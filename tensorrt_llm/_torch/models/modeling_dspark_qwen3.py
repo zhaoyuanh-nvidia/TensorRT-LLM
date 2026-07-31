@@ -228,6 +228,13 @@ class Qwen3DSparkDraftModel(nn.Module):
             window_size=window,
             head_dim=2 * self.kv_dim,
         )
+        # Built after checkpoint load. The layer-invariant context stream uses
+        # every draft layer's K/V projections, so stack them into one GEMM
+        # instead of issuing 2 * num_layers small projections.
+        self._fused_ctx_kv_weight: Optional[torch.Tensor] = None
+        self._k_norm_weight_stacked: Optional[torch.Tensor] = None
+        self._gate_up_weight_stacked: Optional[torch.Tensor] = None
+        self._k_norm_eps = eps
 
         # Build the weight modules on the meta device; load_weights() assigns
         # the real cuda tensors (torch load_state_dict(assign=True)).
@@ -312,6 +319,88 @@ class Qwen3DSparkDraftModel(nn.Module):
         v = a.v_proj(main_x)
         return torch.cat([k.reshape(*shp, self.kv_dim), v], dim=-1)
 
+    def _build_fused_ctx_kv_buffers(self) -> None:
+        """Stack every layer's context K/V projection and K-norm weights."""
+        if self._fused_ctx_kv_weight is not None:
+            return
+        kv_weights = []
+        k_norm_weights = []
+        for layer in self.layers:
+            attn = layer.self_attn
+            kv_weights.extend([attn.k_proj.weight, attn.v_proj.weight])
+            k_norm_weights.append(attn.k_norm.weight)
+        self._fused_ctx_kv_weight = torch.cat(kv_weights, dim=0).contiguous()
+        self._k_norm_weight_stacked = torch.stack(k_norm_weights).contiguous()
+
+    def _ctx_kv_all(self, main_x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        """Context K/V for all draft layers from one fused projection.
+
+        Args:
+            main_x: ``[..., hidden_size]`` projected target context.
+            positions: ``[...]`` absolute positions matching ``main_x``.
+
+        Returns:
+            ``[..., num_layers, 2 * kv_dim]`` with normalized/RoPE'd K then V.
+        """
+        if self._fused_ctx_kv_weight is None:
+            self._build_fused_ctx_kv_buffers()
+        assert self._fused_ctx_kv_weight is not None
+        assert self._k_norm_weight_stacked is not None
+
+        leading_shape = main_x.shape[:-1]
+        kv = F.linear(main_x, self._fused_ctx_kv_weight)
+        kv = kv.view(
+            *leading_shape,
+            self.num_stages,
+            2,
+            self.num_kv_heads,
+            self.head_dim,
+        )
+        k = kv.select(-3, 0)
+        v = kv.select(-3, 1)
+
+        # Match Qwen3RMSNorm exactly while normalizing every layer/head in one
+        # vectorized operation. K is [..., layers, kv_heads, head_dim].
+        k_dtype = k.dtype
+        k_float = k.float()
+        k = k_float * torch.rsqrt(k_float.pow(2).mean(-1, keepdim=True) + self._k_norm_eps)
+        weight_shape = [1] * (k.ndim - 3) + [
+            self.num_stages,
+            1,
+            self.head_dim,
+        ]
+        k = self._k_norm_weight_stacked.view(*weight_shape) * k.to(k_dtype)
+
+        cos, sin = self._gather_cos_sin(positions, k.dtype)
+        # Add the layer dimension; _apply_rope adds the head dimension.
+        k = _apply_rope(k, cos.unsqueeze(-2), sin.unsqueeze(-2))
+        return torch.cat(
+            [
+                k.reshape(*leading_shape, self.num_stages, self.kv_dim),
+                v.reshape(*leading_shape, self.num_stages, self.kv_dim),
+            ],
+            dim=-1,
+        )
+
+    def _build_fused_mlp_buffers(self) -> None:
+        """Stack every layer's concatenated gate/up projection weights."""
+        if self._gate_up_weight_stacked is not None:
+            return
+        self._gate_up_weight_stacked = torch.stack(
+            [
+                torch.cat([layer.mlp.gate_proj.weight, layer.mlp.up_proj.weight], dim=0)
+                for layer in self.layers
+            ]
+        ).contiguous()
+
+    def _fused_mlp(self, layer_index: int, x: torch.Tensor) -> torch.Tensor:
+        """Run one layer's gated MLP with a single gate/up projection."""
+        if self._gate_up_weight_stacked is None:
+            self._build_fused_mlp_buffers()
+        assert self._gate_up_weight_stacked is not None
+        gate, up = F.linear(x, self._gate_up_weight_stacked[layer_index]).chunk(2, dim=-1)
+        return self.layers[layer_index].mlp.down_proj(F.silu(gate) * up)
+
     @torch.inference_mode()
     def write_context_windows(
         self, main_hidden: torch.Tensor, positions: torch.Tensor, stage_windows: torch.Tensor
@@ -331,9 +420,9 @@ class Qwen3DSparkDraftModel(nn.Module):
         p = positions.to(main_hidden.device).long() - 1
         cols = p % win
         main_x = self._project_ctx(main_hidden)
-        for li, layer in enumerate(self.layers):
-            kv = self._ctx_kv(layer, main_x, p)
-            stage_windows[li, cols] = kv.to(stage_windows.dtype)
+        kv_all = self._ctx_kv_all(main_x, p)
+        for li in range(self.num_stages):
+            stage_windows[li, cols] = kv_all[:, li].to(stage_windows.dtype)
 
     def write_context_windows_batched(
         self,
@@ -361,8 +450,9 @@ class Qwen3DSparkDraftModel(nn.Module):
         rows = slots.long()[:, None].expand(-1, M)
         mask3 = mask.unsqueeze(-1)
         main_x = self._project_ctx(main_hidden)
-        for li, layer in enumerate(self.layers):
-            kv = self._ctx_kv(layer, main_x, p)  # [G, M, 2*kv_dim]
+        kv_all = self._ctx_kv_all(main_x, p)
+        for li in range(self.num_stages):
+            kv = kv_all[:, :, li]  # [G, M, 2*kv_dim]
             win_l = kv_windows[:, li]  # [N, win, 2*kv_dim] view
             cur = win_l[rows, cols]
             win_l[rows, cols] = torch.where(mask3, kv.to(win_l.dtype), cur)
@@ -411,6 +501,7 @@ class Qwen3DSparkDraftModel(nn.Module):
         main_x = self._project_ctx(main_hidden)  # [G, hidden]
         p0 = start_pos - 1
         cols0 = p0 % win
+        kv0_all = self._ctx_kv_all(main_x, p0)
 
         draft_ids = build_draft_input_ids(
             bonus_token_ids, block_size=B, noise_token_id=self.noise_token_id
@@ -438,7 +529,7 @@ class Qwen3DSparkDraftModel(nn.Module):
             a = layer.self_attn
             win_l = kv_windows[:, li]  # [N, win, 2*kv_dim] view
             # Write the newest committed token's context row, then read the ring.
-            kv0 = self._ctx_kv(layer, main_x, p0)  # [G, 2*kv_dim]
+            kv0 = kv0_all[:, li]  # [G, 2*kv_dim]
             win_l[slots, cols0] = kv0.to(win_l.dtype)
             ctx = win_l[slots]  # [G, win, 2*kv_dim]
             k_ctx = ctx[..., : self.kv_dim].view(G, win, self.num_kv_heads, self.head_dim)
@@ -454,16 +545,19 @@ class Qwen3DSparkDraftModel(nn.Module):
 
             k = torch.cat([k_ctx.to(h.dtype), k_blk], dim=1).transpose(1, 2)
             v = torch.cat([v_ctx.to(h.dtype), v_blk], dim=1).transpose(1, 2)
-            k = k.repeat_interleave(self.num_kv_groups, dim=1)
-            v = v.repeat_interleave(self.num_kv_groups, dim=1)
             o = F.scaled_dot_product_attention(
-                q.transpose(1, 2), k, v, attn_mask=attn_mask, scale=self.softmax_scale
+                q.transpose(1, 2),
+                k,
+                v,
+                attn_mask=attn_mask,
+                scale=self.softmax_scale,
+                enable_gqa=self.num_kv_groups > 1,
             )
             o = o.transpose(1, 2).reshape(G, B, self.num_heads * self.head_dim)
             h = residual + a.o_proj(o)
 
             residual = h
-            h = residual + layer.mlp(layer.post_attention_layernorm(h))
+            h = residual + self._fused_mlp(li, layer.post_attention_layernorm(h))
 
         h = self.norm(h)
         base_logits = self.lm_head(h)
@@ -527,6 +621,11 @@ class Qwen3DSparkDraftModel(nn.Module):
             t = t.float() if k.startswith("confidence_head.") else t.to(torch.bfloat16)
             sd[k] = t
         self.load_state_dict(sd, strict=True, assign=True)
+        self._fused_ctx_kv_weight = None
+        self._k_norm_weight_stacked = None
+        self._gate_up_weight_stacked = None
+        self._build_fused_ctx_kv_buffers()
+        self._build_fused_mlp_buffers()
         logger.info(
             f"[DSpark-Qwen3] loaded {len(sd)} draft params "
             f"({self.num_stages} layers, block_size={self.block_size}, "

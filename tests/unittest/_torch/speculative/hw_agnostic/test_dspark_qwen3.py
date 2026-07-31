@@ -220,6 +220,72 @@ def _rand_hidden(gen, n):
     return (torch.randn(n, N_CAP * HID, generator=gen) * 0.3).to(DTYPE)
 
 
+def test_fused_context_kv_matches_per_layer(setup):
+    """The fused all-layer projection preserves the original K/V math."""
+    _, model, device = setup
+    gen = torch.Generator().manual_seed(17)
+    main_hidden = _rand_hidden(gen, 7).to(device)
+    main_x = model._project_ctx(main_hidden)
+    positions = torch.arange(11, 18, device=device)
+
+    got = model._ctx_kv_all(main_x, positions)
+    expected = torch.stack(
+        [model._ctx_kv(layer, main_x, positions) for layer in model.layers],
+        dim=-2,
+    )
+    torch.testing.assert_close(got, expected)
+
+
+def test_attention_uses_native_gqa(setup, monkeypatch):
+    """Keep K/V at KV-head cardinality instead of materializing query heads."""
+    _, model, device = setup
+    gen = torch.Generator().manual_seed(19)
+    win = model._attn_params["window_size"]
+    kv_windows = torch.zeros(
+        1,
+        model.num_stages,
+        win,
+        model._attn_params["head_dim"],
+        dtype=DTYPE,
+        device=device,
+    )
+    main_hidden = _rand_hidden(gen, 1).to(device)
+    bonus = torch.tensor([5], device=device)
+    start = torch.tensor([1], device=device)
+    slots = torch.tensor([0], device=device)
+
+    real_sdpa = F.scaled_dot_product_attention
+    calls = []
+
+    def _record_sdpa(q, k, v, **kwargs):
+        calls.append((q.shape[1], k.shape[1], v.shape[1], kwargs.get("enable_gqa")))
+        return real_sdpa(q, k, v, **kwargs)
+
+    monkeypatch.setattr(F, "scaled_dot_product_attention", _record_sdpa)
+    model.forward_batched(
+        main_hidden,
+        bonus,
+        start,
+        kv_windows=kv_windows,
+        slots=slots,
+    )
+
+    assert calls
+    assert all(call == (N_HEADS, N_KV_HEADS, N_KV_HEADS, True) for call in calls)
+
+
+def test_fused_gate_up_matches_separate_projections(setup):
+    """One concatenated gate/up projection preserves the original MLP math."""
+    _, model, device = setup
+    gen = torch.Generator().manual_seed(23)
+    x = (torch.randn(2, BLOCK, HID, generator=gen) * 0.3).to(DTYPE).to(device)
+
+    for layer_index, layer in enumerate(model.layers):
+        expected = layer.mlp(x)
+        got = model._fused_mlp(layer_index, x)
+        torch.testing.assert_close(got, expected)
+
+
 def test_worker_protocol_golden(setup):
     """Drive the model exactly like DSparkWorker across 3 decode steps."""
     weights, model, device = setup
