@@ -91,8 +91,11 @@ def dspark_propose(
             first_prev_token_ids=bonus_token_ids,
             hidden_states=block_hidden,
             temperature=temperature,
+            collect_logits=return_logits,
         )
-        draft_logits = corrected
+        if return_logits:
+            assert corrected is not None
+            draft_logits = corrected
     else:
         from .heads import greedy_or_sample
 

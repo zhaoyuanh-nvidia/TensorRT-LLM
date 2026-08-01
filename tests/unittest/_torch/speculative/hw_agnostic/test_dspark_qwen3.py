@@ -35,7 +35,12 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch.models.modeling_dspark_qwen3 import Qwen3DSparkDraftModel, _apply_rope
+from tensorrt_llm._torch.models.modeling_dspark_qwen3 import (
+    Qwen3DSparkDraftModel,
+    _apply_rope,
+    _RMSNorm,
+)
+from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 
 VOCAB = 97
 HID = 32
@@ -220,6 +225,47 @@ def _rand_hidden(gen, n):
     return (torch.randn(n, N_CAP * HID, generator=gen) * 0.3).to(DTYPE)
 
 
+@pytest.mark.parametrize("shape", [(2, BLOCK, HID), (2, BLOCK, N_HEADS, HEAD_DIM)])
+def test_trtllm_rmsnorm_wrapper_matches_qwen_reference(shape):
+    """The fused dispatch preserves Qwen's fp32 RMSNorm definition and keys."""
+    dim = shape[-1]
+    norm = _RMSNorm(dim, EPS)
+    assert isinstance(norm, RMSNorm)
+    assert tuple(norm.state_dict()) == ("weight",)
+
+    gen = torch.Generator().manual_seed(13 + dim)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    weight = (1.0 + torch.randn(dim, generator=gen) * 0.05).to(device=device, dtype=DTYPE)
+    norm.load_state_dict({"weight": weight}, strict=True, assign=True)
+    x = (torch.randn(*shape, generator=gen) * 0.3).to(device=device, dtype=DTYPE)
+
+    got = norm(x)
+    xf = x.float()
+    expected = weight * (xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + EPS)).to(DTYPE)
+    torch.testing.assert_close(got, expected, atol=1e-2, rtol=1e-2)
+
+
+def test_trtllm_rmsnorm_wrapper_fuses_residual_add():
+    """Fused add+norm returns the old BF16 residual sum and normalized view."""
+    norm = _RMSNorm(HID, EPS)
+    gen = torch.Generator().manual_seed(41)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    weight = (1.0 + torch.randn(HID, generator=gen) * 0.05).to(device=device, dtype=DTYPE)
+    norm.load_state_dict({"weight": weight}, strict=True, assign=True)
+
+    x = (torch.randn(2, BLOCK, HID, generator=gen) * 0.3).to(device=device, dtype=DTYPE)
+    residual = (torch.randn(2, BLOCK, HID, generator=gen) * 0.3).to(device=device, dtype=DTYPE)
+    x_ref = x.clone()
+    residual_ref = residual.clone()
+
+    got, residual_sum = norm(x, residual)
+    expected_sum = x_ref + residual_ref
+    sf = expected_sum.float()
+    expected = weight * (sf * torch.rsqrt(sf.pow(2).mean(-1, keepdim=True) + EPS)).to(DTYPE)
+    torch.testing.assert_close(residual_sum, expected_sum)
+    torch.testing.assert_close(got, expected, atol=1e-2, rtol=1e-2)
+
+
 def test_fused_context_kv_matches_per_layer(setup):
     """The fused all-layer projection preserves the original K/V math."""
     _, model, device = setup
@@ -233,7 +279,9 @@ def test_fused_context_kv_matches_per_layer(setup):
         [model._ctx_kv(layer, main_x, positions) for layer in model.layers],
         dim=-2,
     )
-    torch.testing.assert_close(got, expected)
+    # FlashInfer may select a different BF16 row-grouping kernel for the
+    # stacked projection; the two paths remain equivalent to BF16 precision.
+    torch.testing.assert_close(got, expected, atol=2e-3, rtol=2e-2)
 
 
 def test_attention_uses_native_gqa(setup, monkeypatch):
@@ -348,6 +396,81 @@ def test_worker_protocol_golden(setup):
             f"step {step}: draft tokens diverge from reference"
         )
         bonus_val = (bonus_val * 7 + 3) % VOCAB
+
+
+def test_precommitted_context_matches_legacy_update(setup):
+    """A consolidated accepted-token write matches the legacy two-stage path."""
+    _, model, device = setup
+    gen = torch.Generator().manual_seed(29)
+    G = 3
+    win = model._attn_params["window_size"]
+    slots = torch.arange(G, device=device)
+    old = torch.tensor([4, win - 1, win + 2], device=device)
+    nacc = torch.tensor([1, 2, BLOCK + 1], device=device)
+    accepted_hidden = (
+        _rand_hidden(gen, G * (BLOCK + 1)).reshape(G, BLOCK + 1, N_CAP * HID).to(device)
+    )
+    main_hidden = accepted_hidden[slots, nacc - 1]
+    bonus = torch.tensor([11, 22, 33], device=device)
+    start_pos = old + nacc
+
+    base_windows = (
+        torch.randn(
+            G,
+            model.num_stages,
+            win,
+            model._attn_params["head_dim"],
+            generator=gen,
+        )
+        .to(DTYPE)
+        .to(device)
+    )
+    legacy_windows = base_windows.clone()
+    precommitted_windows = base_windows.clone()
+
+    legacy_j = torch.arange(BLOCK, device=device)
+    legacy_pos = old[:, None] + 1 + legacy_j[None, :]
+    legacy_mask = legacy_j[None, :] < (nacc[:, None] - 1)
+    model.write_context_windows_batched(
+        accepted_hidden[:, :BLOCK],
+        legacy_pos,
+        slots,
+        legacy_mask,
+        legacy_windows,
+    )
+    legacy_tokens, legacy_n, legacy_logits = model.forward_batched(
+        main_hidden,
+        bonus,
+        start_pos,
+        kv_windows=legacy_windows,
+        slots=slots,
+        return_logits=True,
+    )
+
+    combined_j = torch.arange(BLOCK + 1, device=device)
+    combined_pos = old[:, None] + 1 + combined_j[None, :]
+    combined_mask = combined_j[None, :] < nacc[:, None]
+    model.write_context_windows_batched(
+        accepted_hidden,
+        combined_pos,
+        slots,
+        combined_mask,
+        precommitted_windows,
+    )
+    combined_tokens, combined_n, combined_logits = model.forward_batched(
+        main_hidden,
+        bonus,
+        start_pos,
+        kv_windows=precommitted_windows,
+        slots=slots,
+        context_precommitted=True,
+        return_logits=True,
+    )
+
+    torch.testing.assert_close(precommitted_windows, legacy_windows)
+    torch.testing.assert_close(combined_logits, legacy_logits, atol=0.05, rtol=0.05)
+    assert torch.equal(combined_tokens, legacy_tokens)
+    assert torch.equal(combined_n, legacy_n)
 
 
 def test_batched_matches_eager_singletons(setup):

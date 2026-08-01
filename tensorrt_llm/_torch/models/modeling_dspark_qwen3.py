@@ -60,6 +60,7 @@ from torch import nn
 
 from tensorrt_llm.logger import logger
 
+from ..modules.rms_norm import RMSNorm
 from .dspark.draft import build_draft_input_ids, dspark_propose
 from .dspark.heads import build_markov_head
 
@@ -68,7 +69,7 @@ from .dspark.heads import build_markov_head
 # window bounds the worker buffer at
 # ``max_batch * num_layers * window * 2 * kv_dim`` bytes while remaining
 # exactly full-context for sequences up to ``window`` tokens.
-_DEFAULT_CTX_WINDOW = 2048
+_DEFAULT_CTX_WINDOW = 1024
 _CTX_WINDOW_ENV = "TRTLLM_DSPARK_QWEN3_CTX_WINDOW"
 
 
@@ -88,19 +89,24 @@ def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.
     return x * cos + _rotate_half(x) * sin
 
 
-class _RMSNorm(nn.Module):
-    """Qwen3RMSNorm: fp32 normalize, cast back, then scale by the bf16 weight."""
+class _RMSNorm(RMSNorm):
+    """Checkpoint-name-preserving TRT-LLM RMSNorm wrapper for Qwen3 DSpark."""
 
     def __init__(self, dim: int, eps: float):
-        super().__init__()
-        self.weight = nn.Parameter(torch.empty(dim))
-        self.eps = float(eps)
+        super().__init__(hidden_size=int(dim), eps=float(eps))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        dt = x.dtype
-        xf = x.float()
-        xf = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + self.eps)
-        return self.weight * xf.to(dt)
+    def forward(
+        self, x: torch.Tensor, residual: Optional[torch.Tensor] = None
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Flatten leading dimensions for FlashInfer's rank-2 RMSNorm ABI."""
+        shape = x.shape
+        x_flat = x.reshape(-1, shape[-1])
+        if residual is None:
+            return super().forward(x_flat).reshape(shape)
+
+        normalized, residual_sum = super().forward(x_flat, residual.reshape(-1, shape[-1]))
+        assert residual_sum is not None
+        return normalized.reshape(shape), residual_sum.reshape(shape)
 
 
 class _Attention(nn.Module):
@@ -467,6 +473,7 @@ class Qwen3DSparkDraftModel(nn.Module):
         *,
         kv_windows: torch.Tensor,
         slots: torch.Tensor,
+        context_precommitted: bool = False,
         temperature: float = 0.0,
         confidence_threshold: float = 0.0,
         return_logits: bool = False,
@@ -487,6 +494,10 @@ class Qwen3DSparkDraftModel(nn.Module):
             start_pos: ``[G]`` absolute decode position of the bonus token.
             kv_windows: ``[N, num_layers, window, 2*kv_dim]`` persistent buffer.
             slots: ``[G]`` request rows into ``kv_windows``.
+            context_precommitted: the worker already projected and wrote the
+                newest committed token into ``kv_windows`` together with the
+                other accepted tokens. Skips the otherwise duplicate context
+                projection/write for that bonus row.
         Returns:
             ``(draft_tokens [G, block], num_proposed [G])`` and, with
             ``return_logits``, the corrected block logits ``[G, block, vocab]``.
@@ -498,10 +509,11 @@ class Qwen3DSparkDraftModel(nn.Module):
         device = main_hidden.device
         start_pos = start_pos.long()
 
-        main_x = self._project_ctx(main_hidden)  # [G, hidden]
-        p0 = start_pos - 1
-        cols0 = p0 % win
-        kv0_all = self._ctx_kv_all(main_x, p0)
+        if not context_precommitted:
+            main_x = self._project_ctx(main_hidden)  # [G, hidden]
+            p0 = start_pos - 1
+            cols0 = p0 % win
+            kv0_all = self._ctx_kv_all(main_x, p0)
 
         draft_ids = build_draft_input_ids(
             bonus_token_ids, block_size=B, noise_token_id=self.noise_token_id
@@ -528,9 +540,11 @@ class Qwen3DSparkDraftModel(nn.Module):
         for li, layer in enumerate(self.layers):
             a = layer.self_attn
             win_l = kv_windows[:, li]  # [N, win, 2*kv_dim] view
-            # Write the newest committed token's context row, then read the ring.
-            kv0 = kv0_all[:, li]  # [G, 2*kv_dim]
-            win_l[slots, cols0] = kv0.to(win_l.dtype)
+            # Write the newest committed token's context row unless the worker
+            # already included it in the consolidated accepted-token update.
+            if not context_precommitted:
+                kv0 = kv0_all[:, li]  # [G, 2*kv_dim]
+                win_l[slots, cols0] = kv0.to(win_l.dtype)
             ctx = win_l[slots]  # [G, win, 2*kv_dim]
             k_ctx = ctx[..., : self.kv_dim].view(G, win, self.num_kv_heads, self.head_dim)
             v_ctx = ctx[..., self.kv_dim :].view(G, win, self.num_kv_heads, self.head_dim)
@@ -554,10 +568,8 @@ class Qwen3DSparkDraftModel(nn.Module):
                 enable_gqa=self.num_kv_groups > 1,
             )
             o = o.transpose(1, 2).reshape(G, B, self.num_heads * self.head_dim)
-            h = residual + a.o_proj(o)
-
-            residual = h
-            h = residual + self._fused_mlp(li, layer.post_attention_layernorm(h))
+            mlp_input, h = layer.post_attention_layernorm(a.o_proj(o), residual)
+            h = h + self._fused_mlp(li, mlp_input)
 
         h = self.norm(h)
         base_logits = self.lm_head(h)
@@ -642,6 +654,8 @@ class Qwen3DSparkForCausalLM(nn.Module):
     with the target model (the drafter checkpoint's copies are identical
     frozen snapshots and are skipped at load).
     """
+
+    supports_precommitted_context = True
 
     def __init__(self, draft_config, block_size: Optional[int] = None):
         super().__init__()

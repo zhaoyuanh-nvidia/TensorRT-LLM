@@ -44,10 +44,19 @@ def test_markov_block_sampling_shapes_and_determinism(head_type):
         tok2, _ = head.sample_block_tokens(
             base, first_prev_token_ids=first, hidden_states=hid, temperature=0.0
         )
+        tok3, omitted = head.sample_block_tokens(
+            base,
+            first_prev_token_ids=first,
+            hidden_states=hid,
+            temperature=0.0,
+            collect_logits=False,
+        )
     assert tok.shape == (B, BLK)
     assert logits.shape == (B, BLK, VOCAB)
     # Greedy is deterministic.
     assert torch.equal(tok, tok2)
+    assert torch.equal(tok, tok3)
+    assert omitted is None
     # Each sampled token is the argmax of its (bias-corrected) step logits.
     assert torch.equal(tok, logits.argmax(dim=-1))
 

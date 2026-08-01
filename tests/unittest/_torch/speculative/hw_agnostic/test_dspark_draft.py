@@ -48,9 +48,21 @@ def test_dspark_propose_full_block_no_confidence():
             confidence_head=None,
             block_size=BLK,
         )
+        tokens_with_logits, num_with_logits, logits = dspark_propose(
+            base,
+            bonus_token_ids=bonus,
+            block_hidden=hid,
+            markov_head=markov,
+            confidence_head=None,
+            block_size=BLK,
+            return_logits=True,
+        )
     assert tokens.shape == (B, BLK)
     # No confidence head -> propose the full block.
     assert torch.all(num == BLK)
+    assert torch.equal(tokens, tokens_with_logits)
+    assert torch.equal(num, num_with_logits)
+    assert logits.shape == (B, BLK, VOCAB)
     # Tokens match the markov head's own greedy block sampling.
     ref_tokens, _ = markov.sample_block_tokens(
         base, first_prev_token_ids=bonus, hidden_states=hid, temperature=0.0

@@ -376,7 +376,7 @@ class DSparkWorker(SpecWorkerBase):
         batch_size: int,
         total_target_tokens: int,
         all_rank_num_tokens: Optional[List[int]] = None,
-    ) -> torch.Tensor:
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """CUDA-graph-safe batched gen draft (all gen requests in one forward).
 
         Free of host syncs and data-dependent shapes: per-request quantities
@@ -384,9 +384,12 @@ class DSparkWorker(SpecWorkerBase):
         back-fill) are gathered as tensors, slots come from the host-built
         ``_batch_to_slot`` mirror, and the backbone runs once via
         ``DSparkDraftModel.forward_batched``. Returns the per-position corrected
-        block logits ``[num_gens, K, vocab]`` (or ``None`` when there is nothing to
-        draft); the worker feeds them to ``SpecWorkerBase.sample_draft_tokens``.
-        Confidence truncation stays disabled — the full block is proposed.
+        block logits ``[num_gens, K, vocab]`` and the exact tokens already chosen
+        by the sequential Markov head (or ``(None, None)`` when there is nothing
+        to draft). The worker can directly reuse those tokens for the TP1,
+        shared-vocabulary greedy path; all other paths keep routing the logits
+        through ``SpecWorkerBase.sample_draft_tokens``. Confidence truncation
+        stays disabled — the full block is proposed.
         """
         num_gens = batch_size - num_contexts
         K = self.max_draft_len
@@ -394,10 +397,10 @@ class DSparkWorker(SpecWorkerBase):
         device = accepted_tokens.device
 
         if num_gens == 0:
-            return None
+            return None, None
         captured = spec_metadata.get_hidden_states(total_target_tokens)
         if captured is None:
-            return None
+            return None, None
 
         # gen-only graph batches have num_ctx_tokens == 0; mixed eager batches put
         # the gen tokens after the context tokens.
@@ -417,19 +420,25 @@ class DSparkWorker(SpecWorkerBase):
         base = gen_start + arange_g * Kp1  # [G]
         main_hidden = captured[base + gidx]  # [G, ncap*hidden]
 
-        # Fixed-size ([G, K]) masked back-fill of the intermediate accepted tokens
-        # (everything but the bonus) into the rolling window — same frames as the
-        # eager path (old+1 .. old+nacc-1), with j >= nacc-1 masked out.
+        # Qwen3 can project all accepted context rows (including the newest
+        # bonus row) in one fixed-shape [G, K+1] call, then tell its draft
+        # forward that the context is already committed. Other DSpark models
+        # retain the legacy [G, K] intermediate-only update and project the
+        # bonus row inside forward_batched. The capability branch and tensor
+        # shapes are static for a captured CUDA graph.
+        context_precommitted = bool(getattr(draft_model, "supports_precommitted_context", False))
         old = self._ctx_len[slots]  # [G] pre-increment decode position
-        j = torch.arange(K, device=device)  # [K]
-        interim_valid = j.unsqueeze(0) < (nacc.unsqueeze(1) - 1)  # [G, K]
-        interim_pos = old.unsqueeze(1) + 1 + j.unsqueeze(0)  # [G, K]
-        interim_base = (base.unsqueeze(1) + j.unsqueeze(0)).clamp(
+        num_context_rows = Kp1 if context_precommitted else K
+        valid_context_rows = nacc if context_precommitted else nacc - 1
+        j = torch.arange(num_context_rows, device=device)
+        context_valid = j.unsqueeze(0) < valid_context_rows.unsqueeze(1)
+        context_pos = old.unsqueeze(1) + 1 + j.unsqueeze(0)
+        context_base = (base.unsqueeze(1) + j.unsqueeze(0)).clamp(
             min=0, max=captured.shape[0] - 1
-        )  # [G, K] (clamped; invalid entries are masked out anyway)
-        interim_hidden = captured[interim_base]  # [G, K, ncap*hidden]
+        )  # invalid entries are masked out by write_context_windows_batched
+        context_hidden = captured[context_base]
         draft_model.write_context_windows_batched(
-            interim_hidden, interim_pos, slots, interim_valid, self._kv_windows
+            context_hidden, context_pos, slots, context_valid, self._kv_windows
         )
 
         # Advance the decode position by the accepted count; start_pos (= post-
@@ -437,21 +446,54 @@ class DSparkWorker(SpecWorkerBase):
         start_pos = old + nacc  # [G]
         self._ctx_len[slots] = start_pos
 
-        # Surface the per-position corrected block logits ([num_gens, K, vocab])
-        # and let SpecWorkerBase.sample_draft_tokens do the (greedy or rejection)
-        # sampling + TP gather + draft_probs scatter, rather than argmaxing here.
-        _toks, _num_proposed, block_logits = draft_model.forward_batched(
-            main_hidden,
-            bonus,
-            start_pos,
-            kv_windows=self._kv_windows,
-            slots=slots,
-            temperature=0.0,
-            confidence_threshold=0.0,
-            return_logits=True,
-            all_rank_num_tokens=all_rank_num_tokens,
+        # The exact all-greedy TP1 path consumes the sequential Markov tokens
+        # directly and does not need the corrected [G, K, vocab] output. Other
+        # paths retain logits for unified sampling, TP gather, and draft_probs.
+        return_logits = not self._can_reuse_exact_greedy_tokens(spec_metadata)
+        if context_precommitted:
+            result = draft_model.forward_batched(
+                main_hidden,
+                bonus,
+                start_pos,
+                kv_windows=self._kv_windows,
+                slots=slots,
+                context_precommitted=True,
+                temperature=0.0,
+                confidence_threshold=0.0,
+                return_logits=return_logits,
+                all_rank_num_tokens=all_rank_num_tokens,
+            )
+        else:
+            result = draft_model.forward_batched(
+                main_hidden,
+                bonus,
+                start_pos,
+                kv_windows=self._kv_windows,
+                slots=slots,
+                temperature=0.0,
+                confidence_threshold=0.0,
+                return_logits=return_logits,
+                all_rank_num_tokens=all_rank_num_tokens,
+            )
+        if return_logits:
+            draft_tokens, _num_proposed, block_logits = result
+        else:
+            draft_tokens, _num_proposed = result
+            block_logits = None
+        return block_logits, draft_tokens
+
+    def _can_reuse_exact_greedy_tokens(self, spec_metadata: "DSparkSpecMetadata") -> bool:
+        """Whether the Markov head's already-selected tokens are final.
+
+        ``forward_batched`` constructs corrected logits and selects each Markov
+        token sequentially. Repeating argmax over those same logits is exact but
+        redundant when the batch is greedy, the vocabulary is not TP-sharded,
+        and no draft-to-target vocabulary remap is required. The condition is
+        static for a CUDA-graph key, so this Python branch is capture-safe.
+        """
+        return (
+            spec_metadata.is_all_greedy_sample and self.mapping.tp_size == 1 and self._d2t is None
         )
-        return block_logits
 
     def _forward_impl(
         self,
@@ -543,9 +585,10 @@ class DSparkWorker(SpecWorkerBase):
         )
 
         if num_gens > 0:
-            # The batched gen-block draft returns the per-position corrected block
-            # logits [num_gens, K, vocab] and is CUDA-graph-safe.
-            gen_logits = self._draft_gen_block_batched(
+            # The batched gen-block draft returns corrected block logits for the
+            # unified sampler, or just the exact Markov tokens on the static
+            # all-greedy TP1/shared-vocabulary path. Both are CUDA-graph-safe.
+            gen_logits, exact_gen_draft_tokens = self._draft_gen_block_batched(
                 draft_model,
                 spec_metadata,
                 attn_metadata,
@@ -556,10 +599,18 @@ class DSparkWorker(SpecWorkerBase):
                 total_target_tokens,
                 all_rank_num_tokens=all_rank_draft_tokens,
             )
-            if gen_logits is not None:
-                # SpecWorkerBase samples the draft tokens (greedy argmax, or
-                # rejection sampling for a non-greedy batch), performs the TP
-                # gather, and scatters the proposal distribution into draft_probs.
+            if (
+                self._can_reuse_exact_greedy_tokens(spec_metadata)
+                and exact_gen_draft_tokens is not None
+            ):
+                # The Markov loop already performed this exact argmax for every
+                # sequential position; corrected block logits were not retained.
+                gen_draft_tokens = exact_gen_draft_tokens.to(torch.int32)
+                gen_vocab = spec_metadata.draft_probs_last_dim
+            elif gen_logits is not None:
+                # Non-greedy, TP-sharded, and draft-to-target-mapped paths
+                # retain the unified sampler, including proposal-probability
+                # publication for rejection sampling.
                 gen_draft_tokens = self.sample_draft_tokens(
                     gen_logits, spec_metadata, batch_size, num_contexts=num_contexts
                 )

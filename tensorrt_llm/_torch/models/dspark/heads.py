@@ -97,7 +97,8 @@ class VanillaMarkov(nn.Module):
         first_prev_token_ids: torch.Tensor,
         hidden_states: Optional[torch.Tensor],
         temperature: float = 0.0,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        collect_logits: bool = True,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Autoregressive block sampling with the (memoryless) Markov bias.
 
         Args:
@@ -110,7 +111,7 @@ class VanillaMarkov(nn.Module):
         batch_size, block_size = base_logits.shape[:2]
         if block_size == 0:
             empty = torch.empty(batch_size, 0, dtype=torch.long, device=base_logits.device)
-            return empty, base_logits
+            return empty, base_logits if collect_logits else None
         sampled, corrected = [], []
         prev = first_prev_token_ids.long()
         for k in range(block_size):
@@ -118,10 +119,12 @@ class VanillaMarkov(nn.Module):
             step_logits = self.apply_step_logits(
                 base_logits[:, k], token_ids=prev, hidden_states=step_hidden
             )
-            corrected.append(step_logits.unsqueeze(1))
+            if collect_logits:
+                corrected.append(step_logits.unsqueeze(1))
             prev = greedy_or_sample(step_logits, temperature)
             sampled.append(prev)
-        return torch.stack(sampled, dim=1), torch.cat(corrected, dim=1)
+        block_logits = torch.cat(corrected, dim=1) if collect_logits else None
+        return torch.stack(sampled, dim=1), block_logits
 
 
 class GatedMarkovHead(VanillaMarkov):
@@ -171,12 +174,13 @@ class RNNHead(VanillaMarkov):
         first_prev_token_ids: torch.Tensor,
         hidden_states: Optional[torch.Tensor],
         temperature: float = 0.0,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        collect_logits: bool = True,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         assert hidden_states is not None
         batch_size, block_size = base_logits.shape[:2]
         if block_size == 0:
             empty = torch.empty(batch_size, 0, dtype=torch.long, device=base_logits.device)
-            return empty, base_logits
+            return empty, base_logits if collect_logits else None
         state = torch.zeros(
             batch_size, self.markov_rank, device=base_logits.device, dtype=hidden_states.dtype
         )
@@ -186,10 +190,12 @@ class RNNHead(VanillaMarkov):
             prev_emb = self.get_prev_embeddings(prev)
             state, bias = self._rnn_step(state, prev_emb, hidden_states[:, k])
             step_logits = base_logits[:, k] + bias
-            corrected.append(step_logits.unsqueeze(1))
+            if collect_logits:
+                corrected.append(step_logits.unsqueeze(1))
             prev = greedy_or_sample(step_logits, temperature)
             sampled.append(prev)
-        return torch.stack(sampled, dim=1), torch.cat(corrected, dim=1)
+        block_logits = torch.cat(corrected, dim=1) if collect_logits else None
+        return torch.stack(sampled, dim=1), block_logits
 
 
 def build_markov_head(

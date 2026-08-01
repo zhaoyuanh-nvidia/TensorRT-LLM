@@ -112,6 +112,100 @@ def _fake_draft_model(num_stages=3, window_size=128, head_dim=64):
     )
 
 
+@pytest.mark.parametrize("supports_precommitted_context", [False, True])
+@pytest.mark.parametrize("all_greedy", [False, True])
+def test_gen_backfill_precommits_bonus_only_for_supported_drafter(
+    supports_precommitted_context,
+    all_greedy,
+):
+    """Qwen's combined write includes the bonus; legacy drafters stay unchanged."""
+    worker = _make_worker()
+    K = worker.max_draft_len
+    Kp1 = K + 1
+    G = 2
+    slots = torch.tensor([1, 0], device="cuda")
+    worker._batch_to_slot = slots.clone()
+    worker._ctx_len = torch.tensor([20, 10], device="cuda", dtype=torch.long)
+    worker._kv_windows = torch.empty(2, 1, 1, 1, device="cuda", dtype=torch.bfloat16)
+
+    captured = torch.arange(
+        G * Kp1 * HIDDEN,
+        device="cuda",
+        dtype=torch.float32,
+    ).reshape(G * Kp1, HIDDEN)
+    metadata = types.SimpleNamespace(
+        get_hidden_states=lambda _n: captured,
+        is_all_greedy_sample=all_greedy,
+    )
+    attn_metadata = types.SimpleNamespace(num_ctx_tokens=0)
+    accepted_tokens = torch.arange(G * Kp1, device="cuda").reshape(G, Kp1)
+    num_accepted = torch.tensor([1, Kp1], device="cuda")
+
+    class _DraftModel:
+        def __init__(self):
+            if supports_precommitted_context:
+                self.supports_precommitted_context = True
+            self.write_args = None
+            self.forward_args = None
+            self.forward_kwargs = None
+
+        def write_context_windows_batched(self, hidden, positions, got_slots, mask, windows):
+            self.write_args = (hidden, positions, got_slots, mask, windows)
+
+        def forward_batched(self, main_hidden, bonus, start_pos, **kwargs):
+            self.forward_args = (main_hidden, bonus, start_pos)
+            self.forward_kwargs = kwargs
+            tokens = torch.zeros(G, K, device="cuda", dtype=torch.long)
+            proposed = torch.full((G,), K, device="cuda", dtype=torch.long)
+            logits = torch.zeros(G, K, 7, device="cuda")
+            if kwargs["return_logits"]:
+                return tokens, proposed, logits
+            return tokens, proposed
+
+    draft_model = _DraftModel()
+    logits, tokens = worker._draft_gen_block_batched(
+        draft_model,
+        metadata,
+        attn_metadata,
+        accepted_tokens,
+        num_accepted,
+        num_contexts=0,
+        batch_size=G,
+        total_target_tokens=G * Kp1,
+    )
+
+    hidden, positions, got_slots, mask, windows = draft_model.write_args
+    expected_rows = Kp1 if supports_precommitted_context else K
+    expected_valid = num_accepted if supports_precommitted_context else num_accepted - 1
+    captured_by_request = captured.reshape(G, Kp1, HIDDEN)
+    expected_hidden = captured_by_request[:, :expected_rows]
+    expected_positions = torch.tensor(
+        [[11 + j for j in range(expected_rows)], [21 + j for j in range(expected_rows)]],
+        device="cuda",
+    )
+    expected_mask = torch.arange(expected_rows, device="cuda")[None, :] < expected_valid[:, None]
+    assert hidden.shape == (G, expected_rows, HIDDEN)
+    assert torch.equal(hidden, expected_hidden)
+    assert torch.equal(positions, expected_positions)
+    assert torch.equal(got_slots, slots)
+    assert torch.equal(mask, expected_mask)
+    assert windows is worker._kv_windows
+    main_hidden, bonus, start_pos = draft_model.forward_args
+    assert torch.equal(
+        main_hidden, captured_by_request[torch.arange(G, device="cuda"), num_accepted - 1]
+    )
+    assert torch.equal(bonus, accepted_tokens[torch.arange(G, device="cuda"), num_accepted - 1])
+    assert torch.equal(start_pos, torch.tensor([11, 26], device="cuda"))
+    assert ("context_precommitted" in draft_model.forward_kwargs) is supports_precommitted_context
+    assert torch.equal(worker._ctx_len[slots], torch.tensor([11, 26], device="cuda"))
+    assert draft_model.forward_kwargs["return_logits"] is not all_greedy
+    if all_greedy:
+        assert logits is None
+    else:
+        assert logits.shape == (G, K, 7)
+    assert tokens.shape == (G, K)
+
+
 def test_worker_lazy_init_window_buffers():
     worker = _make_worker()
     dm = _fake_draft_model(num_stages=3, window_size=128, head_dim=64)
@@ -376,6 +470,9 @@ def test_forward_mixed_batch_routes_through_base_entries(monkeypatch):
     batch_size = num_contexts + num_gens
 
     meta = _make_metadata(max_num_requests=8)
+    # Exercise the generic/non-greedy logits sampler rather than the exact-token
+    # reuse fast path covered separately below.
+    meta.is_all_greedy_sample = False
     meta.request_ids = [10, 11, 20, 21, 22]  # 2 context + 3 gen
     meta.prepare()
 
@@ -403,7 +500,10 @@ def test_forward_mixed_batch_routes_through_base_entries(monkeypatch):
 
     # The gen-block helper now returns the corrected block logits [num_gens,K,vocab].
     gen_logits = torch.randn(num_gens, K, vocab, device="cuda")
-    monkeypatch.setattr(worker, "_draft_gen_block_batched", lambda *a, **k: gen_logits)
+    gen_tokens = gen_logits.argmax(dim=-1).to(torch.int32)
+    monkeypatch.setattr(
+        worker, "_draft_gen_block_batched", lambda *a, **k: (gen_logits, gen_tokens)
+    )
 
     sdt_calls = {}
     # The gen scatter publishes the FULL (post-TP-gather) vocab width, which is
@@ -454,3 +554,132 @@ def test_forward_mixed_batch_routes_through_base_entries(monkeypatch):
     # Verified tokens are surfaced unchanged.
     assert torch.equal(out["new_tokens"], accepted)
     assert torch.equal(out["new_tokens_lens"], num_accepted)
+
+
+def test_forward_all_greedy_reuses_exact_markov_tokens(monkeypatch):
+    """TP1/shared-vocab greedy batches bypass the redundant logits argmax."""
+    worker = _make_worker()
+    worker.guided_decoder = None
+    dm = _fake_draft_model()
+
+    K = worker.max_draft_len
+    num_gens = 2
+    vocab = 16
+    meta = _make_metadata(max_num_requests=4)
+    meta.is_all_greedy_sample = True
+    meta.request_ids = [20, 21]
+    meta.num_generations = num_gens
+    meta.prepare()
+    attn_metadata = types.SimpleNamespace(
+        num_seqs=num_gens,
+        num_contexts=0,
+        num_ctx_tokens=0,
+        num_tokens=num_gens,
+    )
+
+    accepted = torch.arange(num_gens * (K + 1), dtype=torch.int32, device="cuda").reshape(
+        num_gens, K + 1
+    )
+    num_accepted = torch.ones(num_gens, dtype=torch.int32, device="cuda")
+    monkeypatch.setattr(
+        worker,
+        "sample_and_accept_draft_tokens",
+        lambda *a, **k: (accepted, num_accepted),
+    )
+
+    exact_tokens = torch.arange(num_gens * K, device="cuda").reshape(num_gens, K)
+    monkeypatch.setattr(
+        worker,
+        "_draft_gen_block_batched",
+        lambda *a, **k: (None, exact_tokens),
+    )
+
+    def fail_if_sampled(*args, **kwargs):
+        raise AssertionError("redundant logits sampler must be bypassed")
+
+    monkeypatch.setattr(worker, "sample_draft_tokens", fail_if_sampled)
+
+    zeros = torch.zeros(num_gens, dtype=torch.long, device="cuda")
+    out = worker.forward(
+        zeros,
+        zeros,
+        torch.zeros(num_gens, HIDDEN, device="cuda", dtype=torch.bfloat16),
+        torch.zeros(num_gens, vocab, device="cuda"),
+        attn_metadata,
+        meta,
+        dm,
+    )
+
+    assert out["next_draft_tokens"].dtype == torch.int32
+    assert torch.equal(out["next_draft_tokens"], exact_tokens.to(torch.int32))
+
+
+def test_forward_all_greedy_without_captured_hidden_states_falls_back_to_zeros(
+    monkeypatch,
+):
+    """Missing target hidden states preserve the existing zero-draft fallback."""
+    worker = _make_worker()
+    worker.guided_decoder = None
+    dm = _fake_draft_model()
+
+    K = worker.max_draft_len
+    num_gens = 2
+    vocab = 16
+    meta = _make_metadata(max_num_requests=4)
+    meta.is_all_greedy_sample = True
+    meta.request_ids = [20, 21]
+    meta.num_generations = num_gens
+    meta.prepare()
+    attn_metadata = types.SimpleNamespace(
+        num_seqs=num_gens,
+        num_contexts=0,
+        num_ctx_tokens=0,
+        num_tokens=num_gens,
+    )
+
+    accepted = torch.arange(num_gens * (K + 1), dtype=torch.int32, device="cuda").reshape(
+        num_gens, K + 1
+    )
+    num_accepted = torch.ones(num_gens, dtype=torch.int32, device="cuda")
+    monkeypatch.setattr(
+        worker,
+        "sample_and_accept_draft_tokens",
+        lambda *a, **k: (accepted, num_accepted),
+    )
+    monkeypatch.setattr(
+        worker,
+        "_draft_gen_block_batched",
+        lambda *a, **k: (None, None),
+    )
+
+    zeros = torch.zeros(num_gens, dtype=torch.long, device="cuda")
+    out = worker.forward(
+        zeros,
+        zeros,
+        torch.zeros(num_gens, HIDDEN, device="cuda", dtype=torch.bfloat16),
+        torch.zeros(num_gens, vocab, device="cuda"),
+        attn_metadata,
+        meta,
+        dm,
+    )
+
+    assert out["next_draft_tokens"].dtype == torch.int32
+    assert torch.count_nonzero(out["next_draft_tokens"]) == 0
+
+
+def test_exact_greedy_token_reuse_gate():
+    worker = _make_worker()
+    meta = types.SimpleNamespace(is_all_greedy_sample=True)
+
+    assert worker._can_reuse_exact_greedy_tokens(meta)
+
+    meta.is_all_greedy_sample = False
+    assert not worker._can_reuse_exact_greedy_tokens(meta)
+
+    meta.is_all_greedy_sample = True
+    worker._d2t = torch.zeros(1, dtype=torch.int32, device="cuda")
+    assert not worker._can_reuse_exact_greedy_tokens(meta)
+
+    worker._d2t = None
+    worker.mapping = types.SimpleNamespace(tp_size=2)
+    assert not worker._can_reuse_exact_greedy_tokens(meta)
