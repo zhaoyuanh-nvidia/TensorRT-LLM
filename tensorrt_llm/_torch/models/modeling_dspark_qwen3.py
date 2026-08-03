@@ -71,6 +71,9 @@ from .dspark.heads import build_markov_head
 # exactly full-context for sequences up to ``window`` tokens.
 _DEFAULT_CTX_WINDOW = 1024
 _CTX_WINDOW_ENV = "TRTLLM_DSPARK_QWEN3_CTX_WINDOW"
+_FLASH_KVCACHE_ENV = "TRTLLM_DSPARK_QWEN3_FLASH_KVCACHE"
+_FUSED_QK_NORM_ROPE_ENV = "TRTLLM_DSPARK_QWEN3_FUSED_QK_NORM_ROPE"
+_FUSED_VANILLA_MARKOV_ADDMM_ENV = "TRTLLM_DSPARK_FUSED_VANILLA_MARKOV_ADDMM"
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -227,11 +230,13 @@ class Qwen3DSparkDraftModel(nn.Module):
         # Ring-window length for the worker-owned context K/V buffer.
         window = int(os.environ.get(_CTX_WINDOW_ENV, _DEFAULT_CTX_WINDOW))
         window = max(self.block_size + 2, min(window, max_pos))
-        # Worker allocation contract (DSparkWorker._lazy_init):
-        # kv_windows = [max_batch, num_stages, window_size, head_dim], where
-        # "head_dim" is the per-position row width — here K||V flattened.
+        # Worker allocation contract (DSparkWorker._lazy_init): the first
+        # ``window`` rows are the persistent ring and the ``block_size`` suffix
+        # is transient append space for flash_attn_with_kvcache. ``head_dim``
+        # is the per-position row width — here K||V flattened.
         self._attn_params = dict(
             window_size=window,
+            cache_size=window + self.block_size,
             head_dim=2 * self.kv_dim,
         )
         # Built after checkpoint load. The layer-invariant context stream uses
@@ -269,6 +274,10 @@ class Qwen3DSparkDraftModel(nn.Module):
                 markov_rank=int(getattr(config, "markov_rank", 0)),
                 hidden_size=self.hidden_size,
             )
+            if self.markov_head is not None and self.markov_head.markov_head_type == "vanilla":
+                self.markov_head.use_fused_greedy_addmm = os.environ.get(
+                    _FUSED_VANILLA_MARKOV_ADDMM_ENV, "1"
+                ).lower() not in {"0", "false", "off"}
             self.confidence_head = None
             if bool(getattr(config, "enable_confidence_head", False)):
                 with_markov = bool(getattr(config, "confidence_head_with_markov", False))
@@ -492,7 +501,9 @@ class Qwen3DSparkDraftModel(nn.Module):
                 newest committed context token per request.
             bonus_token_ids: ``[G]`` last accepted token per request.
             start_pos: ``[G]`` absolute decode position of the bonus token.
-            kv_windows: ``[N, num_layers, window, 2*kv_dim]`` persistent buffer.
+            kv_windows: ``[N, num_layers, window+block, 2*kv_dim]`` cache. The
+                first ``window`` rows are persistent; the suffix is transient
+                append space for the current draft block.
             slots: ``[G]`` request rows into ``kv_windows``.
             context_precommitted: the worker already projected and wrote the
                 newest committed token into ``kv_windows`` together with the
@@ -508,6 +519,40 @@ class Qwen3DSparkDraftModel(nn.Module):
         win = int(self._attn_params["window_size"])
         device = main_hidden.device
         start_pos = start_pos.long()
+        cache_size = int(kv_windows.shape[2])
+        flash_kvcache_enabled = os.environ.get(_FLASH_KVCACHE_ENV, "1").lower() not in {
+            "0",
+            "false",
+            "off",
+        }
+        inference_only = not torch.is_grad_enabled()
+        use_flash_kvcache = (
+            flash_kvcache_enabled
+            and inference_only
+            and main_hidden.is_cuda
+            and cache_size >= win + B
+        )
+        fused_qk_norm_rope_enabled = os.environ.get(_FUSED_QK_NORM_ROPE_ENV, "1").lower() not in {
+            "0",
+            "false",
+            "off",
+        }
+        half_head_dim = self.head_dim // 2
+        use_fused_qk_norm_rope = (
+            fused_qk_norm_rope_enabled
+            and inference_only
+            and main_hidden.is_cuda
+            and main_hidden.dtype == torch.bfloat16
+            and self.head_dim % 2 == 0
+            and half_head_dim > 0
+            and (half_head_dim & (half_head_dim - 1)) == 0
+        )
+
+        if use_flash_kvcache:
+            from flash_attn import flash_attn_with_kvcache
+
+            cache_seqlens = start_pos.clamp(min=0, max=win).to(torch.int32)
+            cache_batch_idx = slots.to(torch.int32)
 
         if not context_precommitted:
             main_x = self._project_ctx(main_hidden)  # [G, hidden]
@@ -521,53 +566,100 @@ class Qwen3DSparkDraftModel(nn.Module):
         h = self.embed_tokens(draft_ids)  # [G, B, hidden]
 
         pos_q = start_pos.unsqueeze(1) + torch.arange(B, device=device)  # [G, B]
-        cos_q, sin_q = self._gather_cos_sin(pos_q, h.dtype)
+        if use_fused_qk_norm_rope:
+            from .dspark.qk_norm_rope import fused_separate_qk_norm_rope_
 
-        # Bool attention mask [G, 1, B, win + B]: ring rows valid iff their
-        # index < min(start_pos, win) (ring holds the last `win` positions);
-        # the block attends to itself bidirectionally.
-        ctx_valid = (
-            torch.arange(win, device=device)[None, :] < start_pos.clamp(max=win)[:, None]
-        )  # [G, win]
-        attn_mask = torch.cat(
-            [
-                ctx_valid[:, None, None, :].expand(G, 1, B, win),
-                torch.ones(G, 1, B, B, dtype=torch.bool, device=device),
-            ],
-            dim=-1,
-        )
+            cos_table, sin_table = self._cos_sin_tables(device)
+        else:
+            cos_q, sin_q = self._gather_cos_sin(pos_q, h.dtype)
+
+        if not use_flash_kvcache:
+            # Fallback for CPU/unit-test and legacy window-only caches. Ring
+            # rows are valid iff their index < min(start_pos, win); all block
+            # queries share the same bidirectional key visibility.
+            ctx_valid = (
+                torch.arange(win, device=device)[None, :] < start_pos.clamp(max=win)[:, None]
+            )  # [G, win]
+            attn_mask = torch.cat(
+                [
+                    ctx_valid[:, None, None, :],
+                    torch.ones(G, 1, 1, B, dtype=torch.bool, device=device),
+                ],
+                dim=-1,
+            )
 
         for li, layer in enumerate(self.layers):
             a = layer.self_attn
-            win_l = kv_windows[:, li]  # [N, win, 2*kv_dim] view
+            win_l = kv_windows[:, li]  # [N, cache_size, 2*kv_dim] view
             # Write the newest committed token's context row unless the worker
             # already included it in the consolidated accepted-token update.
             if not context_precommitted:
                 kv0 = kv0_all[:, li]  # [G, 2*kv_dim]
                 win_l[slots, cols0] = kv0.to(win_l.dtype)
-            ctx = win_l[slots]  # [G, win, 2*kv_dim]
-            k_ctx = ctx[..., : self.kv_dim].view(G, win, self.num_kv_heads, self.head_dim)
-            v_ctx = ctx[..., self.kv_dim :].view(G, win, self.num_kv_heads, self.head_dim)
-
             residual = h
             x = layer.input_layernorm(h)
-            q = a.q_norm(a.q_proj(x).view(G, B, self.num_heads, self.head_dim))
-            q = _apply_rope(q, cos_q, sin_q)
-            k_blk = a.k_norm(a.k_proj(x).view(G, B, self.num_kv_heads, self.head_dim))
-            k_blk = _apply_rope(k_blk, cos_q, sin_q)
+            q_proj = a.q_proj(x).reshape(G * B, self.num_heads * self.head_dim)
+            k_proj = a.k_proj(x).reshape(G * B, self.num_kv_heads * self.head_dim)
+            if use_fused_qk_norm_rope:
+                q_proj, k_proj = fused_separate_qk_norm_rope_(
+                    q_proj,
+                    k_proj,
+                    a.q_norm.weight,
+                    a.k_norm.weight,
+                    cos_table,
+                    sin_table,
+                    pos_q,
+                    eps=self._k_norm_eps,
+                    num_q_heads=self.num_heads,
+                    num_kv_heads=self.num_kv_heads,
+                    head_dim=self.head_dim,
+                )
+                q = q_proj.view(G, B, self.num_heads, self.head_dim)
+                k_blk = k_proj.view(G, B, self.num_kv_heads, self.head_dim)
+            else:
+                q = a.q_norm(q_proj.view(G, B, self.num_heads, self.head_dim))
+                q = _apply_rope(q, cos_q, sin_q)
+                k_blk = a.k_norm(k_proj.view(G, B, self.num_kv_heads, self.head_dim))
+                k_blk = _apply_rope(k_blk, cos_q, sin_q)
             v_blk = a.v_proj(x).view(G, B, self.num_kv_heads, self.head_dim)
 
-            k = torch.cat([k_ctx.to(h.dtype), k_blk], dim=1).transpose(1, 2)
-            v = torch.cat([v_ctx.to(h.dtype), v_blk], dim=1).transpose(1, 2)
-            o = F.scaled_dot_product_attention(
-                q.transpose(1, 2),
-                k,
-                v,
-                attn_mask=attn_mask,
-                scale=self.softmax_scale,
-                enable_gqa=self.num_kv_groups > 1,
-            )
-            o = o.transpose(1, 2).reshape(G, B, self.num_heads * self.head_dim)
+            if use_flash_kvcache:
+                # K and V are disjoint strided views of the existing combined
+                # cache. FlashAttention dereferences request slots directly and
+                # appends the transient block at cache_seqlens, avoiding both
+                # the window gather and the two window-sized concatenations.
+                k_cache = win_l[..., : self.kv_dim].view(
+                    win_l.shape[0], cache_size, self.num_kv_heads, self.head_dim
+                )
+                v_cache = win_l[..., self.kv_dim :].view(
+                    win_l.shape[0], cache_size, self.num_kv_heads, self.head_dim
+                )
+                o = flash_attn_with_kvcache(
+                    q=q,
+                    k_cache=k_cache,
+                    v_cache=v_cache,
+                    k=k_blk,
+                    v=v_blk,
+                    cache_seqlens=cache_seqlens,
+                    cache_batch_idx=cache_batch_idx,
+                    causal=False,
+                    softmax_scale=self.softmax_scale,
+                )
+            else:
+                ctx = win_l[slots, :win]  # [G, win, 2*kv_dim]
+                k_ctx = ctx[..., : self.kv_dim].view(G, win, self.num_kv_heads, self.head_dim)
+                v_ctx = ctx[..., self.kv_dim :].view(G, win, self.num_kv_heads, self.head_dim)
+                k = torch.cat([k_ctx.to(h.dtype), k_blk], dim=1).transpose(1, 2)
+                v = torch.cat([v_ctx.to(h.dtype), v_blk], dim=1).transpose(1, 2)
+                o = F.scaled_dot_product_attention(
+                    q.transpose(1, 2),
+                    k,
+                    v,
+                    attn_mask=attn_mask,
+                    scale=self.softmax_scale,
+                    enable_gqa=self.num_kv_groups > 1,
+                ).transpose(1, 2)
+            o = o.reshape(G, B, self.num_heads * self.head_dim)
             mlp_input, h = layer.post_attention_layernorm(a.o_proj(o), residual)
             h = h + self._fused_mlp(li, mlp_input)
 
@@ -604,7 +696,7 @@ class Qwen3DSparkDraftModel(nn.Module):
                 (
                     T,
                     self.num_stages,
-                    self._attn_params["window_size"],
+                    self._attn_params["cache_size"],
                     self._attn_params["head_dim"],
                 ),
                 dtype=torch.bfloat16,

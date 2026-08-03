@@ -106,6 +106,14 @@ class DSparkSpecMetadata(SpecMetadata):
         # ``DFlashSpecMetadata.prepare`` (dflash.py:96-113).
         worker = getattr(self, "_dspark_worker", None)
         if worker is not None and worker._win_inited:
+            # Rows borrowed by padding dummies in the previous forward become
+            # available again only now, after that forward/graph replay has
+            # completed. Clear their throwaway state before reuse.
+            for slot in worker._borrowed_slots:
+                worker._ctx_len[slot] = 0
+                worker._kv_windows[slot].zero_()
+                worker._free_slots.append(slot)
+            worker._borrowed_slots.clear()
             current = set(self.request_ids)
             for rid in list(worker._req_to_slot.keys()):
                 if rid not in current:
@@ -131,13 +139,31 @@ class DSparkSpecMetadata(SpecMetadata):
                     and rid not in worker._req_to_slot
                 ):
                     worker._assign_slot(rid, reset=False)
-            # Unknown request IDs (synthetic warmup / CUDA-graph padding, ADP idle
-            # requests, or disagg seed forwards without a real id) map to the
-            # dedicated throwaway scratch row so they cannot overwrite a live
-            # request's rolling window (they previously aliased to slot 0).
+            # Unknown context rows are ignored by the draft path and can share
+            # the dedicated scratch row. Each unknown *generation* row instead
+            # borrows a distinct currently-free request slot for this forward.
+            # This does not consume the slot: prepare() runs before every
+            # forward and _assign_slot() clears it before later real use. The
+            # distinct indices are required by flash_attn_with_kvcache, whose
+            # append API does not permit duplicate cache_batch_idx entries.
             scratch = worker._scratch_slot
+            mapped_slots = []
+            for index, rid in enumerate(self.request_ids):
+                if rid in worker._req_to_slot:
+                    mapped_slots.append(worker._req_to_slot[rid])
+                elif index < num_contexts:
+                    mapped_slots.append(scratch)
+                else:
+                    if worker._free_slots:
+                        slot = worker._free_slots.popleft()
+                        worker._borrowed_slots.append(slot)
+                        mapped_slots.append(slot)
+                    else:
+                        raise RuntimeError(
+                            "DSpark has no distinct free cache slot for padded generation request"
+                        )
             mapping = torch.tensor(
-                [worker._req_to_slot.get(rid, scratch) for rid in self.request_ids],
+                mapped_slots,
                 dtype=torch.long,
                 device="cpu",
                 pin_memory=prefer_pinned(),
@@ -223,7 +249,9 @@ class DSparkWorker(SpecWorkerBase):
         # Per-slot rolling captured-context KV windows, built lazily on the
         # first forward (fixed-size for slot-indexed reads/writes).
         self._win_inited = False
-        self._kv_windows: Optional[torch.Tensor] = None  # [max_batch, num_stages, win, hd]
+        # [max_batch, num_stages, win+block, hd]: persistent ring plus a
+        # transient append suffix used by flash_attn_with_kvcache.
+        self._kv_windows: Optional[torch.Tensor] = None
         self._ctx_len: Optional[torch.Tensor] = None  # [max_batch] abs decode position
         self._win = 0
 
@@ -239,6 +267,7 @@ class DSparkWorker(SpecWorkerBase):
         # unknown request IDs (set in ``_lazy_init`` to ``max_batch``); it is
         # never handed out through ``_free_slots``.
         self._scratch_slot = 0
+        self._borrowed_slots = []
 
         # The generation draft path is the batched, host-sync-free
         # ``_draft_gen_block_batched`` + ``DSparkDraftModel.forward_batched`` +
@@ -292,19 +321,21 @@ class DSparkWorker(SpecWorkerBase):
 
         self._graph_dummy_id_floor = CUDA_GRAPH_DUMMY_REQUEST_ID - self.max_draft_len
 
+        cache_size = int(draft_model._attn_params.get("cache_size", self._win))
         self._kv_windows = torch.zeros(
-            (num_rows, num_stages, self._win, head_dim),
+            (num_rows, num_stages, cache_size, head_dim),
             dtype=torch.bfloat16,
             device="cuda",
         )
         self._ctx_len = torch.zeros(num_rows, dtype=torch.long, device="cuda")
         self._batch_to_slot = torch.zeros(max_batch, dtype=torch.long, device="cuda")
         self._free_slots = deque(range(max_batch))
+        self._borrowed_slots = []
         self._req_to_slot = {}
         self._win_inited = True
         logger.info(
             f"DSpark: allocated rolling KV windows "
-            f"[{num_rows}, {num_stages}, {self._win}, {head_dim}] "
+            f"[{num_rows}, {num_stages}, {cache_size}, {head_dim}] "
             f"({max_batch} request slots + 1 scratch row)"
         )
 

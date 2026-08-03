@@ -306,7 +306,15 @@ def test_attention_uses_native_gqa(setup, monkeypatch):
     calls = []
 
     def _record_sdpa(q, k, v, **kwargs):
-        calls.append((q.shape[1], k.shape[1], v.shape[1], kwargs.get("enable_gqa")))
+        calls.append(
+            (
+                q.shape[1],
+                k.shape[1],
+                v.shape[1],
+                kwargs.get("enable_gqa"),
+                kwargs["attn_mask"].detach().clone(),
+            )
+        )
         return real_sdpa(q, k, v, **kwargs)
 
     monkeypatch.setattr(F, "scaled_dot_product_attention", _record_sdpa)
@@ -319,7 +327,214 @@ def test_attention_uses_native_gqa(setup, monkeypatch):
     )
 
     assert calls
-    assert all(call == (N_HEADS, N_KV_HEADS, N_KV_HEADS, True) for call in calls)
+    assert all(call[:4] == (N_HEADS, N_KV_HEADS, N_KV_HEADS, True) for call in calls)
+
+    expected_context = (
+        torch.arange(win, device=device)[None, None, None, :] < start[:, None, None, None]
+    )
+    expected_mask = torch.cat(
+        [
+            expected_context,
+            torch.ones(1, 1, 1, BLOCK, dtype=torch.bool, device=device),
+        ],
+        dim=-1,
+    )
+    legacy_mask = torch.cat(
+        [
+            expected_context.expand(1, 1, BLOCK, win),
+            torch.ones(1, 1, BLOCK, BLOCK, dtype=torch.bool, device=device),
+        ],
+        dim=-1,
+    )
+    for *_, attn_mask in calls:
+        assert attn_mask.shape == (1, 1, 1, win + BLOCK)
+        assert torch.equal(attn_mask, expected_mask)
+        assert torch.equal(attn_mask.expand_as(legacy_mask), legacy_mask)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires FlashAttention")
+def test_flash_kvcache_matches_sdpa_for_partial_full_and_wrapped_rings(setup, monkeypatch):
+    """The production cache route preserves the legacy SDPA draft result."""
+    _, model, device = setup
+    monkeypatch.setenv("TRTLLM_DSPARK_QWEN3_FUSED_QK_NORM_ROPE", "0")
+    gen = torch.Generator().manual_seed(29)
+    win = model._attn_params["window_size"]
+    cache_size = model._attn_params["cache_size"]
+    assert cache_size == win + BLOCK
+
+    num_slots = 4
+    slots = torch.tensor([2, 0, 3], device=device)
+    start = torch.tensor([5, win, win + 9], device=device)
+    ring = torch.randn(
+        num_slots,
+        model.num_stages,
+        win,
+        model._attn_params["head_dim"],
+        generator=gen,
+        dtype=DTYPE,
+    ).to(device)
+    flash_windows = torch.full(
+        (
+            num_slots,
+            model.num_stages,
+            cache_size,
+            model._attn_params["head_dim"],
+        ),
+        17.0,
+        dtype=DTYPE,
+        device=device,
+    )
+    flash_windows[:, :, :win].copy_(ring)
+    legacy_windows = flash_windows.clone()
+
+    main_hidden = _rand_hidden(gen, 3).to(device)
+    bonus = torch.tensor([11, 22, 33], device=device)
+    monkeypatch.setenv("TRTLLM_DSPARK_QWEN3_FLASH_KVCACHE", "0")
+    legacy_tokens, legacy_n, legacy_logits = model.forward_batched(
+        main_hidden,
+        bonus,
+        start,
+        kv_windows=legacy_windows,
+        slots=slots,
+        context_precommitted=True,
+        return_logits=True,
+    )
+    monkeypatch.setenv("TRTLLM_DSPARK_QWEN3_FLASH_KVCACHE", "1")
+    flash_tokens, flash_n, flash_logits = model.forward_batched(
+        main_hidden,
+        bonus,
+        start,
+        kv_windows=flash_windows,
+        slots=slots,
+        context_precommitted=True,
+        return_logits=True,
+    )
+
+    assert torch.equal(flash_tokens, legacy_tokens)
+    assert torch.equal(flash_n, legacy_n)
+    torch.testing.assert_close(flash_logits, legacy_logits, atol=0.05, rtol=0.05)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires Triton")
+def test_fused_separate_qk_norm_rope_matches_fallback(setup, monkeypatch):
+    """The separate-input fusion preserves draft tokens and corrected logits."""
+    _, model, device = setup
+    monkeypatch.setenv("TRTLLM_DSPARK_QWEN3_FLASH_KVCACHE", "0")
+    gen = torch.Generator().manual_seed(31)
+    win = model._attn_params["window_size"]
+    cache_size = model._attn_params["cache_size"]
+    slots = torch.tensor([2, 0, 3], device=device)
+    start = torch.tensor([5, win, win + 9], device=device)
+    kv_windows = torch.randn(
+        4,
+        model.num_stages,
+        cache_size,
+        model._attn_params["head_dim"],
+        generator=gen,
+        dtype=DTYPE,
+    ).to(device)
+    main_hidden = _rand_hidden(gen, 3).to(device)
+    bonus = torch.tensor([17, 29, 41], device=device)
+
+    monkeypatch.setenv("TRTLLM_DSPARK_QWEN3_FUSED_QK_NORM_ROPE", "0")
+    reference_tokens, reference_n, reference_logits = model.forward_batched(
+        main_hidden,
+        bonus,
+        start,
+        kv_windows=kv_windows.clone(),
+        slots=slots,
+        context_precommitted=True,
+        return_logits=True,
+    )
+
+    monkeypatch.setenv("TRTLLM_DSPARK_QWEN3_FUSED_QK_NORM_ROPE", "1")
+    fused_tokens, fused_n, fused_logits = model.forward_batched(
+        main_hidden,
+        bonus,
+        start,
+        kv_windows=kv_windows.clone(),
+        slots=slots,
+        context_precommitted=True,
+        return_logits=True,
+    )
+
+    assert torch.equal(fused_tokens, reference_tokens)
+    assert torch.equal(fused_n, reference_n)
+    torch.testing.assert_close(fused_logits, reference_logits, atol=0.05, rtol=0.05)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_combined_fast_paths_cuda_graph_replay(setup, monkeypatch):
+    """Flash, fused Q/K+RoPE, and Markov replay together with unique slots."""
+    _, model, device = setup
+    monkeypatch.setenv("TRTLLM_DSPARK_QWEN3_FLASH_KVCACHE", "1")
+    monkeypatch.setenv("TRTLLM_DSPARK_QWEN3_FUSED_QK_NORM_ROPE", "1")
+    monkeypatch.setattr(model.markov_head, "use_fused_greedy_addmm", True)
+
+    win = model._attn_params["window_size"]
+    cache_size = model._attn_params["cache_size"]
+    cache_shape = (
+        4,
+        model.num_stages,
+        cache_size,
+        model._attn_params["head_dim"],
+    )
+
+    def inputs(seed, slots):
+        generator = torch.Generator().manual_seed(seed)
+        hidden = _rand_hidden(generator, 3).to(device)
+        bonus = torch.randint(0, VOCAB, (3,), generator=generator).to(device)
+        start = torch.full((3,), win, dtype=torch.long, device=device)
+        cache = torch.randn(cache_shape, generator=generator, dtype=DTYPE).to(device)
+        cache[:, :, win:].zero_()
+        return hidden, bonus, start, torch.tensor(slots, device=device), cache
+
+    warm = inputs(37, [0, 1, 2])
+    static_hidden, static_bonus, static_start, static_slots, static_cache = inputs(41, [0, 1, 2])
+    with torch.inference_mode():
+        # Warm lazy imports and the Triton specialization before capture.
+        model.forward_batched(
+            *warm[:3],
+            kv_windows=warm[4],
+            slots=warm[3],
+            context_precommitted=True,
+        )
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            graph_tokens, graph_num_proposed = model.forward_batched(
+                static_hidden,
+                static_bonus,
+                static_start,
+                kv_windows=static_cache,
+                slots=static_slots,
+                context_precommitted=True,
+            )
+
+        # Slot 2 represents a real request; 0 and 3 are distinct free rows
+        # borrowed by padded requests. Change the mapping between replays.
+        replay = inputs(43, [2, 0, 3])
+        reference_cache = replay[4].clone()
+        reference_tokens, reference_num_proposed = model.forward_batched(
+            *replay[:3],
+            kv_windows=reference_cache,
+            slots=replay[3],
+            context_precommitted=True,
+        )
+        static_hidden.copy_(replay[0])
+        static_bonus.copy_(replay[1])
+        static_start.copy_(replay[2])
+        static_slots.copy_(replay[3])
+        static_cache.copy_(replay[4])
+        graph.replay()
+        torch.cuda.synchronize()
+
+    assert torch.equal(graph_tokens, reference_tokens)
+    assert torch.equal(graph_num_proposed, reference_num_proposed)
+    # A full ring appends only in the transient suffix, so graph replay cannot
+    # corrupt any real or borrowed request's persistent prefix.
+    assert torch.equal(static_cache[:, :, :win], replay[4][:, :, :win])
+    assert torch.count_nonzero(static_cache[:, :, win:]) > 0
 
 
 def test_fused_gate_up_matches_separate_projections(setup):

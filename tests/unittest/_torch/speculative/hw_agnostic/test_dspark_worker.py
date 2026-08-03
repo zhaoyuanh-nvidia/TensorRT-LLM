@@ -215,6 +215,7 @@ def test_worker_lazy_init_window_buffers():
     assert worker._kv_windows.shape == (9, 3, 128, 64)
     assert worker._ctx_len.shape == (9,)
     assert worker._scratch_slot == 8
+    assert worker._borrowed_slots == []
     # Dummy-id floor separates real request ids from CUDA-graph padding ids.
     assert worker._graph_dummy_id_floor == (1 << 64) - 1 - worker.max_draft_len
     # The scratch row is never handed out through the free pool.
@@ -420,8 +421,8 @@ def test_prepare_assigns_slots_to_disagg_generation_requests():
     assert worker._batch_to_slot[:2].tolist() == [s0, s1]
 
 
-def test_prepare_keeps_dummy_generation_requests_on_scratch_row():
-    """ADP-idle (id 0) and CUDA-graph padding dummies never consume a real slot."""
+def test_prepare_gives_dummy_generation_requests_distinct_free_slots():
+    """Flash append gets unique cache rows without consuming request slots."""
     from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
     from tensorrt_llm._torch.pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
 
@@ -437,16 +438,45 @@ def test_prepare_keeps_dummy_generation_requests_on_scratch_row():
 
     s_real = worker._req_to_slot[1000]
     assert s_real != worker._scratch_slot
-    # Dummies are neither registered nor given a real slot; they map to scratch.
+    # Dummies are not registered, but each borrows a distinct free row for this
+    # forward so FlashAttention never receives duplicate cache indices.
     assert ATTENTION_DP_DUMMY_REQUEST_ID not in worker._req_to_slot
     assert graph_dummy not in worker._req_to_slot
-    assert worker._batch_to_slot[:3].tolist() == [
-        s_real,
-        worker._scratch_slot,
-        worker._scratch_slot,
-    ]
-    # Exactly one real slot consumed.
-    assert list(worker._free_slots) == [1, 2, 3]
+    mapped = worker._batch_to_slot[:3].tolist()
+    assert mapped[0] == s_real
+    assert len(set(mapped)) == 3
+    assert mapped[1:] == [1, 2]
+    # Exactly one real slot is persistent; two dummy rows are reserved only
+    # until the next prepare.
+    assert list(worker._free_slots) == [3]
+    assert worker._borrowed_slots == [1, 2]
+
+    meta.request_ids = [1000]
+    meta.num_generations = 1
+    meta.prepare()
+    assert worker._borrowed_slots == []
+    assert set(worker._free_slots) == {1, 2, 3}
+
+
+def test_dummy_borrow_cannot_collide_with_later_context_seed():
+    """A mixed batch reserves dummy rows before context slot assignment."""
+    from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
+
+    worker = _make_worker()
+    meta = _make_metadata(max_num_requests=4)
+    worker._lazy_init(_fake_draft_model(), meta)
+    meta._dspark_worker = worker
+
+    context_id = 2000
+    graph_dummy = CUDA_GRAPH_DUMMY_REQUEST_ID - worker.max_draft_len
+    meta.request_ids = [context_id, graph_dummy]
+    meta.num_generations = 1
+    meta.prepare()
+
+    dummy_slot = int(worker._batch_to_slot[1])
+    assert dummy_slot in worker._borrowed_slots
+    context_slot = worker._assign_slot(context_id, reset=True)
+    assert context_slot != dummy_slot
 
 
 def test_forward_mixed_batch_routes_through_base_entries(monkeypatch):

@@ -68,6 +68,9 @@ class VanillaMarkov(nn.Module):
         )
         self.markov_w1 = nn.Embedding(self.vocab_size, self.markov_rank)
         self.markov_w2 = nn.Linear(self.markov_rank, self.vocab_size, bias=False)
+        # Opt-in per model so the Qwen3 fast path cannot silently alter other
+        # VanillaMarkov users (notably the DeepSeek DSpark implementation).
+        self.use_fused_greedy_addmm = False
 
     def get_prev_embeddings(self, token_ids: torch.Tensor) -> torch.Tensor:
         return self.markov_w1(token_ids.long())
@@ -116,9 +119,29 @@ class VanillaMarkov(nn.Module):
         prev = first_prev_token_ids.long()
         for k in range(block_size):
             step_hidden = None if hidden_states is None else hidden_states[:, k]
-            step_logits = self.apply_step_logits(
-                base_logits[:, k], token_ids=prev, hidden_states=step_hidden
-            )
+            if (
+                self.use_fused_greedy_addmm
+                and self.markov_head_type == "vanilla"
+                and not collect_logits
+                and temperature <= 0.0
+                and not torch.is_grad_enabled()
+                and base_logits.is_cuda
+                and base_logits.dtype == torch.bfloat16
+            ):
+                # Preserve the efficient K-position batched LM projection, then
+                # fold the low-rank Markov projection and base-logit correction
+                # into one GEMM epilogue for each sequential greedy step.
+                step_logits = base_logits[:, k]
+                torch.addmm(
+                    step_logits,
+                    self.get_prev_embeddings(prev),
+                    self.markov_w2.weight.t(),
+                    out=step_logits,
+                )
+            else:
+                step_logits = self.apply_step_logits(
+                    base_logits[:, k], token_ids=prev, hidden_states=step_hidden
+                )
             if collect_logits:
                 corrected.append(step_logits.unsqueeze(1))
             prev = greedy_or_sample(step_logits, temperature)

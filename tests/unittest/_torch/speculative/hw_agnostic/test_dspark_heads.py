@@ -75,6 +75,80 @@ def test_markov_bias_is_additive_low_rank():
     assert torch.allclose(corrected[:, 0], expected0, atol=1e-5)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_fused_vanilla_markov_addmm_cuda_graph_matches_reference():
+    """Exercise the Qwen3 greedy BF16 fast path under CUDA graph replay."""
+    torch.manual_seed(7)
+    vocab_size, rank, batch_size, block_size = 4096, 256, 3, 7
+    head = VanillaMarkov(vocab_size=vocab_size, markov_rank=rank).cuda().to(torch.bfloat16).eval()
+
+    def inputs(seed):
+        generator = torch.Generator(device="cuda").manual_seed(seed)
+        base = torch.randn(
+            batch_size,
+            block_size,
+            vocab_size,
+            generator=generator,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        first = torch.randint(
+            0,
+            vocab_size,
+            (batch_size,),
+            generator=generator,
+            device="cuda",
+        )
+        return base, first
+
+    base, first = inputs(11)
+    with torch.inference_mode():
+        head.use_fused_greedy_addmm = False
+        reference, _ = head.sample_block_tokens(
+            base.clone(),
+            first_prev_token_ids=first,
+            hidden_states=None,
+            collect_logits=False,
+        )
+        head.use_fused_greedy_addmm = True
+        candidate_base = base.clone()
+        candidate, _ = head.sample_block_tokens(
+            candidate_base,
+            first_prev_token_ids=first,
+            hidden_states=None,
+            collect_logits=False,
+        )
+        assert torch.equal(candidate, reference)
+        assert not torch.equal(candidate_base, base)
+
+        static_base, static_first = inputs(13)
+        graph = torch.cuda.CUDAGraph()
+        torch.cuda.synchronize()
+        with torch.cuda.graph(graph):
+            graph_tokens, _ = head.sample_block_tokens(
+                static_base,
+                first_prev_token_ids=static_first,
+                hidden_states=None,
+                collect_logits=False,
+            )
+
+        replay_base, replay_first = inputs(17)
+        head.use_fused_greedy_addmm = False
+        replay_reference, _ = head.sample_block_tokens(
+            replay_base.clone(),
+            first_prev_token_ids=replay_first,
+            hidden_states=None,
+            collect_logits=False,
+        )
+        head.use_fused_greedy_addmm = True
+        static_base.copy_(replay_base)
+        static_first.copy_(replay_first)
+        graph.replay()
+        torch.cuda.synchronize()
+
+    assert torch.equal(graph_tokens, replay_reference)
+
+
 def test_rnn_state_carries_across_positions():
     torch.manual_seed(2)
     head = RNNHead(vocab_size=VOCAB, markov_rank=RANK, hidden_size=HID).eval()
