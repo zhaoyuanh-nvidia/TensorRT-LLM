@@ -34,6 +34,7 @@ from tensorrt_llm.inputs.registry import (BaseMultimodalDummyInputsBuilder,
                                           create_input_processor,
                                           create_input_processor_with_hash)
 from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig, DecodingBaseConfig,
+                                          DSparkDecodingConfig,
                                           EncodeCudaGraphConfig,
                                           SeqLenAwareSparseAttentionConfig,
                                           TorchCompileConfig, TorchLlmArgs)
@@ -71,6 +72,7 @@ from ..speculative import (SpecMetadata, get_draft_kv_cache_manager,
                            restore_attn_metadata_after_draft_replay,
                            update_spec_config_from_loaded_model)
 from ..speculative.drafting_loops import BaseDraftingLoopWrapper
+from ..speculative.dspark import DSparkSpecMetadata
 from ..speculative.eagle3 import Eagle3ResourceManager, Eagle3SpecMetadata
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..utils import (get_model_extra_attrs,
@@ -754,6 +756,21 @@ class PyTorchModelEngine(ModelEngine):
                 (self.max_num_tokens, ), dtype=torch.int, device='cuda')
             self.previous_kv_lens_offsets_cuda = torch.zeros(
                 (self.batch_size, ), dtype=torch.int, device='cuda')
+            self.dspark_confidence_pack_indices_cuda = None
+            self.dspark_confidence_query_lens_cuda = None
+            self.dspark_confidence_previous_slots_cuda = None
+            if (isinstance(spec_config, DSparkDecodingConfig)
+                    and spec_config.is_fixed_budget_confidence_enabled):
+                # Fixed-capacity DSpark confidence scheduling packs a dense
+                # [G, K+1] proposal buffer into a constant V-token verifier
+                # input. Allocate the maps once so graph replay never observes
+                # a data-dependent allocation or address.
+                self.dspark_confidence_pack_indices_cuda = torch.empty(
+                    (self.max_num_tokens, ), dtype=torch.long, device='cuda')
+                self.dspark_confidence_query_lens_cuda = torch.empty(
+                    (self.batch_size, ), dtype=torch.int, device='cuda')
+                self.dspark_confidence_previous_slots_cuda = torch.empty(
+                    (self.batch_size, ), dtype=torch.long, device='cuda')
             self.without_logits = self.spec_config.spec_dec_mode.without_logits(
             ) or self.model_is_wrapped
             self.max_total_draft_tokens = spec_config.tokens_per_gen_step - 1
@@ -5068,6 +5085,58 @@ class PyTorchModelEngine(ModelEngine):
         runtime_tokens_per_gen_step = self.get_runtime_tokens_per_gen_step(
             self.runtime_draft_len)
         runtime_draft_token_buffer_width = runtime_tokens_per_gen_step - 1
+
+        # DSpark fixed-budget mode keeps the physical draft block at K while
+        # verifying a prefix-closed, per-request subset whose total query width
+        # is the graph-static budget V. Host request state already carries the
+        # retained lengths copied by SpecSampler, so metadata preparation needs
+        # no new device synchronization here.
+        confidence_fixed_budget_active = False
+        confidence_verifier_token_budget = None
+        confidence_input_draft_lens = None
+        if (isinstance(spec_config, DSparkDecodingConfig) and getattr(
+                spec_config, "is_fixed_budget_confidence_enabled", False)
+                and (next_draft_tokens_device is not None or
+                     (self.is_warmup and bool(extend_requests)
+                      and all(request.is_dummy for request in extend_requests)))
+                and num_ctx_requests == 0 and not generation_requests
+                and not first_draft_requests
+                and (not any(request.is_dummy for request in extend_requests) or
+                     (self.is_warmup and all(request.is_dummy
+                                             for request in extend_requests)))
+                and not self.use_mrope and self.guided_decoder is None
+                and not self.enable_attention_dp and spec_metadata is not None
+                and spec_metadata.is_all_greedy_sample):
+            resolver = getattr(spec_config,
+                               "resolve_confidence_verifier_token_budget", None)
+            if resolver is not None:
+                confidence_verifier_token_budget = resolver(
+                    len(extend_requests))
+            if confidence_verifier_token_budget is not None:
+                if self.is_warmup and all(request.is_dummy
+                                          for request in extend_requests):
+                    retained_budget = (confidence_verifier_token_budget -
+                                       len(extend_requests))
+                    base, extra = divmod(retained_budget, len(extend_requests))
+                    confidence_input_draft_lens = [
+                        base + (idx < extra)
+                        for idx in range(len(extend_requests))
+                    ]
+                else:
+                    confidence_input_draft_lens = [
+                        (request.py_draft_tokens_effective_len
+                         if request.py_draft_tokens_effective_len is not None
+                         else get_draft_token_length(request))
+                        for request in extend_requests
+                    ]
+                confidence_fixed_budget_active = (
+                    len(confidence_input_draft_lens) > 0
+                    and max(confidence_input_draft_lens) <= self.max_draft_len
+                    and len(confidence_input_draft_lens) +
+                    sum(confidence_input_draft_lens)
+                    == confidence_verifier_token_budget)
+
+        confidence_extend_index = 0
         for request in extend_requests:
             is_promoted_context = (request.py_request_id
                                    in promoted_context_request_ids)
@@ -5098,7 +5167,10 @@ class PyTorchModelEngine(ModelEngine):
                     input_ids.extend(request.py_draft_tokens)
                     draft_tokens.extend(request.py_draft_tokens)
                 # get other ids and lengths
-                num_draft_tokens = get_draft_token_length(request)
+                num_draft_tokens = (
+                    confidence_input_draft_lens[confidence_extend_index]
+                    if confidence_fixed_budget_active else
+                    get_draft_token_length(request))
                 past_seen_token_num = (request.context_current_position
                                        if is_promoted_context else
                                        request.max_beam_num_tokens - 1)
@@ -5131,37 +5203,43 @@ class PyTorchModelEngine(ModelEngine):
                 previous_batch_idx = request.py_batch_idx
                 request.py_batch_idx = request.py_seq_slot
 
-                sequence_lengths.append(runtime_tokens_per_gen_step)
+                request_draft_len = (
+                    confidence_input_draft_lens[confidence_extend_index]
+                    if confidence_fixed_budget_active else
+                    runtime_draft_token_buffer_width)
+                request_query_len = request_draft_len + 1
+                sequence_lengths.append(request_query_len)
                 num_accepted_draft_tokens.append(
                     request.py_num_accepted_draft_tokens)
                 past_seen_token_num = request.max_beam_num_tokens - 1
 
-                draft_lens.append(runtime_draft_token_buffer_width)
+                draft_lens.append(request_draft_len)
                 gather_ids.extend(
                     list(
                         range(len(position_ids),
-                              len(position_ids) + runtime_tokens_per_gen_step)))
+                              len(position_ids) + request_query_len)))
                 position_ids.extend(
                     list(
-                        range(past_seen_token_num, past_seen_token_num +
-                              runtime_tokens_per_gen_step)))
+                        range(past_seen_token_num,
+                              past_seen_token_num + request_query_len)))
                 # previous tensor
                 previous_batch_indices.append(previous_batch_idx)
                 previous_pos_indices.extend([previous_batch_idx] *
-                                            runtime_tokens_per_gen_step)
+                                            request_query_len)
 
                 num_cached_tokens_per_seq.append(
-                    past_seen_token_num + runtime_tokens_per_gen_step -
+                    past_seen_token_num + request_query_len -
                     request.py_num_compressed_tokens)
                 request.cached_tokens = (past_seen_token_num +
-                                         runtime_tokens_per_gen_step)
+                                         request_query_len)
                 if self.enable_spec_decode and spec_config.spec_dec_mode.extend_ctx(
                         self.attn_backend) and spec_config.is_linear_tree:
-                    prompt_lengths.append(runtime_tokens_per_gen_step)
+                    prompt_lengths.append(request_query_len)
                 else:
                     prompt_lengths.append(request.py_prompt_len)
 
             append_cross_attention_state(request, project_encoder_output=False)
+            confidence_extend_index += 1
 
         for request in first_draft_requests:
             request_ids.append(request.py_request_id)
@@ -5587,31 +5665,117 @@ class PyTorchModelEngine(ModelEngine):
             runtime_draft_token_buffer_width = runtime_tokens_per_gen_step - 1
 
             if previous_batch_len > 0:
+                if (confidence_fixed_budget_active
+                        and previous_batch_len != len(extend_requests)):
+                    raise RuntimeError(
+                        "DSpark fixed-budget confidence scheduling requires a "
+                        "generation-only batch whose requests all carry the "
+                        "previous overlap-scheduler tensors")
                 previous_slots = previous_seq_slots_device()
-                # previous input ids
-                previous_batch_tokens = (previous_batch_len *
-                                         runtime_tokens_per_gen_step)
-                new_tokens = new_tokens_device.transpose(
-                    0,
-                    1)[previous_slots, :runtime_tokens_per_gen_step].flatten()
+                if confidence_fixed_budget_active:
+                    assert self.dspark_confidence_pack_indices_cuda is not None
+                    assert self.dspark_confidence_query_lens_cuda is not None
+                    assert self.dspark_confidence_previous_slots_cuda is not None
+                    query_lens = [
+                        draft_len + 1
+                        for draft_len in confidence_input_draft_lens
+                    ]
+                    previous_batch_tokens = sum(query_lens)
+                    assert previous_batch_tokens == confidence_verifier_token_budget
+
+                    # Pack from the fixed [G, K+1] device buffer with a
+                    # fixed-length index map. The selected row count is the
+                    # graph key's V, so index_select has a static output shape.
+                    pack_indices = [
+                        row * runtime_tokens_per_gen_step + local
+                        for row, query_len in enumerate(query_lens)
+                        for local in range(query_len)
+                    ]
+                    pack_indices_host = torch.tensor(
+                        pack_indices,
+                        dtype=torch.long,
+                        pin_memory=prefer_pinned(),
+                    )
+                    self.dspark_confidence_pack_indices_cuda[:previous_batch_tokens].copy_(
+                        pack_indices_host, non_blocking=True)
+                    dense_new_tokens = new_tokens_device.transpose(
+                        0, 1)[previous_slots, :runtime_tokens_per_gen_step]
+                    new_tokens = dense_new_tokens.reshape(-1).index_select(
+                        0,
+                        self.
+                        dspark_confidence_pack_indices_cuda[:
+                                                            previous_batch_tokens],
+                    )
+                else:
+                    previous_batch_tokens = (previous_batch_len *
+                                             runtime_tokens_per_gen_step)
+                    new_tokens = new_tokens_device.transpose(0, 1)[
+                        previous_slots, :runtime_tokens_per_gen_step].flatten()
                 self.input_ids_cuda[num_tokens:num_tokens +
                                     previous_batch_tokens].copy_(
                                         new_tokens, non_blocking=True)
 
                 # previous draft tokens
-                previous_batch_draft_tokens = (previous_batch_len *
+                previous_batch_draft_tokens = (sum(confidence_input_draft_lens)
+                                               if confidence_fixed_budget_active
+                                               else previous_batch_len *
                                                runtime_draft_token_buffer_width)
                 if runtime_draft_token_buffer_width > 0:
-                    self.draft_tokens_cuda[
-                        num_draft_tokens:num_draft_tokens +
-                        previous_batch_draft_tokens].copy_(
-                            next_draft_tokens_device[
-                                previous_slots, :
-                                runtime_draft_token_buffer_width].flatten(),
-                            non_blocking=True)
+                    dense_draft_tokens = next_draft_tokens_device[
+                        previous_slots, :runtime_draft_token_buffer_width]
+                    if confidence_fixed_budget_active:
+                        draft_pack_indices = [
+                            row * runtime_draft_token_buffer_width + local
+                            for row, draft_len in enumerate(
+                                confidence_input_draft_lens)
+                            for local in range(draft_len)
+                        ]
+                        draft_pack_indices_host = torch.tensor(
+                            draft_pack_indices,
+                            dtype=torch.long,
+                            pin_memory=prefer_pinned(),
+                        )
+                        self.dspark_confidence_pack_indices_cuda[:previous_batch_draft_tokens].copy_(
+                            draft_pack_indices_host, non_blocking=True)
+                        packed_draft_tokens = dense_draft_tokens.reshape(
+                            -1
+                        ).index_select(
+                            0,
+                            self.
+                            dspark_confidence_pack_indices_cuda[:
+                                                                previous_batch_draft_tokens],
+                        )
+                    else:
+                        packed_draft_tokens = dense_draft_tokens.flatten()
+                    self.draft_tokens_cuda[num_draft_tokens:num_draft_tokens +
+                                           previous_batch_draft_tokens].copy_(
+                                               packed_draft_tokens,
+                                               non_blocking=True)
                 # prepare data for the preprocess inputs
-                kv_len_offsets_device = (new_tokens_lens_device -
-                                         runtime_tokens_per_gen_step)
+                if confidence_fixed_budget_active:
+                    query_lens_host = torch.tensor(
+                        query_lens,
+                        dtype=torch.int,
+                        pin_memory=prefer_pinned(),
+                    )
+                    confidence_previous_slots = (
+                        self.
+                        dspark_confidence_previous_slots_cuda[:
+                                                              previous_batch_len]
+                    )
+                    confidence_previous_slots.copy_(previous_slots,
+                                                    non_blocking=True)
+                    self.dspark_confidence_query_lens_cuda.index_copy_(
+                        0,
+                        confidence_previous_slots,
+                        query_lens_host.to(device="cuda", non_blocking=True),
+                    )
+                    kv_len_offsets_device = (
+                        new_tokens_lens_device -
+                        self.dspark_confidence_query_lens_cuda)
+                else:
+                    kv_len_offsets_device = (new_tokens_lens_device -
+                                             runtime_tokens_per_gen_step)
                 previous_pos_indices_host = torch.tensor(
                     previous_pos_indices,
                     dtype=torch.int,
@@ -5635,10 +5799,16 @@ class PyTorchModelEngine(ModelEngine):
 
                 num_extend_reqeust_wo_dummy = len(extend_requests) - len(
                     extend_dummy_requests)
-                self.previous_pos_id_offsets_cuda[
+                previous_token_start = (
+                    0 if confidence_fixed_budget_active else
                     (num_extend_reqeust_wo_dummy - previous_batch_len) *
-                    runtime_tokens_per_gen_step:num_extend_reqeust_wo_dummy *
-                    runtime_tokens_per_gen_step].copy_(
+                    runtime_tokens_per_gen_step)
+                previous_token_end = (previous_batch_tokens
+                                      if confidence_fixed_budget_active else
+                                      num_extend_reqeust_wo_dummy *
+                                      runtime_tokens_per_gen_step)
+                self.previous_pos_id_offsets_cuda[
+                    previous_token_start:previous_token_end].copy_(
                         new_tokens_lens_device[self.previous_pos_indices_cuda[
                             0:previous_batch_tokens]],
                         non_blocking=True)
@@ -5761,9 +5931,12 @@ class PyTorchModelEngine(ModelEngine):
                 helix_is_inactive_rank=helix_is_inactive_rank,
             )
 
-        if not attn_metadata.is_cuda_graph:
+        if not attn_metadata.is_cuda_graph or confidence_fixed_budget_active:
             # Assumes seq lens do not change between CUDA graph invocations. This applies
-            # to draft sequences too. This means that all draft sequences must be padded.
+            # to ordinary draft sequences too. Fixed-budget DSpark is the
+            # exception: only sum(query_lens)==V is graph-static, while each
+            # request's d_i+1 varies. The setter copies into the metadata's
+            # stable CUDA buffer, so updating it does not invalidate capture.
             attn_metadata.seq_lens = torch.tensor(
                 sequence_lengths,
                 dtype=torch.int,
@@ -5893,6 +6066,20 @@ class PyTorchModelEngine(ModelEngine):
             total_draft_lens = sum(draft_lens)
             spec_metadata.draft_tokens = self.draft_tokens_cuda[:
                                                                 total_draft_lens]
+            if isinstance(spec_metadata, DSparkSpecMetadata):
+                spec_metadata.confidence_fixed_budget_active = (
+                    confidence_fixed_budget_active)
+                spec_metadata.confidence_verifier_token_budget = (
+                    confidence_verifier_token_budget
+                    if confidence_fixed_budget_active else 0)
+                if confidence_fixed_budget_active:
+                    draft_lens_host = torch.tensor(
+                        draft_lens,
+                        dtype=torch.int,
+                        pin_memory=prefer_pinned(),
+                    )
+                    spec_metadata.draft_lens[:len(draft_lens)].copy_(
+                        draft_lens_host, non_blocking=True)
             spec_metadata.request_ids = request_ids
             spec_metadata.gather_ids = self.gather_ids_cuda[:len(gather_ids)]
             spec_metadata.num_generations = len(
@@ -7053,6 +7240,61 @@ class PyTorchModelEngine(ModelEngine):
             spec_metadata.runtime_draft_len = self.runtime_draft_len
             spec_metadata.runtime_tokens_per_gen_step = (
                 self.get_runtime_tokens_per_gen_step(self.runtime_draft_len))
+
+            # Make the packed DSpark query lengths visible before attention
+            # metadata is prepared. _prepare_tp_inputs repeats the guard while
+            # packing token IDs; keeping both decisions host-side avoids a
+            # confidence-dependent device read or synchronization.
+            if isinstance(spec_metadata, DSparkSpecMetadata):
+                spec_metadata.confidence_fixed_budget_active = False
+                spec_metadata.confidence_verifier_token_budget = 0
+                spec_config = self.spec_config
+                gen_requests = scheduled_requests.generation_requests
+                if (isinstance(spec_config, DSparkDecodingConfig) and getattr(
+                        spec_config,
+                        "is_fixed_budget_confidence_enabled",
+                        False,
+                ) and scheduled_requests.num_context_requests == 0
+                        and len(gen_requests) == scheduled_requests.batch_size
+                        and
+                    (not any(request.is_dummy for request in gen_requests) or
+                     (self.is_warmup and all(request.is_dummy
+                                             for request in gen_requests)))
+                        and spec_metadata.is_all_greedy_sample
+                        and not self.use_mrope and self.guided_decoder is None
+                        and not self.enable_attention_dp):
+                    budget = spec_config.resolve_confidence_verifier_token_budget(
+                        len(gen_requests))
+                    if budget is not None and gen_requests:
+                        if self.is_warmup and all(request.is_dummy
+                                                  for request in gen_requests):
+                            retained_budget = budget - len(gen_requests)
+                            base, extra = divmod(retained_budget,
+                                                 len(gen_requests))
+                            retained_lens = [
+                                base + (idx < extra)
+                                for idx in range(len(gen_requests))
+                            ]
+                        else:
+                            retained_lens = [
+                                (request.py_draft_tokens_effective_len
+                                 if request.py_draft_tokens_effective_len
+                                 is not None else
+                                 get_draft_token_length(request))
+                                for request in gen_requests
+                            ]
+                        if (max(retained_lens) <= self.max_draft_len
+                                and len(retained_lens) + sum(retained_lens)
+                                == budget):
+                            retained_lens_host = torch.tensor(
+                                retained_lens,
+                                dtype=torch.int,
+                                pin_memory=prefer_pinned(),
+                            )
+                            spec_metadata.draft_lens[:len(retained_lens)].copy_(
+                                retained_lens_host, non_blocking=True)
+                            spec_metadata.confidence_fixed_budget_active = True
+                            spec_metadata.confidence_verifier_token_budget = budget
 
             # Parallel-draft modes advertise a per-gen-step width via
             # tokens_per_gen_step (PARD: 2K, DFlash: K+1).  Pass

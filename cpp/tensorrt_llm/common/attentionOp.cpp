@@ -1186,14 +1186,18 @@ int AttentionOp::mlaGeneration(
         tllmRunnerParams.mBatchSize = batch_beam;
         // It is used to construct contiguous kv cache TMA descriptors.
         tllmRunnerParams.mMaxSeqLenCacheKv = generation_params.max_attention_window_size;
-        // This should be set to numDraftTokens + 1.
-        tllmRunnerParams.mMaxSeqLenQ = params.acc_q_len / batch_beam;
+        bool const usesVariableQueryLengths = params.generation_lengths != nullptr;
+        // Keep the physical K+1 width as the graph/kernel maximum while the
+        // packed token count and cumulative offsets describe the ragged input.
+        tllmRunnerParams.mMaxSeqLenQ
+            = usesVariableQueryLengths ? mMLAParams.predicted_tokens_per_seq : params.acc_q_len / batch_beam;
         tllmRunnerParams.mMaxSeqLenKv = generation_params.max_past_kv_length;
         tllmRunnerParams.mJITWarmup = generation_params.trtllm_gen_jit_warmup;
         tllmRunnerParams.mJITWarmupMaxNumRequests = mMaxNumRequests;
         tllmRunnerParams.mJITWarmupMaxSeqLenQ = mMaxContextLength;
         tllmRunnerParams.mJITWarmupMaxSeqLenKv = mMaxSeqLen;
-        tllmRunnerParams.mSumOfSeqLensQ = int(batch_beam * tllmRunnerParams.mMaxSeqLenQ);
+        tllmRunnerParams.mSumOfSeqLensQ
+            = usesVariableQueryLengths ? params.acc_q_len : int(batch_beam * tllmRunnerParams.mMaxSeqLenQ);
         // Not used in the generation kernels as contiguous_kv or paged_kv layouts are used.
         tllmRunnerParams.mSumOfSeqLensKv = int(batch_beam * tllmRunnerParams.mMaxSeqLenKv);
 
@@ -1211,6 +1215,13 @@ int AttentionOp::mlaGeneration(
         tllmRunnerParams.mMultiProcessorCount = mMultiProcessorCount;
         tllmRunnerParams.stream = stream;
         tllmRunnerParams.mSfStartTokenIdx = generation_params.start_token_idx_sf;
+        if (usesVariableQueryLengths)
+        {
+            TLLM_CHECK_WITH_INFO(
+                params.cu_q_seqlens != nullptr, "Variable-length MLA generation requires cumulative query lengths.");
+            tllmRunnerParams.cumSeqLensQPtr = params.cu_q_seqlens;
+            tllmRunnerParams.seqLensQPtr = params.generation_lengths;
+        }
 
         // Scales for quantization
         if (mFP8GenerationMLA)

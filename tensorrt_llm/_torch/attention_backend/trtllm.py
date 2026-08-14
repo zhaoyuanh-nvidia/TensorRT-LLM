@@ -119,6 +119,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     # if spec-dec tree wouldn't be changed at all, the mask won't be computed every step.
     is_spec_dec_dynamic_tree: bool = False
     force_prepare_spec_dec_tree_mask: bool = False
+    # DSpark fixed-budget verification is a linear, ragged multi-token query.
+    # Blackwell intentionally keeps ``is_spec_decoding_enabled`` false for
+    # linear trees, so this independent flag carries only the query
+    # segmentation required by MLA preprocessing and phased FMHA.
+    confidence_fixed_budget_active: bool = False
 
     # parameters required for spec-dec mode
     max_total_draft_tokens: Optional[int] = None
@@ -129,6 +134,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     # Compact Hopper C++ row stride for 1D dynamic-tree offsets.
     position_offsets_stride: int = 0
     spec_decoding_packed_mask: Optional[torch.Tensor] = None
+    # Mutable linear-tree buffers used only by DSpark fixed-budget packing.
+    # Keep them separate from the functools-cached static K templates, which
+    # must remain immutable for later static/full-K steps.
+    dspark_confidence_position_offsets: Optional[torch.Tensor] = None
+    dspark_confidence_packed_mask: Optional[torch.Tensor] = None
     spec_decoding_generation_lengths: Optional[torch.Tensor] = None
     spec_decoding_bl_tree_mask_offset: Optional[torch.Tensor] = None
     spec_decoding_bl_tree_mask: Optional[torch.Tensor] = None
@@ -1077,6 +1087,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.is_spec_decoding_enabled = is_spec_decoding_enabled and (
             not self.is_sm_version_trtllm_gen_kernel(sm=get_sm_version())
             or is_spec_dec_dynamic_tree)
+        self.confidence_fixed_budget_active = bool(
+            spec_metadata is not None
+            and getattr(spec_metadata, "confidence_fixed_budget_active", False))
 
         # use_spec_decoding is default to true by default, change in runtime by layers / requests
         self.use_spec_decoding = self.is_spec_decoding_enabled
@@ -1256,14 +1269,99 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 runtime_draft_token_buffer_width = (
                     spec_metadata.runtime_tokens_per_gen_step -
                     1 if spec_metadata is not None else max_draft_len)
-                self.generate_spec_decoding_generation_length(
-                    runtime_draft_len=runtime_draft_token_buffer_width)
-                self.spec_decoding_position_offsets = generate_spec_decoding_position_offsets(
-                    self.max_num_requests, runtime_draft_token_buffer_width)
-                self.spec_decoding_packed_mask = generate_spec_decoding_packed_mask(
-                    self.max_num_requests, runtime_draft_token_buffer_width)
+                if (spec_metadata is not None and getattr(
+                        spec_metadata,
+                        "confidence_fixed_budget_active",
+                        False,
+                )):
+                    query_lens = spec_metadata.draft_lens[:batch_size] + 1
+                    self.spec_decoding_generation_lengths[:batch_size].copy_(
+                        query_lens, non_blocking=True)
+
+                    dense_width = runtime_draft_token_buffer_width + 1
+                    dense_capacity = batch_size * dense_width
+                    verifier_tokens = (
+                        spec_metadata.confidence_verifier_token_budget)
+                    local_positions = torch.arange(dense_width,
+                                                   dtype=torch.int,
+                                                   device="cuda")
+                    keep = (local_positions.unsqueeze(0)
+                            < query_lens.unsqueeze(1)).reshape(-1)
+                    dense_indices = torch.arange(dense_capacity,
+                                                 dtype=torch.long,
+                                                 device="cuda")
+                    sort_keys = torch.where(keep, dense_indices,
+                                            dense_indices + dense_capacity)
+                    packed_dense_indices = torch.argsort(
+                        sort_keys)[:verifier_tokens]
+                    packed_offsets = local_positions.repeat(
+                        batch_size)[packed_dense_indices]
+
+                    position_template = generate_spec_decoding_position_offsets(
+                        self.max_num_requests,
+                        runtime_draft_token_buffer_width,
+                    )
+                    if self.dspark_confidence_position_offsets is None:
+                        self.dspark_confidence_position_offsets = torch.empty_like(
+                            position_template)
+                    self.spec_decoding_position_offsets = (
+                        self.dspark_confidence_position_offsets)
+                    self.spec_decoding_position_offsets.reshape(
+                        -1)[:verifier_tokens].copy_(packed_offsets,
+                                                    non_blocking=True)
+                    packed_mask_template = generate_spec_decoding_packed_mask(
+                        self.max_num_requests,
+                        runtime_draft_token_buffer_width,
+                    )
+                    if self.dspark_confidence_packed_mask is None:
+                        self.dspark_confidence_packed_mask = torch.empty_like(
+                            packed_mask_template)
+                    self.spec_decoding_packed_mask = (
+                        self.dspark_confidence_packed_mask)
+                    mask_blocks = packed_mask_template.shape[-1]
+                    packed_mask = packed_mask_template.reshape(
+                        dense_capacity, mask_blocks)[packed_dense_indices]
+                    self.spec_decoding_packed_mask.reshape(
+                        -1,
+                        mask_blocks)[:verifier_tokens].copy_(packed_mask,
+                                                             non_blocking=True)
+                else:
+                    self.generate_spec_decoding_generation_length(
+                        runtime_draft_len=runtime_draft_token_buffer_width)
+                    self.spec_decoding_position_offsets = generate_spec_decoding_position_offsets(
+                        self.max_num_requests, runtime_draft_token_buffer_width)
+                    self.spec_decoding_packed_mask = generate_spec_decoding_packed_mask(
+                        self.max_num_requests, runtime_draft_token_buffer_width)
 
             self.update_position_offsets_for_cpp(cpp_query_len)
+        elif self.confidence_fixed_budget_active:
+            # On Blackwell, linear speculative mode is deliberately disabled,
+            # but the fixed-budget verifier is still a ragged generation-only
+            # query. Preserve its per-request boundaries and packed local
+            # positions for the TRTLLM-gen preprocessing path without enabling
+            # tree-mask semantics.
+            assert spec_metadata is not None
+            if self.spec_decoding_generation_lengths is None:
+                self.spec_decoding_generation_lengths = torch.empty(
+                    [self.max_num_requests],
+                    dtype=torch.int,
+                    device="cuda",
+                )
+            query_lens = spec_metadata.draft_lens[:batch_size] + 1
+            self.spec_decoding_generation_lengths[:batch_size].copy_(
+                query_lens, non_blocking=True)
+
+            dense_width = spec_metadata.runtime_tokens_per_gen_step
+            # TRTLLM-gen indexes this table as [request, max_query_width]
+            # even though Q/K/V themselves are request-major packed. Keep the
+            # dense immutable template; the per-request lengths decide which
+            # prefix of each row is live.
+            self.spec_decoding_position_offsets = (
+                generate_spec_decoding_position_offsets(
+                    self.max_num_requests,
+                    dense_width - 1,
+                ))
+            self.update_position_offsets_for_cpp(0)
 
     def generate_spec_decoding_generation_length(self, runtime_draft_len):
         self.spec_decoding_generation_lengths[:self.max_num_requests].fill_(
@@ -1663,8 +1761,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                                         n_gen].to(torch.int32)
             cu_q = torch.zeros(n_gen + 1, dtype=torch.int32, device=q.device)
             cu_kv = torch.zeros(n_gen + 1, dtype=torch.int32, device=q.device)
-            cu_q[1:] = torch.cumsum(gen_q_lens, dim=0).to(
-                torch.int32) * self.num_heads
+            q_offset_scale = (1 if metadata.confidence_fixed_budget_active else
+                              self.num_heads)
+            cu_q[1:] = (torch.cumsum(gen_q_lens, dim=0).to(torch.int32) *
+                        q_offset_scale)
             cu_kv[1:] = torch.cumsum(gen_kv_lens, dim=0).to(torch.int32)
             forward_args.cu_q_seqlens = cu_q
             forward_args.cu_kv_seqlens = cu_kv
@@ -2132,6 +2232,23 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             metadata.helix_position_offsets, metadata.helix_is_inactive_rank
         ]
 
+        generation_lengths = None
+        if metadata.confidence_fixed_budget_active:
+            assert metadata.spec_decoding_generation_lengths is not None
+            generation_lengths = metadata.spec_decoding_generation_lengths[:
+                                                                           metadata
+                                                                           .
+                                                                           num_generations]
+            # Fixed-budget sparse MLA consumes token-space query boundaries.
+            # The legacy uniform path writes head-expanded offsets in the
+            # preprocessing kernel and remains unchanged.
+            cu_q_seqlens[0].zero_()
+            torch.cumsum(
+                generation_lengths,
+                dim=0,
+                out=cu_q_seqlens[1:metadata.num_generations + 1],
+            )
+
         torch.ops.trtllm.mla_rope_generation(
             fused_q,
             q_pe,
@@ -2171,4 +2288,5 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.qk_rope_head_dim,
             self.v_head_dim,
             self.rope_append,
+            generation_lengths,
         )

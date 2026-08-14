@@ -1087,13 +1087,60 @@ class Indexer(nn.Module):
         Indexer.recompute_context_kv_gather_mappings(metadata, indexer_params)
 
     @staticmethod
+    def prepare_confidence_fixed_budget_rows(metadata: DSAtrtllmAttentionMetadata):
+        """Prepare graph-stable V-row indexer metadata for ragged verification."""
+        num_contexts = metadata.num_contexts
+        num_generations = metadata.num_generations
+        assert num_contexts == 0, "fixed-budget confidence verification is generation-only"
+
+        num_gen_tokens = metadata.num_tokens - metadata.num_ctx_tokens
+        req_idx = (
+            metadata.req_idx_per_token[metadata.num_ctx_tokens : metadata.num_tokens].to(torch.long)
+            - num_contexts
+        )
+        query_lens = metadata._seq_lens_cuda[num_contexts : num_contexts + num_generations]
+        query_starts = torch.cumsum(query_lens, dim=0, dtype=torch.int32) - query_lens
+        local_offset = (
+            torch.arange(
+                num_gen_tokens,
+                dtype=torch.int32,
+                device=metadata.kv_lens_cuda_runtime.device,
+            )
+            - query_starts[req_idx]
+        )
+        full_kv_lens = metadata.kv_lens_cuda_runtime[num_contexts : num_contexts + num_generations]
+        past_kv_lens = full_kv_lens - query_lens
+        query_kv_lens = past_kv_lens[req_idx] + local_offset + 1
+
+        metadata.query_kv_lens_expanded_cuda[:num_gen_tokens].copy_(query_kv_lens)
+        indexer_kv_lens = metadata.get_indexer_kv_lens(query_kv_lens)
+        metadata.kv_lens_expanded_cuda[:num_gen_tokens].copy_(indexer_kv_lens)
+        torch.index_select(
+            metadata.indexer_k_cache_block_offsets[num_contexts : num_contexts + num_generations],
+            0,
+            req_idx,
+            out=metadata.block_table_expanded[:num_gen_tokens],
+        )
+        metadata.gen_indexer_kv_lens_cuda_runtime = metadata.get_indexer_kv_lens(full_kv_lens)
+        scheduler_metadata_buffer_expanded = get_paged_mqa_logits_metadata(
+            metadata.kv_lens_expanded_cuda[:num_gen_tokens].view(-1, 1),
+            _DG_SCHEDULE_BLOCK_KV,
+            metadata.num_sms,
+        )
+        metadata.scheduler_metadata_buffer_expanded.copy_(
+            scheduler_metadata_buffer_expanded, non_blocking=True
+        )
+
+    @staticmethod
     def prepare_scheduler_metadata(metadata: DSAtrtllmAttentionMetadata):
         """
         Prepare scheduler metadata for the DeepGEMM decode MQA kernel.
         """
         num_contexts = metadata.num_contexts
         num_generations = metadata.num_generations
-        if not metadata.use_expanded_buffers_for_mtp:
+        if metadata.confidence_fixed_budget_active:
+            Indexer.prepare_confidence_fixed_budget_rows(metadata)
+        elif not metadata.use_expanded_buffers_for_mtp:
             gen_seq_lens = metadata.get_indexer_kv_lens(
                 metadata.kv_lens_cuda_runtime[num_contexts : num_contexts + num_generations]
             )
@@ -1626,6 +1673,7 @@ class Indexer(nn.Module):
             and metadata.in_mtp_draft_loop
             and metadata.indexer_skip_topk
             and metadata.shared_topk_indices is not None
+            and not metadata.confidence_fixed_budget_active
         )
 
         if has_decode and not metadata.skip_indexer_for_gen_reqs and reuse_topk:
@@ -1633,22 +1681,33 @@ class Indexer(nn.Module):
                 metadata.shared_topk_indices[:num_generations, :]
             )
         elif has_decode and not metadata.skip_indexer_for_gen_reqs:
-            # Get decode lengths per request (from seq_lens) for validation
-            gen_seq_lens = metadata.seq_lens[num_contexts : num_contexts + num_generations]
-            max_decode_len = gen_seq_lens.max().item()
-            min_decode_len = gen_seq_lens.min().item()
-            assert max_decode_len == min_decode_len, (
-                "max_decode_len != min_decode_len, we need padding"
-            )
-
             # Reshape q for decode phase: [num_gen_tokens, ...] -> [batch_size, next_n, ...]
             q_decode = q_fp8[token_offset : token_offset + num_gen_tokens, ...]
             batch_size = num_generations
-            next_n = num_gen_tokens // num_generations
+            ragged_confidence = metadata.confidence_fixed_budget_active
+            if ragged_confidence:
+                # The total verifier budget V is graph-static, but q_i varies.
+                # Present the packed request-major queries as V independent
+                # next_n=1 rows with per-row causal lengths and block tables.
+                next_n = 1
+                q_decode = q_decode.view(-1, 1, *q_fp8.shape[1:])
+                context_lens = metadata.kv_lens_expanded_cuda[:num_gen_tokens].view(-1, 1)
+                query_kv_lens = metadata.query_kv_lens_expanded_cuda[:num_gen_tokens]
+                block_table = metadata.block_table_expanded[:num_gen_tokens]
+                scheduler_metadata_buffer = metadata.scheduler_metadata_buffer_expanded
+            else:
+                # Existing kernels require one uniform next_n for every request.
+                gen_seq_lens = metadata.seq_lens[num_contexts : num_contexts + num_generations]
+                max_decode_len = gen_seq_lens.max().item()
+                min_decode_len = gen_seq_lens.min().item()
+                assert max_decode_len == min_decode_len, (
+                    "max_decode_len != min_decode_len, we need padding"
+                )
+                next_n = num_gen_tokens // num_generations
             # Because fp8_paged_mqa_logits can only support next_n == 1/2/4 on sm100, and
             # next_n == 1/2 on sm90, for other next_n, we need to flatten the q_decode tensor
             # and expand the corresponding metadata.
-            if not metadata.use_expanded_buffers_for_mtp or next_n == 1:
+            if not ragged_confidence and (not metadata.use_expanded_buffers_for_mtp or next_n == 1):
                 q_decode = q_decode.view(num_generations, -1, *q_fp8.shape[1:])
                 # 2D context_lens slice from the pre-allocated buffer; matches
                 # q_decode's (batch, next_n) layout required by the new
@@ -1668,7 +1727,7 @@ class Indexer(nn.Module):
                     scheduler_metadata_buffer = metadata.scheduler_metadata_buffer
                 else:
                     scheduler_metadata_buffer = metadata.scheduler_metadata_buffer_full_next_n
-            else:
+            elif not ragged_confidence:
                 q_decode = q_decode.view(-1, 1, *q_fp8.shape[1:])
                 num_tokens = q_decode.shape[0]
                 # New API requires 2D; each expanded token becomes a (1,) row.
@@ -1676,7 +1735,8 @@ class Indexer(nn.Module):
                 block_table = metadata.block_table_expanded[:num_tokens]
                 scheduler_metadata_buffer = metadata.scheduler_metadata_buffer_expanded
 
-            assert num_gen_tokens == batch_size * next_n
+            if not ragged_confidence:
+                assert num_gen_tokens == batch_size * next_n
             weights_decode = weights[token_offset : token_offset + num_gen_tokens, ...]
 
             # Get k cache and call fp8_paged_mqa_logits / fp8_fp4_paged_mqa_logits
@@ -1696,8 +1756,15 @@ class Indexer(nn.Module):
                 # the same KV length on this path (kv_lens_cuda_2d broadcasts),
                 # so passing the 1D contiguous kv_lens slice for context_lens
                 # avoids materializing a 2D contiguous tensor per call.
-                dsl_context_lens = metadata.gen_indexer_kv_lens_cuda_runtime
-                assert dsl_context_lens is not None
+                if ragged_confidence:
+                    dsl_context_lens = context_lens.view(-1)
+                    dsl_block_table = block_table
+                    dsl_schedule_meta = scheduler_metadata_buffer
+                else:
+                    dsl_context_lens = metadata.gen_indexer_kv_lens_cuda_runtime
+                    assert dsl_context_lens is not None
+                    dsl_block_table = block_table
+                    dsl_schedule_meta = metadata.scheduler_metadata_buffer
                 # Wave-aware atom-split: the picker in `_pick_dsl_expand` caches
                 # (factor, atom) on metadata with invariant
                 # `factor * atom == 1 + max_draft_tokens` (the target/verify-time
@@ -1709,7 +1776,8 @@ class Indexer(nn.Module):
                 # tokens; gate here so i≥1 draft calls fall back to the
                 # kernel-native next_n=1 path.
                 dsl_atom_split = (
-                    metadata.dsl_expand_factor > 1
+                    not ragged_confidence
+                    and metadata.dsl_expand_factor > 1
                     and next_n == metadata.dsl_expand_factor * metadata.dsl_atom
                 )
                 if self.use_fp4:
@@ -1723,8 +1791,6 @@ class Indexer(nn.Module):
                         q_decode.shape[0], q_decode.shape[1], self.n_heads
                     )
                     dsl_q = q_decode.view(torch.uint8)
-                    dsl_block_table = block_table
-                    dsl_schedule_meta = metadata.scheduler_metadata_buffer
                     if dsl_atom_split:
                         factor = metadata.dsl_expand_factor
                         eff_next_n = metadata.dsl_atom
@@ -1753,8 +1819,8 @@ class Indexer(nn.Module):
                     # may be compressed for DeepSeek-V4.
                     dsl_q = q_decode
                     fp8_ctx_lens = dsl_context_lens
-                    fp8_block_table = block_table
-                    fp8_schedule_meta = metadata.scheduler_metadata_buffer
+                    fp8_block_table = dsl_block_table
+                    fp8_schedule_meta = dsl_schedule_meta
                     if dsl_atom_split:
                         factor = metadata.dsl_expand_factor
                         atom = metadata.dsl_atom
@@ -1799,13 +1865,17 @@ class Indexer(nn.Module):
             if use_custom_topk:
                 # Kernel expects kv_lens (total cache length), not seq_lens (new tokens)
                 # This is because rowEnd = seq_len - next_n + offset + 1
-                gen_kv_lens_cuda = metadata.kv_lens_cuda_runtime[
-                    num_contexts : num_contexts + num_generations
-                ]
+                gen_kv_lens_cuda = (
+                    query_kv_lens
+                    if ragged_confidence
+                    else metadata.kv_lens_cuda_runtime[
+                        num_contexts : num_contexts + num_generations
+                    ]
+                )
 
                 pre_idx = None
                 heuristic_scratch = None
-                if self._enable_heuristic_topk:
+                if self._enable_heuristic_topk and not ragged_confidence:
                     local_layer = metadata.kv_cache_manager.layer_offsets[self.layer_idx]
                     # Pass prev_topk directly; the +1 temporal offset is
                     # handled inside the C++ kernel (preIdxOffset += 1).
@@ -1813,7 +1883,7 @@ class Indexer(nn.Module):
                     if not metadata.use_cute_dsl_topk:
                         heuristic_scratch = metadata.heuristic_scratch_values[:num_gen_tokens]
 
-                if self.use_cute_dsl_topk and self._enable_heuristic_topk:
+                if self.use_cute_dsl_topk and self._enable_heuristic_topk and not ragged_confidence:
                     torch.ops.trtllm.cute_dsl_gvr_topk_decode(
                         logits_decode,
                         pre_idx,
@@ -1826,9 +1896,14 @@ class Indexer(nn.Module):
                         order_row=metadata.kv_lens_row_reorder,
                     )
                 elif self.use_cute_dsl_topk and (self.compress_ratio == 1 or next_n == 1):
+                    topk_seq_lens = (
+                        context_lens.view(-1)
+                        if ragged_confidence and self.compress_ratio > 1
+                        else (gen_kv_lens_cuda if self.compress_ratio == 1 else context_lens)
+                    )
                     torch.ops.trtllm.cute_dsl_indexer_topk_decode(
                         logits_decode,
-                        context_lens if self.compress_ratio > 1 else gen_kv_lens_cuda,
+                        topk_seq_lens,
                         topk_indices_buffer[token_offset : token_offset + num_gen_tokens, :],
                         self.index_topk,
                         next_n,
@@ -1853,9 +1928,14 @@ class Indexer(nn.Module):
                     .unsqueeze(0)
                     .expand(num_gen_tokens, -1)
                 )
-                row_indices = torch.arange(num_gen_tokens, device=q_decode.device) // next_n
-                next_n_offset = torch.arange(num_gen_tokens, device=q_decode.device) % next_n
-                index_end_pos = (context_lens[row_indices] - next_n + next_n_offset).unsqueeze(1)
+                if ragged_confidence:
+                    index_end_pos = (context_lens.view(-1) - 1).unsqueeze(1)
+                else:
+                    row_indices = torch.arange(num_gen_tokens, device=q_decode.device) // next_n
+                    next_n_offset = torch.arange(num_gen_tokens, device=q_decode.device) % next_n
+                    index_end_pos = (context_lens[row_indices] - next_n + next_n_offset).unsqueeze(
+                        1
+                    )
                 # index_end_pos: [B * N, 1]
                 mask = positions <= index_end_pos
                 # mask: [B * N, L]
@@ -1878,7 +1958,11 @@ class Indexer(nn.Module):
             if self._enable_heuristic_topk:
                 local_layer = metadata.kv_cache_manager.layer_offsets[self.layer_idx]
                 decode_topk = topk_indices_buffer[token_offset : token_offset + num_gen_tokens]
-                last_mtp_topk = decode_topk[next_n - 1 :: next_n]
+                if ragged_confidence:
+                    last_rows = metadata.cu_seq_lens_cuda[1 : num_generations + 1] - 1
+                    last_mtp_topk = decode_topk[last_rows.to(torch.long)]
+                else:
+                    last_mtp_topk = decode_topk[next_n - 1 :: next_n]
                 metadata.heuristic_prev_topk[local_layer, :num_generations].copy_(last_mtp_topk)
 
         elif has_decode and metadata.skip_indexer_for_gen_reqs:
@@ -1887,7 +1971,12 @@ class Indexer(nn.Module):
                 metadata.topk_indices_buffer[num_ctx_tokens:num_tokens, :]
             )
 
-        if self.mtp_index_share and metadata.in_mtp_draft_loop and not reuse_topk:
+        if (
+            self.mtp_index_share
+            and metadata.in_mtp_draft_loop
+            and not reuse_topk
+            and not metadata.confidence_fixed_budget_active
+        ):
             rows = None
             if has_decode:
                 next_n = num_gen_tokens // num_generations

@@ -1809,6 +1809,16 @@
     },
     {
       "allowed_values": [
+        "disabled",
+        "fixed_budget"
+      ],
+      "annotation": "Literal['disabled', 'fixed_budget']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "speculative_config.confidence_mode"
+    },
+    {
+      "allowed_values": [
         "AUTO",
         "DFlash",
         "DSpark",

@@ -384,7 +384,7 @@ public:
         std::optional<torch::Tensor> relative_attention_bias,
         std::optional<torch::Tensor> quant_scale_qkv = std::nullopt,
         std::optional<torch::Tensor> dsv4_inv_rope_cos_sin_cache = std::nullopt,
-        bool enable_dsv4_epilogue_fusion = false) const
+        bool enable_dsv4_epilogue_fusion = false, bool confidence_fixed_budget_active = false) const
         = 0;
 };
 
@@ -454,7 +454,8 @@ public:
         std::optional<torch::Tensor> flash_mla_num_splits, bool trtllm_gen_jit_warmup,
         std::optional<int64_t> aux_kv_cache_pool_ptr, bool const is_cross, std::optional<torch::Tensor> cross_kv,
         std::optional<torch::Tensor> relative_attention_bias, std::optional<torch::Tensor> quant_scale_qkv,
-        std::optional<torch::Tensor> dsv4_inv_rope_cos_sin_cache, bool enable_dsv4_epilogue_fusion) const override
+        std::optional<torch::Tensor> dsv4_inv_rope_cos_sin_cache, bool enable_dsv4_epilogue_fusion,
+        bool confidence_fixed_budget_active) const override
     {
         auto stream = at::cuda::getCurrentCUDAStream(qkv_or_q.get_device());
         T* attention_input = static_cast<T*>(qkv_or_q.slice(0, token_offset).data_ptr());
@@ -623,6 +624,31 @@ public:
             mla_params.acc_q_len = num_tokens;
             mla_params.head_num = op.mNumHeads;
             mla_params.meta = op.mMLAParams;
+            if (confidence_fixed_budget_active)
+            {
+                TORCH_CHECK(
+                    !is_context, "DSpark fixed-budget confidence mode is only supported for generation attention.");
+                TORCH_CHECK(spec_decoding_generation_lengths.has_value(),
+                    "DSpark fixed-budget confidence mode requires per-request generation lengths.");
+                TORCH_CHECK(
+                    cu_q_seqlens.has_value(), "DSpark fixed-budget confidence mode requires cumulative query lengths.");
+                TORCH_CHECK(spec_decoding_generation_lengths->is_cuda()
+                        && spec_decoding_generation_lengths->device() == qkv_or_q.device(),
+                    "DSpark fixed-budget generation lengths must be on the attention input CUDA device.");
+                TORCH_CHECK(spec_decoding_generation_lengths->scalar_type() == torch::kInt32
+                        && spec_decoding_generation_lengths->is_contiguous()
+                        && spec_decoding_generation_lengths->dim() == 1
+                        && spec_decoding_generation_lengths->size(0) >= num_seqs,
+                    "DSpark fixed-budget generation lengths must be contiguous int32 with at least num_seqs entries.");
+                TORCH_CHECK(cu_q_seqlens->is_cuda() && cu_q_seqlens->device() == qkv_or_q.device(),
+                    "DSpark fixed-budget cumulative query lengths must be on the attention input CUDA device.");
+                TORCH_CHECK(cu_q_seqlens->scalar_type() == torch::kInt32 && cu_q_seqlens->is_contiguous()
+                        && cu_q_seqlens->dim() == 1 && cu_q_seqlens->size(0) >= num_seqs + 1,
+                    "DSpark fixed-budget cumulative query lengths must be contiguous int32 with at least "
+                    "num_seqs + 1 entries.");
+                mla_params.generation_lengths = spec_decoding_generation_lengths->data_ptr<int32_t>();
+                mla_params.cu_q_seqlens = cu_q_seqlens->data_ptr<int32_t>();
+            }
 
             mla_params.workspace = workspace_ptr;
         }
@@ -920,9 +946,14 @@ public:
             TLLM_CHECK(batch_beam % beam_width == 0);
             int32_t const num_requests = batch_beam / beam_width;
 
-            TLLM_CHECK_WITH_INFO(num_tokens % num_seqs == 0,
-                "seq_len should be same for all generation requests, num_tokens=%d, num_seqs=%d", num_tokens, num_seqs);
-            int32_t const input_seq_length = num_tokens / num_seqs;
+            if (!confidence_fixed_budget_active)
+            {
+                TLLM_CHECK_WITH_INFO(num_tokens % num_seqs == 0,
+                    "seq_len should be same for all generation requests, num_tokens=%d, num_seqs=%d", num_tokens,
+                    num_seqs);
+            }
+            int32_t const input_seq_length
+                = confidence_fixed_budget_active ? predicted_tokens_per_seq : num_tokens / num_seqs;
 
             common_enqueue_params.input_seq_length = input_seq_length;
             AttentionOp::EnqueueGenerationParams<T> enqueue_params{common_enqueue_params};
@@ -1114,7 +1145,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<torch::Tensor> relative_attention_bias, int64_t relative_attention_max_distance,
     std::optional<int64_t> spec_decoding_target_max_draft_tokens, std::optional<torch::Tensor> quant_scale_qkv,
     std::optional<torch::Tensor> dsv4_inv_rope_cos_sin_cache, bool enable_dsv4_epilogue_fusion,
-    bool const force_prepare_spec_dec_tree_mask, std::optional<int64_t> const max_num_sequences)
+    bool const force_prepare_spec_dec_tree_mask, std::optional<int64_t> const max_num_sequences,
+    bool const confidence_fixed_budget_active)
 {
     TLLM_LOG_TRACE("Attention op starts at layer %d", local_layer_idx);
     // Use these tensors to infer if the attention is using KV cache
@@ -1349,6 +1381,34 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     int32_t const num_generations = num_seqs - static_cast<int32_t>(num_contexts);
     int32_t const num_tokens = qkv_or_q.size(0);
     int32_t const num_gen_tokens = is_gen_only ? num_tokens : num_tokens - static_cast<int32_t>(num_ctx_tokens);
+
+    if (confidence_fixed_budget_active)
+    {
+        TORCH_CHECK(is_mla_enable && op->isMLAEnabled(), "DSpark fixed-budget confidence mode requires MLA attention.");
+        TORCH_CHECK(op->useSparseMLA(), "DSpark fixed-budget confidence mode requires native TRTLLM-gen sparse MLA.");
+        TORCH_CHECK(is_gen_only && num_contexts == 0 && num_ctx_tokens == 0 && num_generations == num_seqs,
+            "DSpark fixed-budget confidence mode requires a generation-only batch.");
+        TORCH_CHECK(beam_width == 1, "DSpark fixed-budget confidence mode requires beam width 1.");
+        TORCH_CHECK(!is_cross, "DSpark fixed-budget confidence mode does not support cross attention.");
+        TORCH_CHECK(!is_spec_decoding_enabled && !use_spec_decoding && !is_spec_dec_tree && !op->useCustomMask(),
+            "DSpark fixed-budget confidence mode requires linear verification without tree/custom-mask semantics.");
+        TORCH_CHECK(!helix_position_offsets.has_value() && !helix_is_inactive_rank.has_value(),
+            "DSpark fixed-budget confidence mode does not support Helix attention.");
+        TORCH_CHECK(num_sparse_topk_value > 0 && sparse_attn_indices.has_value() && sparse_attn_indices->numel() > 0
+                && sparse_attn_kv_lens.has_value(),
+            "DSpark fixed-budget confidence mode requires dynamic sparse MLA indices and per-token top-k lengths.");
+        TORCH_CHECK(sparse_attn_indices->is_cuda() && sparse_attn_indices->device() == qkv_or_q.device()
+                && sparse_attn_indices->scalar_type() == torch::kInt32 && sparse_attn_indices->is_contiguous()
+                && sparse_attn_indices->dim() >= 1 && sparse_attn_indices->size(0) >= num_gen_tokens,
+            "DSpark fixed-budget sparse attention indices must be contiguous int32 CUDA rows for every verifier "
+            "token.");
+        TORCH_CHECK(sparse_attn_kv_lens->is_cuda() && sparse_attn_kv_lens->device() == qkv_or_q.device()
+                && sparse_attn_kv_lens->scalar_type() == torch::kInt32 && sparse_attn_kv_lens->is_contiguous()
+                && sparse_attn_kv_lens->dim() == 1 && sparse_attn_kv_lens->size(0) >= num_gen_tokens,
+            "DSpark fixed-budget sparse top-k lengths must be contiguous int32 CUDA values for every verifier "
+            "token.");
+    }
+
     auto const ctx_total_kv_len = host_total_kv_lens.index({0}).item<int32_t>();
     auto const gen_total_kv_len = host_total_kv_lens.index({1}).item<int32_t>();
 
@@ -1401,7 +1461,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             num_sparse_topk_value, sparse_attn_kv_lens, cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter,
             mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer, flash_mla_tile_scheduler_metadata, flash_mla_num_splits,
             trtllm_gen_jit_warmup, aux_kv_cache_pool_ptr, is_cross, cross_kv, relative_attention_bias, quant_scale_qkv,
-            dsv4_inv_rope_cos_sin_cache, enable_dsv4_epilogue_fusion);
+            dsv4_inv_rope_cos_sin_cache, enable_dsv4_epilogue_fusion, confidence_fixed_budget_active);
     }
 
     if ((num_generations > 0) && (attn_input_type != AttentionInputType::ContextOnly))
@@ -1424,7 +1484,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             num_sparse_topk_value, sparse_attn_kv_lens, cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter,
             mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer, flash_mla_tile_scheduler_metadata, flash_mla_num_splits,
             trtllm_gen_jit_warmup, aux_kv_cache_pool_ptr, is_cross, cross_kv, relative_attention_bias, quant_scale_qkv,
-            dsv4_inv_rope_cos_sin_cache, enable_dsv4_epilogue_fusion);
+            dsv4_inv_rope_cos_sin_cache, enable_dsv4_epilogue_fusion, confidence_fixed_budget_active);
     }
 
     TLLM_LOG_TRACE("Attention op stops at layer %d", local_layer_idx);

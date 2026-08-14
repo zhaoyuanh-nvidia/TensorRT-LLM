@@ -50,6 +50,7 @@ class SampleStateTensorsSpec(SampleStateTensors):
 
     new_tokens_lens: torch.Tensor
     next_draft_tokens: torch.Tensor
+    next_draft_lens: Optional[torch.Tensor] = None
 
 
 @dataclass(kw_only=True)
@@ -117,6 +118,7 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         next_new_tokens: torch.Tensor
         next_draft_tokens: torch.Tensor
         new_tokens_lens: torch.Tensor
+        next_draft_lens: torch.Tensor
 
     def __init__(self, args: TorchSampler.Args, *, accepted_path_len: Optional[int] = None):
         """
@@ -167,13 +169,15 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             ),
             next_draft_tokens=int_tensor((seq_slots, args.max_total_draft_tokens)),
             new_tokens_lens=int_tensor((seq_slots,)),
+            next_draft_lens=int_tensor((seq_slots,)),
         )
 
     def _request_common_handling(
         self,
         request: LlmRequest,
         next_draft_tokens: list[list[int]],
-        runtime_draft_len: Optional[int],
+        next_draft_len: int,
+        physical_draft_len: int,
     ) -> None:
         """Common handling for both context and generation requests."""
         if request.py_return_context_logits:
@@ -193,7 +197,12 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
                 "return_log_probs not supported with speculative decoding, skipping for request %s",
                 request.py_request_id,
             )
-        request.py_draft_tokens = next_draft_tokens[request.py_seq_slot][:runtime_draft_len]
+        # Keep the host-visible proposal buffer at its physical width. CUDA
+        # graph selection keys on that stable K, while the separate effective
+        # length describes the confidence-retained prefix for packing into V.
+        # Legacy dynamic-width modes pass the same value for both lengths.
+        request.py_draft_tokens = next_draft_tokens[request.py_seq_slot][:physical_draft_len]
+        request.py_draft_tokens_effective_len = next_draft_len
         request.py_decoding_iter += 1
 
     def update_requests(
@@ -215,6 +224,9 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         new_tokens = state.host.new_tokens.tolist()
         new_tokens_lens_list = state.host.new_tokens_lens.tolist()
         next_draft_tokens_list = state.host.next_draft_tokens.tolist()
+        next_draft_lens_list = (
+            state.host.next_draft_lens.tolist() if state.host.next_draft_lens is not None else None
+        )
         beam_idx = DEFAULT_BEAM_IDX
         runtime_draft_len = getattr(state, "runtime_draft_len", self.draft_len)
 
@@ -244,8 +256,21 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             req.py_num_draft_tokens_verified = (
                 state.draft_lens[req_idx] if state.draft_lens is not None else 0
             )
-            req.py_rewind_len = runtime_draft_len - req.py_num_accepted_draft_tokens
-            self._request_common_handling(req, next_draft_tokens_list, runtime_draft_len)
+            verified_draft_len = (
+                state.draft_lens[req_idx] if state.draft_lens is not None else runtime_draft_len
+            )
+            req.py_rewind_len = verified_draft_len - req.py_num_accepted_draft_tokens
+            next_draft_len = (
+                next_draft_lens_list[req.py_seq_slot]
+                if next_draft_lens_list is not None
+                else runtime_draft_len
+            )
+            self._request_common_handling(
+                req,
+                next_draft_tokens_list,
+                next_draft_len,
+                runtime_draft_len,
+            )
 
     def sample_async(
         self,
@@ -294,11 +319,16 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
 
         o_new_tokens = outputs["new_tokens"][num_skip : num_skip + num_sampling_requests]
         o_new_tokens_lens = outputs["new_tokens_lens"][num_skip : num_skip + num_sampling_requests]
+        o_new_tokens_lens = o_new_tokens_lens.to(dtype=self.store.new_tokens_lens.dtype)
         o_next_draft_tokens = outputs["next_draft_tokens"][
             num_skip : num_skip + num_sampling_requests
         ]
         o_next_new_tokens = outputs["next_new_tokens"][num_skip : num_skip + num_sampling_requests]
         runtime_draft_len = o_next_draft_tokens.shape[1]
+        o_next_draft_lens = outputs.get("next_draft_lens")
+        if o_next_draft_lens is not None:
+            o_next_draft_lens = o_next_draft_lens[num_skip : num_skip + num_sampling_requests]
+            o_next_draft_lens = o_next_draft_lens.to(dtype=self.store.next_draft_lens.dtype)
 
         # Pad or truncate to match fixed-size store buffers for index_copy_.
         # The worker output width tracks runtime_draft_len, which dynamic draft
@@ -330,18 +360,26 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         self.store.next_new_tokens.squeeze(-1).T.index_copy_(0, slots, o_next_new_tokens)
         self.store.new_tokens_lens.index_copy_(0, slots, o_new_tokens_lens)
         self.store.next_draft_tokens.index_copy_(0, slots, o_next_draft_tokens)
+        if o_next_draft_lens is not None:
+            self.store.next_draft_lens.index_copy_(0, slots, o_next_draft_lens)
 
         # Create sample state with async D2H copy
         device_tensors = SampleStateTensorsSpec(
             new_tokens=self.store.next_new_tokens,
             new_tokens_lens=self.store.new_tokens_lens,
             next_draft_tokens=self.store.next_draft_tokens,
+            next_draft_lens=(self.store.next_draft_lens if o_next_draft_lens is not None else None),
         )
 
         host_tensors = SampleStateTensorsSpec(
             new_tokens=self._copy_to_host(self.store.new_tokens),
             new_tokens_lens=self._copy_to_host(self.store.new_tokens_lens),
             next_draft_tokens=self._copy_to_host(self.store.next_draft_tokens),
+            next_draft_lens=(
+                self._copy_to_host(self.store.next_draft_lens)
+                if o_next_draft_lens is not None
+                else None
+            ),
         )
         sampler_event = self._record_sampler_event()
 

@@ -399,14 +399,48 @@ __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* q_ptr, T* q_pe, T* k
     }
 }
 
+__device__ __forceinline__ void getGenerationTokenLocation(int global_token_idx, int uniform_seq_len, int batch_size,
+    int const* generation_lengths, int const* seq_q_offsets, int& batch_idx, int& local_token_idx, int& current_seq_len)
+{
+    if (generation_lengths == nullptr)
+    {
+        batch_idx = global_token_idx / uniform_seq_len;
+        local_token_idx = global_token_idx % uniform_seq_len;
+        current_seq_len = uniform_seq_len;
+        return;
+    }
+
+    // seq_q_offsets are expressed in packed-token rows. They are pre-filled
+    // from the per-request lengths before this kernel is launched. Binary
+    // search keeps the mapping graph-safe without materializing a
+    // token-to-request table whose contents vary with confidence scores.
+    int low = 0;
+    int high = batch_size;
+    while (low + 1 < high)
+    {
+        int const mid = low + (high - low) / 2;
+        if (seq_q_offsets[mid] <= global_token_idx)
+        {
+            low = mid;
+        }
+        else
+        {
+            high = mid;
+        }
+    }
+    batch_idx = low;
+    current_seq_len = generation_lengths[batch_idx];
+    local_token_idx = global_token_idx - seq_q_offsets[batch_idx];
+}
+
 template <typename T, int BLOCK_SIZE, int K_DIM, int ROPE_DIM, typename KVCacheBuffer>
 __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe, T const* fuse_buf, void* quant_q,
     KVCacheBuffer kv_cache, float2 const* cos_sin_cache, size_t head_num, int c_k, int total_s_len, int seq_len,
-    int* seqQOffset, uint32_t* fmha_tile_counter, int32_t const* kv_cache_lengths, int* seqKVOffsets, int q_pe_ld,
-    int q_pe_stride, KvCacheDataType cache_type, float* bmm1_scale, float* bmm2_scale, float const* quant_scale_o,
-    float const* quant_scale_q, float const* quant_scale_kv, float const* dequant_scale_q,
-    float const* dequant_scale_kv, float host_bmm1_scale, int32_t const* helix_position_offsets,
-    bool const* helix_is_inactive_rank)
+    int batch_size, int32_t const* generation_lengths, int* seqQOffset, uint32_t* fmha_tile_counter,
+    int32_t const* kv_cache_lengths, int* seqKVOffsets, int q_pe_ld, int q_pe_stride, KvCacheDataType cache_type,
+    float* bmm1_scale, float* bmm2_scale, float const* quant_scale_o, float const* quant_scale_q,
+    float const* quant_scale_kv, float const* dequant_scale_q, float const* dequant_scale_kv, float host_bmm1_scale,
+    int32_t const* helix_position_offsets, bool const* helix_is_inactive_rank)
 {
     // Constants.
     using VecT = typename VecType<T>::Type;
@@ -471,17 +505,20 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
         for (int global_token_idx = (threadIdx.x / VECS_PER_HEAD) + blockIdx.x * TOKENS_PER_BLOCK;
              global_token_idx < seq_len_loop_end; global_token_idx += TOKENS_PER_BLOCK * gridDim.x)
         {
-            auto batch_idx = global_token_idx / seq_len;
-            auto local_token_idx = global_token_idx % seq_len;
+            int batch_idx;
+            int local_token_idx;
+            int current_seq_len;
+            getGenerationTokenLocation(global_token_idx, seq_len, batch_size, generation_lengths, seqQOffset, batch_idx,
+                local_token_idx, current_seq_len);
             bool const valid_token = global_token_idx < total_s_len;
             VecT data;
 
             if (valid_token)
             {
 
-                auto const position_id
-                    = (helix_position_offsets != nullptr ? helix_position_offsets[global_token_idx]
-                                                         : kv_cache_lengths[batch_idx] - seq_len + local_token_idx);
+                auto const position_id = (helix_position_offsets != nullptr
+                        ? helix_position_offsets[global_token_idx]
+                        : kv_cache_lengths[batch_idx] - current_seq_len + local_token_idx);
                 float2 const* rotary_coef_cache_buffer
                     = cos_sin_cache + static_cast<size_t>(ROPE_DIM) * position_id + (head_dim_idx / 2);
 
@@ -519,7 +556,7 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
                     // If helix parallelism is being used, only write to KV cache if current rank is active.
                     if (helix_is_inactive_rank == nullptr || !helix_is_inactive_rank[batch_idx])
                     {
-                        auto const token_kv_idx = kv_cache_lengths[batch_idx] - seq_len + local_token_idx;
+                        auto const token_kv_idx = kv_cache_lengths[batch_idx] - current_seq_len + local_token_idx;
 
                         {
                             auto kDst = reinterpret_cast<T*>(kv_cache.getKBlockPtr(batch_idx, token_kv_idx));
@@ -568,21 +605,27 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
                  + blockIdx.x * K_TOKENS_PER_BLOCK;
              global_token_idx < seq_len_loop_end; global_token_idx += block_dim * K_TOKENS_PER_BLOCK * gridDim.x)
         {
-            auto batch_idx = global_token_idx / seq_len;
-            auto local_token_idx = global_token_idx % seq_len;
+            int batch_idx;
+            int local_token_idx;
+            int current_seq_len;
+            getGenerationTokenLocation(global_token_idx, seq_len, batch_size, generation_lengths, seqQOffset, batch_idx,
+                local_token_idx, current_seq_len);
             bool valid_token = global_token_idx < total_s_len;
 
             if (valid_token)
             {
                 if (head_dim_vec_idx == 0)
                 {
-                    seqQOffset[batch_idx + 1] = head_num * seq_len * (batch_idx + 1);
+                    if (generation_lengths == nullptr)
+                    {
+                        seqQOffset[batch_idx + 1] = head_num * seq_len * (batch_idx + 1);
+                    }
                 }
 
                 // If helix parallelism is being used, only write to KV cache if current rank is active.
                 if (helix_is_inactive_rank == nullptr || !helix_is_inactive_rank[batch_idx])
                 {
-                    auto const token_kv_idx = kv_cache_lengths[batch_idx] - seq_len + local_token_idx;
+                    auto const token_kv_idx = kv_cache_lengths[batch_idx] - current_seq_len + local_token_idx;
                     auto const src_kv_global_offset = static_cast<size_t>(global_token_idx) * (c_k + ROPE_DIM);
 
                     {
@@ -647,7 +690,7 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
 
     if (blockIdx.x == 0 && blockIdx.y == 0)
     {
-        int const batchSizeBound = total_s_len / seq_len;
+        int const batchSizeBound = generation_lengths == nullptr ? total_s_len / seq_len : batch_size;
         for (int batchOffset = 0; batchOffset <= batchSizeBound; batchOffset += BLOCK_SIZE)
         {
             // The index of the batch.
@@ -1158,9 +1201,13 @@ void invokeMLARopeGeneration(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer
     dim3 grid(int(tensorrt_llm::common::divUp(params.acc_q_len, 32)), params.head_num + 1 + 8);
     if (params.cache_type == KvCacheDataType::FP8)
         grid.y += params.head_num * 8;
-    TLLM_CHECK_WITH_INFO(params.acc_q_len % params.batch_size == 0,
-        "MLA can only support input sequences with the same sequence length.");
-    auto seq_len = params.acc_q_len / params.batch_size;
+    if (params.generation_lengths == nullptr)
+    {
+        TLLM_CHECK_WITH_INFO(params.acc_q_len % params.batch_size == 0,
+            "MLA can only support input sequences with the same sequence length unless generation_lengths is set.");
+    }
+    auto const seq_len = params.generation_lengths == nullptr ? params.acc_q_len / params.batch_size
+                                                              : params.meta.predicted_tokens_per_seq;
 
     auto* kernel_instance = &applyMLARopeAndAssignQKVKernelGeneration<T, 256, 512, 64, KVCacheBuffer>;
     if (!params.meta.rope_append)
@@ -1179,10 +1226,11 @@ void invokeMLARopeGeneration(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer
     config.attrs = attrs;
     cudaLaunchKernelEx(&config, kernel_instance, params.q_buf, params.q_pe, params.latent_cache, params.quant_q_buf,
         kv_cache_buffer, params.cos_sin_cache, params.head_num, params.meta.kv_lora_rank, params.acc_q_len, seq_len,
-        params.seqQOffset, params.fmha_tile_counter, params.cache_seq_lens, params.cu_kv_seqlens, params.q_pe_ld,
-        params.q_pe_stride, params.cache_type, params.bmm1_scale, params.bmm2_scale, params.quant_scale_o,
-        params.quant_scale_q, params.quant_scale_kv, params.dequant_scale_q, params.dequant_scale_kv,
-        params.host_bmm1_scale, params.helix_position_offsets, params.helix_is_inactive_rank);
+        params.batch_size, params.generation_lengths, params.seqQOffset, params.fmha_tile_counter,
+        params.cache_seq_lens, params.cu_kv_seqlens, params.q_pe_ld, params.q_pe_stride, params.cache_type,
+        params.bmm1_scale, params.bmm2_scale, params.quant_scale_o, params.quant_scale_q, params.quant_scale_kv,
+        params.dequant_scale_q, params.dequant_scale_kv, params.host_bmm1_scale, params.helix_position_offsets,
+        params.helix_is_inactive_rank);
 }
 
 template <typename T, typename TCache>

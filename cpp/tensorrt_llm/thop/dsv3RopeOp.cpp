@@ -56,6 +56,7 @@ struct MlaRopeGenArgs
     int32_t num_heads;
     tk::MlaMetaParams mla_meta_params;
     int32_t const* sequence_lengths_ptr;
+    int32_t const* generation_lengths_ptr;
     int32_t max_context_q_len;
     int const* block_ids_per_seq_ptr;
     tk::KvCacheDataType cache_type;
@@ -90,6 +91,7 @@ void invokeMLARopeGenerationHelper(T const* latent_cache_ptr, T* q_pe_ptr, T* fu
     mla_params.meta = args.mla_meta_params;
 
     mla_params.cache_seq_lens = args.sequence_lengths_ptr;
+    mla_params.generation_lengths = args.generation_lengths_ptr;
     mla_params.max_input_seq_len = args.max_context_q_len;
 
     mla_params.block_ids_per_seq = args.block_ids_per_seq_ptr;
@@ -133,7 +135,8 @@ void MLARopeGeneration(torch::Tensor fused_q, // [tokens, num_heads, (nope_dim +
 
     int64_t const tokens_per_block, int64_t const attention_window_size, int64_t const beam_width,
     int64_t const quant_mode, double const q_scaling, int64_t q_lora_rank, int64_t kv_lora_rank,
-    int64_t qk_nope_head_dim, int64_t qk_rope_head_dim, int64_t v_head_dim, bool rope_append)
+    int64_t qk_nope_head_dim, int64_t qk_rope_head_dim, int64_t v_head_dim, bool rope_append,
+    std::optional<torch::Tensor> generation_lengths)
 {
     TLLM_CHECK_WITH_INFO(
         head_size == kv_lora_rank + qk_rope_head_dim, "head_size must = kv_lora_rank + qk_rope_head_dim");
@@ -184,6 +187,18 @@ void MLARopeGeneration(torch::Tensor fused_q, // [tokens, num_heads, (nope_dim +
     }
 
     int const* sequence_lengths_ptr = sequence_length.slice(0, seq_offset).data_ptr<int>();
+    int const* generation_lengths_ptr = nullptr;
+    if (generation_lengths.has_value())
+    {
+        TORCH_CHECK(generation_lengths->is_cuda(), "generation_lengths must be a CUDA tensor");
+        TORCH_CHECK(generation_lengths->device() == fused_q.device(),
+            "generation_lengths must be on the same device as fused_q");
+        TORCH_CHECK(generation_lengths->scalar_type() == torch::kInt32, "generation_lengths must be int32");
+        TORCH_CHECK(generation_lengths->dim() == 1 && generation_lengths->size(0) == num_generations,
+            "generation_lengths must have shape [num_generations]");
+        TORCH_CHECK(generation_lengths->is_contiguous(), "generation_lengths must be contiguous");
+        generation_lengths_ptr = generation_lengths->data_ptr<int32_t>();
+    }
     // Note we still need context length during generation for MMHA optimization.
     int32_t const max_context_q_len
         = host_context_lengths.slice(0, seq_offset, seq_offset + num_generations).max().item<int32_t>();
@@ -227,10 +242,11 @@ void MLARopeGeneration(torch::Tensor fused_q, // [tokens, num_heads, (nope_dim +
 
     // Currently NVFP4 KV cache is not supported for MLA
     MlaRopeGenArgs args{q_pe_ld, q_pe_stride, rotary_cos_sin_ptr, num_generations, num_gen_tokens,
-        static_cast<int32_t>(num_heads), mla_meta_params, sequence_lengths_ptr, max_context_q_len,
-        block_ids_per_seq_ptr, cache_type, cu_q_seqlens_ptr, cu_kv_seqlens_ptr, fmha_tile_counter_ptr,
-        mla_bmm1_scale_ptr, mla_bmm2_scale_ptr, quant_q_buffer_ptr, quant_scale_o_ptr, kv_scale_orig_quant_ptr,
-        kv_scale_quant_orig_ptr, host_bmm1_scale, helix_position_offsets_ptr, helix_is_inactive_rank_ptr};
+        static_cast<int32_t>(num_heads), mla_meta_params, sequence_lengths_ptr, generation_lengths_ptr,
+        max_context_q_len, block_ids_per_seq_ptr, cache_type, cu_q_seqlens_ptr, cu_kv_seqlens_ptr,
+        fmha_tile_counter_ptr, mla_bmm1_scale_ptr, mla_bmm2_scale_ptr, quant_q_buffer_ptr, quant_scale_o_ptr,
+        kv_scale_orig_quant_ptr, kv_scale_quant_orig_ptr, host_bmm1_scale, helix_position_offsets_ptr,
+        helix_is_inactive_rank_ptr};
 
     auto const input_dtype = fused_q.scalar_type();
     if (input_dtype == torch::kFloat16)
@@ -303,6 +319,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         ", int qk_rope_head_dim"
         ", int v_head_dim"
         ", bool rope_append"
+        ", Tensor? generation_lengths=None"
         ") -> ()");
 }
 

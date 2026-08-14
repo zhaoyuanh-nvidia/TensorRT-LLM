@@ -126,7 +126,14 @@ def _make_llm_request(request_id, seq_slot):
     )
 
 
-def _run_spec_sampler_update(request, *, draft_lens, new_tokens_lens, next_draft_tokens):
+def _run_spec_sampler_update(
+    request,
+    *,
+    draft_lens,
+    new_tokens_lens,
+    next_draft_tokens,
+    next_draft_lens=None,
+):
     sampler = SpecSampler.__new__(SpecSampler)
     sampler.max_seq_len = 2048
     sampler.draft_len = len(next_draft_tokens[0])
@@ -143,6 +150,9 @@ def _run_spec_sampler_update(request, *, draft_lens, new_tokens_lens, next_draft
         new_tokens=new_tokens,
         new_tokens_lens=torch.tensor(new_tokens_lens, dtype=torch.int),
         next_draft_tokens=torch.tensor(next_draft_tokens, dtype=torch.int),
+        next_draft_lens=(
+            torch.tensor(next_draft_lens, dtype=torch.int) if next_draft_lens is not None else None
+        ),
     )
     state = SampleStateSpec(
         requests=[request],
@@ -190,6 +200,24 @@ class TestSpecSamplerPairing:
 
         assert request.py_num_accepted_draft_tokens == 0
         assert request.py_num_draft_tokens_verified == 0
+
+    def test_fixed_budget_installs_per_request_next_length(self):
+        request = _make_llm_request(3, 0)
+        request.py_draft_tokens = [21, 22, 23, 24, 25]
+
+        _run_spec_sampler_update(
+            request,
+            draft_lens=[5],
+            new_tokens_lens=[3],
+            next_draft_tokens=[[31, 32, 33, 34, 35]],
+            next_draft_lens=[2],
+        )
+
+        assert request.py_num_accepted_draft_tokens == 2
+        assert request.py_num_draft_tokens_verified == 5
+        assert request.py_rewind_len == 3
+        assert request.py_draft_tokens == [31, 32, 33, 34, 35]
+        assert request.py_draft_tokens_effective_len == 2
 
 
 class TestDrafterPadRecordsEffectiveLen:

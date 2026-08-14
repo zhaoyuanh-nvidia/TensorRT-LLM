@@ -44,6 +44,7 @@ from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.inputs.registry import BaseMultimodalDummyInputsBuilder
 from tensorrt_llm.llmapi import (CudaGraphConfig, SADecodingConfig,
                                  SamplingParams)
+from tensorrt_llm.llmapi.llm_args import DSparkDecodingConfig
 from tensorrt_llm.mapping import CpType, Mapping
 
 
@@ -712,6 +713,175 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
             model_dtype_key._replace(peft_cache_data_type=None),
             fp8_key._replace(peft_cache_data_type=None),
         )
+
+    def test_dspark_confidence_graph_key_uses_fixed_verifier_budget(
+            self) -> None:
+        runner = Mock()
+        runner.config = SimpleNamespace(is_draft_model=False)
+        runner.max_beam_width = 1
+        runner.spec_config = DSparkDecodingConfig(
+            max_draft_len=5,
+            speculative_model="/tmp/dummy_model",
+            confidence_mode="fixed_budget",
+            confidence_verifier_token_budget_schedule={2: 9})
+        runner._get_seq_len_mode.return_value = False
+        first = _make_request_stub(1)
+        first.py_draft_tokens = [11, 12, 13, 14, 15]
+        first.py_draft_tokens_effective_len = 4
+        second = _make_request_stub(2)
+        second.py_draft_tokens = [21, 22, 23, 24, 25]
+        second.py_draft_tokens_effective_len = 3
+        batch = ScheduledRequests()
+        batch.generation_requests = [first, second]
+
+        key = CUDAGraphRunner.get_graph_key(runner, batch)
+
+        assert key is not None
+        self.assertEqual(key.verifier_num_tokens, 9)
+        self.assertEqual(CUDAGraphRunner._get_num_tokens_for_key(runner, key),
+                         9)
+
+    def test_dspark_confidence_warmup_synthesizes_fixed_verifier_budget(
+            self) -> None:
+        runner = Mock()
+        runner.config = SimpleNamespace(is_draft_model=False)
+        runner.max_beam_width = 1
+        runner._capture_allowed = True
+        runner.spec_config = DSparkDecodingConfig(
+            max_draft_len=5,
+            speculative_model="/tmp/dummy_model",
+            confidence_mode="fixed_budget",
+            confidence_verifier_token_budget_schedule={2: 9})
+        runner._get_seq_len_mode.return_value = False
+        first = _make_request_stub(1)
+        first.is_dummy = True
+        first.py_draft_tokens = [11, 12, 13, 14, 15]
+        first.py_draft_tokens_effective_len = None
+        second = _make_request_stub(2)
+        second.is_dummy = True
+        second.py_draft_tokens = [21, 22, 23, 24, 25]
+        second.py_draft_tokens_effective_len = None
+        batch = ScheduledRequests()
+        batch.generation_requests = [first, second]
+
+        key = CUDAGraphRunner.get_graph_key(runner, batch)
+
+        assert key is not None
+        self.assertEqual(key.verifier_num_tokens, 9)
+        self.assertEqual(first.py_draft_tokens_effective_len, 4)
+        self.assertEqual(second.py_draft_tokens_effective_len, 3)
+
+    def test_dspark_confidence_non_greedy_warmup_keeps_static_shape(
+            self) -> None:
+        runner = Mock()
+        runner.config = SimpleNamespace(is_draft_model=False)
+        runner.max_beam_width = 1
+        runner._capture_allowed = True
+        runner.spec_config = DSparkDecodingConfig(
+            max_draft_len=5,
+            speculative_model="/tmp/dummy_model",
+            confidence_mode="fixed_budget",
+            confidence_verifier_token_budget_schedule={2: 9})
+        runner._get_seq_len_mode.return_value = False
+        requests = [_make_request_stub(1), _make_request_stub(2)]
+        for request in requests:
+            request.is_dummy = True
+            request.py_draft_tokens = [11, 12, 13, 14, 15]
+            request.py_draft_tokens_effective_len = None
+        batch = ScheduledRequests()
+        batch.generation_requests = requests
+
+        key = CUDAGraphRunner.get_graph_key(
+            runner,
+            batch,
+            spec_metadata=SimpleNamespace(is_all_greedy_sample=False),
+        )
+
+        assert key is not None
+        self.assertEqual(key.verifier_num_tokens, 0)
+        self.assertEqual(CUDAGraphRunner._get_num_tokens_for_key(runner, key),
+                         12)
+        self.assertTrue(
+            all(request.py_draft_tokens_effective_len is None
+                for request in requests))
+
+    def test_dspark_confidence_static_step_uses_legacy_token_shape(
+            self) -> None:
+        runner = Mock()
+        runner.config = SimpleNamespace(is_draft_model=False)
+        runner.max_beam_width = 1
+        runner.spec_config = DSparkDecodingConfig(
+            max_draft_len=5,
+            speculative_model="/tmp/dummy_model",
+            confidence_mode="fixed_budget",
+            confidence_verifier_token_budget_schedule={4: 18})
+        runner._get_seq_len_mode.return_value = False
+        request = _make_request_stub(1)
+        request.py_draft_tokens = [11, 12, 13, 14, 15]
+        request.py_draft_tokens_effective_len = None
+        batch = ScheduledRequests()
+        batch.generation_requests = [request]
+
+        key = CUDAGraphRunner.get_graph_key(runner, batch)
+
+        assert key is not None
+        self.assertEqual(key.verifier_num_tokens, 0)
+        self.assertEqual(CUDAGraphRunner._get_num_tokens_for_key(runner, key),
+                         6)
+
+    def test_dspark_confidence_rejects_compact_shape_off_budget(self) -> None:
+        runner = Mock()
+        runner.config = SimpleNamespace(is_draft_model=False)
+        runner.max_beam_width = 1
+        runner.spec_config = DSparkDecodingConfig(
+            max_draft_len=5,
+            speculative_model="/tmp/dummy_model",
+            confidence_mode="fixed_budget",
+            confidence_verifier_token_budget_schedule={2: 9})
+        runner._get_seq_len_mode.return_value = False
+        first = _make_request_stub(1)
+        first.py_draft_tokens = [11, 12, 13, 14, 15]
+        first.py_draft_tokens_effective_len = 3
+        second = _make_request_stub(2)
+        second.py_draft_tokens = [21, 22, 23, 24, 25]
+        second.py_draft_tokens_effective_len = 3
+        batch = ScheduledRequests()
+        batch.generation_requests = [first, second]
+
+        self.assertIsNone(CUDAGraphRunner.get_graph_key(runner, batch))
+
+    def test_dspark_confidence_rejects_runtime_padding_dummy(self) -> None:
+        runner = Mock()
+        runner.config = SimpleNamespace(is_draft_model=False)
+        runner.max_beam_width = 1
+        runner._capture_allowed = False
+        runner.spec_config = DSparkDecodingConfig(
+            max_draft_len=5,
+            speculative_model="/tmp/dummy_model",
+            confidence_mode="fixed_budget",
+            confidence_verifier_token_budget_schedule={2: 9})
+        runner._get_seq_len_mode.return_value = False
+        first = _make_request_stub(1)
+        first.py_draft_tokens = [11, 12, 13, 14, 15]
+        first.py_draft_tokens_effective_len = 4
+        second = _make_request_stub(2)
+        second.is_dummy = True
+        second.py_draft_tokens = [21, 22, 23, 24, 25]
+        second.py_draft_tokens_effective_len = 3
+        batch = ScheduledRequests()
+        batch.generation_requests = [first, second]
+
+        self.assertIsNone(CUDAGraphRunner.get_graph_key(runner, batch))
+
+    def test_verifier_budget_is_part_of_cuda_graph_identity(self) -> None:
+        static_key = KeyType(batch_size=2, draft_len=5, is_first_draft=False)
+        compact_key = static_key._replace(verifier_num_tokens=9)
+
+        self.assertNotEqual(static_key, compact_key)
+        self.assertEqual(
+            CUDAGraphRunner._get_num_tokens_for_key(Mock(), static_key), 12)
+        self.assertEqual(
+            CUDAGraphRunner._get_num_tokens_for_key(Mock(), compact_key), 9)
 
     def test_graph_dtype_change_falls_back_to_eager(self) -> None:
         runner = Mock()

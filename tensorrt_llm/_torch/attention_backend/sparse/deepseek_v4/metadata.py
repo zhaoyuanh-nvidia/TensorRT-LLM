@@ -42,6 +42,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         self.num_total_compressed_tokens = {}
         self.max_ctx_compressed_tokens = {}
         self._ctx_output_sizes: Optional[Dict[int, int]] = None
+        self._gen_output_sizes: Dict[int, int] = {}
         sparse_metadata_params = self.sparse_metadata_params
         if not isinstance(sparse_metadata_params, DeepSeekV4MetadataParams):
             raise ValueError("DeepSeek-V4 sparse attention metadata params are not set")
@@ -496,13 +497,30 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         # 1) CPU-side: compute scalar metadata (num_total_compressed_tokens, etc.)
         # 2) CUDA-side: fill *_cuda buffers via prepare_compressed_kv_metadata()
         num_gen_tokens_per_seq = (
-            num_gen_tokens // self.num_generations if self.num_generations > 0 else 0
+            self.max_draft_tokens + 1
+            if self.confidence_fixed_budget_active
+            else (num_gen_tokens // self.num_generations if self.num_generations > 0 else 0)
         )
         self.num_gen_tokens_per_seq = num_gen_tokens_per_seq
         num_contexts = self.num_contexts
         num_generations = self.num_generations
         kv_lens_slice = kv_lens[:num_requests]
         cached_slice = cached_token_lens[:num_requests]
+        # Ragged confidence queries have a fixed total V but variable q_i.
+        # Ratio 1 therefore needs exactly V output slots. Compressed ratios
+        # reserve the worst-case physical K+1 contribution per request; the
+        # device-derived new_comp lengths and mask suppress unused slots. This
+        # keeps CUDA-graph shapes fixed without assuming q_i == V // G.
+        gen_output_sizes = {
+            compress_ratio: (
+                num_gen_tokens
+                if self.confidence_fixed_budget_active and compress_ratio == 1
+                else num_generations
+                * ((num_gen_tokens_per_seq + compress_ratio - 1) // compress_ratio)
+            )
+            for compress_ratio in self.compress_ratio_set
+        }
+        self._gen_output_sizes = gen_output_sizes
 
         # Host-side per-ratio ctx compressed-token counts (Python ints), so
         # _compute_ctx_compressed_position_ids never reads a device scalar
@@ -516,9 +534,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
                 cu_new = new_comp_kv_lens.cumsum(0)
                 num_ctx_compressed_tokens = cu_new[num_contexts - 1].item()
                 ctx_output_sizes[compress_ratio] = num_ctx_compressed_tokens
-                num_gen_compressed_tokens = num_generations * (
-                    (num_gen_tokens_per_seq + compress_ratio - 1) // compress_ratio
-                )
+                num_gen_compressed_tokens = gen_output_sizes[compress_ratio]
                 self.num_total_compressed_tokens[compress_ratio] = (
                     num_ctx_compressed_tokens + num_gen_compressed_tokens
                 )
@@ -529,9 +545,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             # Decode-only: scalars depend only on num_generations and
             # num_gen_tokens_per_seq, no per-request tensor ops needed.
             for compress_ratio in self.compress_ratio_set:
-                self.num_total_compressed_tokens[compress_ratio] = num_generations * (
-                    (num_gen_tokens_per_seq + compress_ratio - 1) // compress_ratio
-                )
+                self.num_total_compressed_tokens[compress_ratio] = gen_output_sizes[compress_ratio]
                 self.max_ctx_compressed_tokens[compress_ratio] = 0
 
         # Cached for on_update_kv_lens(); see the reuse gate there.
@@ -598,7 +612,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
                 ctx_output_sizes,
             )
 
-        if self.num_gen_tokens_per_seq > 0 and num_generations > 0:
+        if any(self._gen_output_sizes.values()) and num_generations > 0:
             # Extract output_offset as Python int per ratio to avoid
             # tensor-scalar slice inside compiled function.
             # For decode-only batches (num_contexts == 0), offset is 0.
@@ -612,7 +626,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
                 self.compressed_position_ids_cuda,
                 num_contexts,
                 num_generations,
-                self.num_gen_tokens_per_seq,
+                self._gen_output_sizes,
                 self._compress_ratios_sorted,
                 gen_output_offsets,
             )
@@ -629,7 +643,9 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
 
         num_gen_tokens = num_tokens - self.num_ctx_tokens
         self.num_gen_tokens_per_seq = (
-            num_gen_tokens // self.num_generations if self.num_generations > 0 else 0
+            self.max_draft_tokens + 1
+            if self.confidence_fixed_budget_active
+            else (num_gen_tokens // self.num_generations if self.num_generations > 0 else 0)
         )
 
         # Reuse prepare()'s host-computed ctx sizes unless the extend_ctx path
@@ -722,7 +738,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         compressed_position_ids_bufs: Dict[int, torch.Tensor],
         num_contexts: int,
         num_generations: int,
-        num_gen_tokens_per_seq: int,
+        gen_output_sizes: Dict[int, int],
         compress_ratios: list,
         gen_output_offsets: Dict[int, int],
     ):
@@ -739,8 +755,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         device = past_kv_lens_bufs[compress_ratios[0]].device
         batch_size = num_contexts + num_generations
         for compress_ratio in compress_ratios:
-            new_gen_comp = (num_gen_tokens_per_seq + compress_ratio - 1) // compress_ratio
-            gen_comp = num_generations * new_gen_comp
+            gen_comp = gen_output_sizes[compress_ratio]
             output_offset = gen_output_offsets[compress_ratio]
             cu_new_comp = cu_new_comp_kv_bufs[compress_ratio]
             output_idx = torch.arange(gen_comp, dtype=torch.int32, device=device) + output_offset

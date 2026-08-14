@@ -954,6 +954,7 @@ class DSparkDraftModel(nn.Module):
         temperature: float = 0.0,
         confidence_threshold: float = 0.0,
         return_logits: bool = False,
+        return_confidence_logits: bool = False,
         all_rank_num_tokens: Optional[List[int]] = None,
     ) -> tuple:
         """Full block-draft forward: chain the ``num_stages`` DSpark stages.
@@ -1005,6 +1006,7 @@ class DSparkDraftModel(nn.Module):
             temperature=temperature,
             confidence_threshold=confidence_threshold,
             return_logits=return_logits,
+            return_confidence_logits=return_confidence_logits,
         )
 
     def forward_batched(
@@ -1018,6 +1020,7 @@ class DSparkDraftModel(nn.Module):
         temperature: float = 0.0,
         confidence_threshold: float = 0.0,
         return_logits: bool = False,
+        return_confidence_logits: bool = False,
         all_rank_num_tokens: Optional[List[int]] = None,
     ) -> tuple:
         """CUDA-graph-safe batched block-draft forward (all gen requests at once).
@@ -1073,6 +1076,7 @@ class DSparkDraftModel(nn.Module):
             temperature=temperature,
             confidence_threshold=confidence_threshold,
             return_logits=return_logits,
+            return_confidence_logits=return_confidence_logits,
         )
 
     def run_moe_lockstep_noop(
@@ -1122,6 +1126,7 @@ class DSparkDraftModel(nn.Module):
         temperature: float = 0.0,
         confidence_threshold: float = 0.0,
         return_logits: bool = False,
+        return_confidence_logits: bool = False,
     ) -> tuple:
         """Block-draft head: hc_head + norm + lm_head -> markov refine + confidence.
 
@@ -1143,6 +1148,7 @@ class DSparkDraftModel(nn.Module):
             temperature=temperature,
             confidence_threshold=confidence_threshold,
             return_logits=return_logits,
+            return_confidence_logits=return_confidence_logits,
         )
 
 

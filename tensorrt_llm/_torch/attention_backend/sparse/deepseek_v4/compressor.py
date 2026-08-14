@@ -220,6 +220,8 @@ class Compressor(nn.Module):
 
         if num_generations > 0:
             gen_kv_lens = kv_lens[num_contexts:]
+            # Dispatch the graph-static maximum query width. The CUDA kernel
+            # derives each request's actual packed q_i from cu_seq_lens.
             next_n = metadata.num_gen_tokens_per_seq
             # Pass full kv_score (not sliced) with the generation portion of
             # cu_seq_lens so the kernel reads at the correct absolute offsets.

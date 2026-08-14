@@ -337,7 +337,11 @@ __global__ void pagedKvCompressKernel(void const* __restrict__ kv_score_raw, flo
     int const eff_tid = head_blk * NTHRD_INNER + tid;
 
     int const kv_len = kv_lens[batch_idx];
-    int const sp = kv_len - NEXT_N;
+    // NEXT_N is the graph-static maximum query width. Confidence scheduling
+    // packs a variable number of query tokens for each request, so recover the
+    // actual width from the packed query prefix instead of assuming NEXT_N.
+    int const actual_next_n = cu_seq_lens[batch_idx + 1] - cu_seq_lens[batch_idx];
+    int const sp = kv_len - actual_next_n;
     int const in_off = cu_seq_lens[batch_idx];
     int const out_off = cu_kv_comp[batch_idx];
     int64_t const page_sd = static_cast<int64_t>(page_size) * STATE_DIM;
@@ -347,7 +351,7 @@ __global__ void pagedKvCompressKernel(void const* __restrict__ kv_score_raw, flo
     auto* paged_score = reinterpret_cast<StateElemT*>(paged_score_raw);
 
     // ================================================================
-    // Phase 1: Write NEXT_N new tokens' KV and score state to paged cache.
+    // Phase 1: Write this request's new tokens to paged cache.
     //
     // Only warp 0 participates (all warps share the same eff_tid mapping).
     // When NUM_RED_WARPS == 1, the guard compiles away.
@@ -357,6 +361,8 @@ __global__ void pagedKvCompressKernel(void const* __restrict__ kv_score_raw, flo
 #pragma unroll
         for (int t = 0; t < NEXT_N; t++)
         {
+            if (t >= actual_next_n)
+                break;
             int token_idx = sp + t;
             if (token_idx < kv_len)
             {
@@ -413,7 +419,7 @@ __global__ void pagedKvCompressKernel(void const* __restrict__ kv_score_raw, flo
     // ================================================================
     // Phase 2: Count how many complete compression windows finished.
     // ================================================================
-    int last_token_idx = sp + NEXT_N - 1;
+    int last_token_idx = kv_len - 1;
     int num_compressions = (last_token_idx + 1) / COMPRESS_RATIO - sp / COMPRESS_RATIO;
 
     // ================================================================

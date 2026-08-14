@@ -91,6 +91,10 @@ struct MlaParams
     int32_t head_num; // h
     void* workspace;
     int32_t const* cache_seq_lens;
+    // Optional per-request generation query lengths. When set, generation
+    // tokens are request-major ragged instead of uniform
+    // ``acc_q_len / batch_size``.
+    int32_t const* generation_lengths = nullptr;
     int* seqQOffset;
     uint32_t* fmha_tile_counter;
     int32_t max_input_seq_len;

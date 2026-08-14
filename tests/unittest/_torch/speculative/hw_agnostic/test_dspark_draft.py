@@ -97,3 +97,29 @@ def test_dspark_propose_confidence_truncates():
             confidence_threshold=0.5,
         )
     assert int(num2[0]) == 0
+
+
+def test_dspark_propose_surfaces_confidence_logits_without_host_truncation():
+    torch.manual_seed(2)
+    confidence_head = DSparkConfidenceHead(hidden_size=HID).eval()
+    base_logits = torch.randn(B, BLK, VOCAB)
+    bonus = torch.randint(0, VOCAB, (B,))
+    hidden = torch.randn(B, BLK, HID)
+
+    with torch.no_grad():
+        draft_tokens, num_proposed, draft_logits, confidence_logits = dspark_propose(
+            base_logits,
+            bonus_token_ids=bonus,
+            block_hidden=hidden,
+            markov_head=None,
+            confidence_head=confidence_head,
+            block_size=BLK,
+            confidence_threshold=0.0,
+            return_logits=True,
+            return_confidence_logits=True,
+        )
+
+    assert draft_tokens.shape == (B, BLK)
+    assert torch.all(num_proposed == BLK)
+    assert torch.equal(draft_logits, base_logits)
+    assert torch.equal(confidence_logits, confidence_head(hidden))

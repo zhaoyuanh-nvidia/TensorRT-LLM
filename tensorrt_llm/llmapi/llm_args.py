@@ -2852,15 +2852,75 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         "read from the draft model config (dspark_markov_head_type), "
         "defaulting to \"vanilla\".")
 
-    # NOTE: confidence-based dynamic drafting (the draft model's confidence head
-    # that truncates the proposed block) is NOT enabled in this PR. The user-facing
-    # ``enable_confidence_head`` / ``confidence_threshold`` knobs are intentionally
-    # omitted and will be added when the feature is actually wired into the
-    # speculative scheduling/verification path. The confidence head module and its
-    # internal plumbing remain as scaffolding (see DSparkConfidenceHead /
-    # dspark_propose).
+    confidence_mode: Literal["disabled", "fixed_budget"] = Field(
+        default="disabled",
+        description=
+        "Confidence-based DSpark scheduling mode. \"disabled\" preserves "
+        "static K-token verification. \"fixed_budget\" keeps the physical "
+        "draft width at max_draft_len, ranks draft prefixes with the confidence "
+        "head, and packs target verification into a fixed token budget selected "
+        "by confidence_verifier_token_budget_schedule.")
+
+    confidence_verifier_token_budget_schedule: Optional[dict[int, int]] = Field(
+        default=None,
+        description=
+        "Map from CUDA-graph batch size G to the total number V of target "
+        "verification tokens in that graph. V includes one mandatory anchor "
+        "token per generation request, so each entry must satisfy "
+        "G <= V <= G * (max_draft_len + 1). Only exact configured graph batch "
+        "sizes use fixed-budget confidence scheduling.")
 
     decoding_type: Literal["DSpark"] = Field(default="DSpark")
+
+    @model_validator(mode="after")
+    def validate_confidence_fixed_budget(self):
+        schedule = self.confidence_verifier_token_budget_schedule
+        if self.confidence_mode == "disabled":
+            if schedule is not None:
+                raise ValueError(
+                    "DSpark confidence_verifier_token_budget_schedule requires "
+                    "confidence_mode='fixed_budget'")
+            return self
+
+        if not schedule:
+            raise ValueError(
+                "DSpark confidence_mode='fixed_budget' requires a non-empty "
+                "confidence_verifier_token_budget_schedule")
+        if not self.max_draft_len:
+            raise ValueError("DSpark confidence_mode='fixed_budget' requires "
+                             "max_draft_len > 0")
+
+        for graph_batch_size, verifier_tokens in schedule.items():
+            if graph_batch_size < 1:
+                raise ValueError(
+                    "DSpark confidence verifier schedule graph batch sizes must "
+                    f"be >= 1; got {graph_batch_size}")
+            minimum_tokens = graph_batch_size
+            maximum_tokens = graph_batch_size * (self.max_draft_len + 1)
+            if not minimum_tokens <= verifier_tokens <= maximum_tokens:
+                raise ValueError(
+                    "DSpark confidence verifier token budget must satisfy "
+                    "G <= V <= G * (max_draft_len + 1); got "
+                    f"G={graph_batch_size}, V={verifier_tokens}, "
+                    f"max_draft_len={self.max_draft_len}")
+
+        self.confidence_verifier_token_budget_schedule = dict(
+            sorted(schedule.items()))
+        return self
+
+    @property
+    def is_fixed_budget_confidence_enabled(self) -> bool:
+        """Whether DSpark confidence-based fixed-budget packing is enabled."""
+        return self.confidence_mode == "fixed_budget"
+
+    def resolve_confidence_verifier_token_budget(
+            self, graph_batch_size: int) -> Optional[int]:
+        """Return the configured verifier capacity for an exact graph size."""
+        if (not self.is_fixed_budget_confidence_enabled
+                or self.confidence_verifier_token_budget_schedule is None):
+            return None
+        return self.confidence_verifier_token_budget_schedule.get(
+            graph_batch_size)
 
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):
@@ -5895,6 +5955,22 @@ class TorchLlmArgs(BaseLlmArgs):
                 logger.debug(
                     f"draft_len_schedule keys added to cuda_graph_config.batch_sizes, current batch_sizes: {self.cuda_graph_config.batch_sizes}"
                 )
+
+            if (isinstance(self.speculative_config, DSparkDecodingConfig) and
+                    self.speculative_config.confidence_mode == "fixed_budget"):
+                if self.disable_overlap_scheduler:
+                    raise ValueError(
+                        "DSpark confidence_mode='fixed_budget' requires the "
+                        "overlap scheduler")
+                if self.cuda_graph_config is not None:
+                    confidence_schedule = self.speculative_config.confidence_verifier_token_budget_schedule
+                    assert confidence_schedule is not None
+                    self.cuda_graph_config.batch_sizes = CudaGraphConfig._merge_schedule_keys(
+                        self.cuda_graph_config.batch_sizes, confidence_schedule)
+                    logger.debug(
+                        "DSpark confidence verifier schedule keys added to "
+                        "cuda_graph_config.batch_sizes, current batch_sizes: "
+                        f"{self.cuda_graph_config.batch_sizes}")
 
         else:
             self.decoding_config = None

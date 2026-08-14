@@ -29,6 +29,32 @@ if TYPE_CHECKING:
     )
 
 
+def _generation_query_metadata(
+    metadata: "TrtllmAttentionMetadata",
+    predicted_tokens_per_seq: int,
+    num_gen_tokens: int,
+    num_seqs: int,
+) -> tuple[int, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Resolve uniform or ragged generation-query metadata for TRTLLM-gen."""
+    input_seq_length = num_gen_tokens // num_seqs if num_seqs > 0 else 1
+    spec_gen_lengths = None
+    spec_pos_offsets = None
+    ragged_linear_generation = metadata.confidence_fixed_budget_active
+    if (
+        metadata.is_spec_decoding_enabled or ragged_linear_generation
+    ) and predicted_tokens_per_seq > 1:
+        spec_gen_lengths = metadata.spec_decoding_generation_lengths
+        position_offsets_for_cpp = metadata.spec_decoding_position_offsets_for_cpp
+        if position_offsets_for_cpp is not None and position_offsets_for_cpp.dim() == 1:
+            position_offsets_for_cpp = position_offsets_for_cpp.view(metadata.max_num_requests, -1)
+        spec_pos_offsets = position_offsets_for_cpp
+        if ragged_linear_generation:
+            # V // G is only an average; kernels use the physical K+1 width as
+            # the maximum and ``spec_gen_lengths`` for request boundaries.
+            input_seq_length = predicted_tokens_per_seq
+    return input_seq_length, spec_gen_lengths, spec_pos_offsets
+
+
 @dataclass(slots=True)
 class FmhaParams:
     attn: "TrtllmAttention"
@@ -226,19 +252,17 @@ class PhasedFmha(Fmha):
             max_past_kv_len = int(
                 host_past_key_value_lengths[seq_offset : seq_offset + num_seqs].max()
             )
-            input_seq_length = num_gen_tokens // num_seqs if num_seqs > 0 else 1
-
             predicted_tokens_per_seq = attn.predicted_tokens_per_seq
-            spec_gen_lengths = None
-            spec_pos_offsets = None
-            if metadata.is_spec_decoding_enabled and predicted_tokens_per_seq > 1:
-                spec_gen_lengths = metadata.spec_decoding_generation_lengths
-                position_offsets_for_cpp = metadata.spec_decoding_position_offsets_for_cpp
-                if position_offsets_for_cpp is not None and position_offsets_for_cpp.dim() == 1:
-                    position_offsets_for_cpp = position_offsets_for_cpp.view(
-                        metadata.max_num_requests, -1
-                    )
-                spec_pos_offsets = position_offsets_for_cpp
+            (
+                input_seq_length,
+                spec_gen_lengths,
+                spec_pos_offsets,
+            ) = _generation_query_metadata(
+                metadata,
+                predicted_tokens_per_seq,
+                num_gen_tokens,
+                num_seqs,
+            )
 
             params.attention_input = q[token_offset : token_offset + num_gen_tokens]
             params.qkv_input = params.attention_input

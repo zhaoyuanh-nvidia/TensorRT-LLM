@@ -29,7 +29,9 @@ from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
+from ..distributed import AllReduce, AllReduceStrategy
 from ..pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
+from .dspark_confidence import plan_fixed_verifier_budget, verify_packed_greedy
 from .interface import SpecMetadata, SpecWorkerBase
 
 if TYPE_CHECKING:
@@ -53,6 +55,8 @@ class DSparkSpecMetadata(SpecMetadata):
     """
 
     batch_indices_cuda: Optional[torch.Tensor] = None
+    confidence_fixed_budget_active: bool = False
+    confidence_verifier_token_budget: int = 0
 
     # Hidden state capture fields
     layers_to_capture: Optional[List[int]] = None
@@ -67,6 +71,9 @@ class DSparkSpecMetadata(SpecMetadata):
             dtype=torch.int,
             device="cuda",
         )
+        # Persistent per-request retained lengths for packed target
+        # verification. Reusing this allocation is required by CUDA graphs.
+        self.draft_lens = torch.empty([self.max_num_requests], dtype=torch.int, device="cuda")
 
         self.is_spec_dec_tree = False
         self.is_spec_dec_dynamic_tree = False
@@ -219,6 +226,19 @@ class DSparkWorker(SpecWorkerBase):
         super().__init__(use_separate_draft_kv_cache)
         self.spec_config = spec_config
         self.mapping = mapping
+        self._confidence_all_reduce = (
+            AllReduce(
+                mapping,
+                strategy=AllReduceStrategy.NCCL,
+                dtype=torch.float32,
+            )
+            if (
+                getattr(spec_config, "is_fixed_budget_confidence_enabled", False)
+                and mapping.tp_size > 1
+                and not mapping.enable_attention_dp
+            )
+            else None
+        )
 
         # Per-slot rolling captured-context KV windows, built lazily on the
         # first forward (fixed-size for slot-indexed reads/writes).
@@ -376,7 +396,7 @@ class DSparkWorker(SpecWorkerBase):
         batch_size: int,
         total_target_tokens: int,
         all_rank_num_tokens: Optional[List[int]] = None,
-    ) -> torch.Tensor:
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """CUDA-graph-safe batched gen draft (all gen requests in one forward).
 
         Free of host syncs and data-dependent shapes: per-request quantities
@@ -384,9 +404,10 @@ class DSparkWorker(SpecWorkerBase):
         back-fill) are gathered as tensors, slots come from the host-built
         ``_batch_to_slot`` mirror, and the backbone runs once via
         ``DSparkDraftModel.forward_batched``. Returns the per-position corrected
-        block logits ``[num_gens, K, vocab]`` (or ``None`` when there is nothing to
-        draft); the worker feeds them to ``SpecWorkerBase.sample_draft_tokens``.
-        Confidence truncation stays disabled — the full block is proposed.
+        block logits ``[num_gens, K, vocab]`` and, when fixed-budget mode is
+        configured for this exact batch size, confidence logits
+        ``[num_gens, K]``. The physical proposal remains the full K block; the
+        confidence plan only compacts the following target-verification step.
         """
         num_gens = batch_size - num_contexts
         K = self.max_draft_len
@@ -394,10 +415,10 @@ class DSparkWorker(SpecWorkerBase):
         device = accepted_tokens.device
 
         if num_gens == 0:
-            return None
+            return None, None
         captured = spec_metadata.get_hidden_states(total_target_tokens)
         if captured is None:
-            return None
+            return None, None
 
         # gen-only graph batches have num_ctx_tokens == 0; mixed eager batches put
         # the gen tokens after the context tokens.
@@ -411,10 +432,16 @@ class DSparkWorker(SpecWorkerBase):
             accepted_tokens[num_contexts:batch_size].gather(1, gidx.unsqueeze(1)).squeeze(1).long()
         )  # [G]
 
-        # Captured target hidden at the bonus position within each request's Kp1
-        # processed tokens.
+        # Captured target hidden at the bonus position. Static K verification
+        # uses a dense [G, K+1] layout. Fixed-budget confidence verification is
+        # request-major packed, so each request starts at the exclusive prefix
+        # sum of its device-side query length instead.
         arange_g = torch.arange(num_gens, device=device)
-        base = gen_start + arange_g * Kp1  # [G]
+        if spec_metadata.confidence_fixed_budget_active:
+            query_lens = spec_metadata.draft_lens[num_contexts:batch_size].long() + 1
+            base = torch.cumsum(query_lens, dim=0) - query_lens
+        else:
+            base = gen_start + arange_g * Kp1  # [G]
         main_hidden = captured[base + gidx]  # [G, ncap*hidden]
 
         # Fixed-size ([G, K]) masked back-fill of the intermediate accepted tokens
@@ -440,7 +467,27 @@ class DSparkWorker(SpecWorkerBase):
         # Surface the per-position corrected block logits ([num_gens, K, vocab])
         # and let SpecWorkerBase.sample_draft_tokens do the (greedy or rejection)
         # sampling + TP gather + draft_probs scatter, rather than argmaxing here.
-        _toks, _num_proposed, block_logits = draft_model.forward_batched(
+        verifier_token_budget = (
+            self.spec_config.resolve_confidence_verifier_token_budget(num_gens)
+            if (
+                num_contexts == 0
+                and spec_metadata.is_all_greedy_sample
+                and getattr(
+                    self.spec_config,
+                    "is_fixed_budget_confidence_enabled",
+                    False,
+                )
+            )
+            else None
+        )
+        if (
+            verifier_token_budget is not None
+            and draft_model.dspark_model.mtp_layers[-1].confidence_head is None
+        ):
+            raise RuntimeError(
+                "DSpark fixed-budget confidence scheduling requires a loaded confidence head"
+            )
+        draft_outputs = draft_model.forward_batched(
             main_hidden,
             bonus,
             start_pos,
@@ -449,9 +496,54 @@ class DSparkWorker(SpecWorkerBase):
             temperature=0.0,
             confidence_threshold=0.0,
             return_logits=True,
+            return_confidence_logits=verifier_token_budget is not None,
             all_rank_num_tokens=all_rank_num_tokens,
         )
-        return block_logits
+        if verifier_token_budget is not None:
+            _toks, _num_proposed, block_logits, confidence_logits = draft_outputs
+        else:
+            _toks, _num_proposed, block_logits = draft_outputs
+            confidence_logits = None
+        return block_logits, confidence_logits
+
+    def _sample_and_accept_fixed_budget(
+        self,
+        logits: torch.Tensor,
+        attn_metadata,
+        spec_metadata: "DSparkSpecMetadata",
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Greedy verification for packed, variable per-request prefixes.
+
+        The target logits are packed request-major with ``sum(d_i + 1) == V``
+        rows, while the return tensors retain the physical K+1 width expected
+        by the shared sampler. All indexing is derived from the persistent
+        device-side ``draft_lens`` buffer and is CUDA-graph safe.
+        """
+        batch_size = attn_metadata.num_seqs
+        if attn_metadata.num_contexts != 0:
+            raise RuntimeError(
+                "DSpark fixed-budget confidence verification requires a generation-only batch"
+            )
+        if not spec_metadata.is_all_greedy_sample:
+            raise RuntimeError(
+                "DSpark fixed-budget confidence verification currently "
+                "supports greedy sampling only"
+            )
+        if self.force_num_accepted_tokens != 0.0:
+            raise RuntimeError(
+                "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS is not supported "
+                "with DSpark fixed-budget confidence verification"
+            )
+
+        target_tokens = self._sample_tokens_for_batch(logits, spec_metadata, 0, batch_size).to(
+            torch.int32
+        )
+        return verify_packed_greedy(
+            target_tokens,
+            spec_metadata.draft_tokens,
+            spec_metadata.draft_lens[:batch_size],
+            self.max_draft_len,
+        )
 
     def _sample_draft_tokens_guided(
         self,
@@ -519,9 +611,14 @@ class DSparkWorker(SpecWorkerBase):
         # hook), then routes to strict or rejection sampling. Greedy parity with
         # the previous hand-rolled path is preserved (rejection only engages for a
         # non-greedy batch with valid draft_probs).
-        accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
-            logits, attn_metadata, spec_metadata
-        )
+        if spec_metadata.confidence_fixed_budget_active:
+            accepted_tokens, num_accepted_tokens = self._sample_and_accept_fixed_budget(
+                logits, attn_metadata, spec_metadata
+            )
+        else:
+            accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
+                logits, attn_metadata, spec_metadata
+            )
 
         total_target_tokens = input_ids.shape[0]
 
@@ -583,7 +680,7 @@ class DSparkWorker(SpecWorkerBase):
         if num_gens > 0:
             # The batched gen-block draft returns the per-position corrected block
             # logits [num_gens, K, vocab] and is CUDA-graph-safe.
-            gen_logits = self._draft_gen_block_batched(
+            gen_logits, confidence_logits = self._draft_gen_block_batched(
                 draft_model,
                 spec_metadata,
                 attn_metadata,
@@ -619,6 +716,7 @@ class DSparkWorker(SpecWorkerBase):
             else:
                 gen_draft_tokens = torch.zeros((num_gens, K), dtype=torch.int32, device="cuda")
                 gen_vocab = None
+                confidence_logits = None
         else:
             # No local generation requests: if any peer EP rank has some, we must
             # still cross the draft MoE's cross-rank barrier the same number of
@@ -627,6 +725,7 @@ class DSparkWorker(SpecWorkerBase):
                 draft_model.run_moe_lockstep_noop(all_rank_draft_tokens, accepted_tokens.device)
             gen_draft_tokens = torch.empty((0, K), dtype=torch.int32, device="cuda")
             gen_vocab = None
+            confidence_logits = None
 
         # Context requests are not drafted by the block worker (zero placeholder
         # token); fill their draft-prob slot rows with a legal one-hot so they are
@@ -638,6 +737,33 @@ class DSparkWorker(SpecWorkerBase):
             next_draft_tokens = torch.cat([ctx_draft_tokens, gen_draft_tokens], dim=0)
         else:
             next_draft_tokens = gen_draft_tokens
+
+        next_draft_lens = None
+        if (
+            num_contexts == 0
+            and confidence_logits is not None
+            and getattr(self.spec_config, "is_fixed_budget_confidence_enabled", False)
+            and spec_metadata.is_all_greedy_sample
+        ):
+            verifier_token_budget = self.spec_config.resolve_confidence_verifier_token_budget(
+                num_gens
+            )
+            if verifier_token_budget is not None:
+                if self._confidence_all_reduce is not None:
+                    confidence_contribution = (
+                        confidence_logits.float()
+                        if self.mapping.tp_rank == 0
+                        else torch.zeros_like(confidence_logits, dtype=torch.float32)
+                    )
+                    confidence_logits = self._confidence_all_reduce(
+                        confidence_contribution.contiguous()
+                    )
+                    if isinstance(confidence_logits, tuple):
+                        confidence_logits = confidence_logits[0]
+                confidence_plan = plan_fixed_verifier_budget(
+                    confidence_logits, verifier_token_budget
+                )
+                next_draft_lens = confidence_plan.retained_lens
 
         next_new_tokens = self._prepare_next_new_tokens(
             accepted_tokens,
@@ -651,10 +777,13 @@ class DSparkWorker(SpecWorkerBase):
             self._ctx_len.copy_(saved_ctx_len)
             self._kv_windows.copy_(saved_windows)
 
-        return {
+        outputs = {
             "logits": raw_logits,
             "new_tokens": accepted_tokens,
             "new_tokens_lens": num_accepted_tokens,
             "next_draft_tokens": next_draft_tokens,
             "next_new_tokens": next_new_tokens,
         }
+        if next_draft_lens is not None:
+            outputs["next_draft_lens"] = next_draft_lens
+        return outputs

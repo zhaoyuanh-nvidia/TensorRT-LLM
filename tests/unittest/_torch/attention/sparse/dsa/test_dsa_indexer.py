@@ -966,6 +966,155 @@ def test_indexer_compress_ratio_zero_or_one_means_uncompressed(disabled_ratio):
     assert metadata.get_indexer_max_seq_len() == 1024
 
 
+def _create_confidence_fixed_budget_indexer_metadata(
+    num_requests: int, verifier_token_budget: int
+) -> DSAtrtllmAttentionMetadata:
+    """Create the persistent device buffers used by fixed-budget DSA preparation."""
+    max_blocks_per_sequence = 8
+    metadata = object.__new__(DSAtrtllmAttentionMetadata)
+    metadata._num_contexts = 0
+    metadata._num_generations = num_requests
+    metadata._num_seqs = num_requests
+    metadata._num_ctx_tokens = 0
+    metadata._num_tokens = verifier_token_budget
+    metadata._indexer_compress_ratio = 4
+    metadata.num_sms = deep_gemm.get_num_sms()
+
+    metadata._seq_lens_cuda = torch.empty(num_requests, dtype=torch.int32, device="cuda")
+    metadata.kv_lens_cuda_runtime = torch.empty(num_requests, dtype=torch.int32, device="cuda")
+    metadata.req_idx_per_token = torch.empty(
+        verifier_token_budget, dtype=torch.int32, device="cuda"
+    )
+    metadata.query_kv_lens_expanded_cuda = torch.full(
+        (verifier_token_budget,), -1, dtype=torch.int32, device="cuda"
+    )
+    metadata.kv_lens_expanded_cuda = torch.full(
+        (verifier_token_budget,), -1, dtype=torch.int32, device="cuda"
+    )
+    metadata.indexer_k_cache_block_offsets = (
+        torch.arange(
+            num_requests * max_blocks_per_sequence,
+            dtype=torch.int32,
+            device="cuda",
+        ).view(num_requests, max_blocks_per_sequence)
+        + 100
+    )
+    metadata.block_table_expanded = torch.full(
+        (verifier_token_budget, max_blocks_per_sequence),
+        -1,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    metadata.scheduler_metadata_buffer_expanded = torch.full(
+        (metadata.num_sms + 1, 2), -1, dtype=torch.int32, device="cuda"
+    )
+    metadata.gen_indexer_kv_lens_cuda_runtime = None
+    metadata._test_past_kv_lens_cuda = torch.tensor(
+        [255, 511, 767], dtype=torch.int32, device="cuda"
+    )
+    metadata.get_indexer_kv_lens = MethodType(
+        DSAtrtllmAttentionMetadata.get_indexer_kv_lens, metadata
+    )
+    return metadata
+
+
+def _set_confidence_fixed_budget_inputs(
+    metadata: DSAtrtllmAttentionMetadata, query_lens: list[int]
+) -> torch.Tensor:
+    """Update graph-stable input buffers for one ragged fixed-budget layout."""
+    query_lens_cuda = torch.tensor(query_lens, dtype=torch.int32, device="cuda")
+    req_idx = torch.repeat_interleave(
+        torch.arange(len(query_lens), dtype=torch.int32, device="cuda"),
+        query_lens_cuda,
+        output_size=metadata.num_tokens,
+    )
+    metadata._seq_lens_cuda.copy_(query_lens_cuda)
+    metadata.kv_lens_cuda_runtime.copy_(metadata._test_past_kv_lens_cuda + query_lens_cuda)
+    metadata.req_idx_per_token.copy_(req_idx)
+    return req_idx
+
+
+def _assert_confidence_fixed_budget_rows(
+    metadata: DSAtrtllmAttentionMetadata,
+    query_lens: list[int],
+    expected_req_idx: torch.Tensor,
+    stable_buffer_ptrs: dict[str, int],
+) -> None:
+    """Validate all persistent row metadata after eager execution or graph replay."""
+    expected_raw = torch.tensor(
+        [
+            past_kv_len + local_offset + 1
+            for past_kv_len, query_len in zip(
+                metadata._test_past_kv_lens_cuda.cpu().tolist(), query_lens
+            )
+            for local_offset in range(query_len)
+        ],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    expected_compressed = expected_raw // metadata._indexer_compress_ratio
+    expected_blocks = torch.index_select(
+        metadata.indexer_k_cache_block_offsets, 0, expected_req_idx.to(torch.long)
+    )
+    expected_schedule = deep_gemm.get_paged_mqa_logits_metadata(
+        expected_compressed.view(-1, 1), 64, metadata.num_sms
+    )
+
+    torch.testing.assert_close(metadata.query_kv_lens_expanded_cuda, expected_raw)
+    torch.testing.assert_close(metadata.kv_lens_expanded_cuda, expected_compressed)
+    torch.testing.assert_close(metadata.block_table_expanded, expected_blocks)
+    torch.testing.assert_close(
+        metadata.gen_indexer_kv_lens_cuda_runtime,
+        metadata.get_indexer_kv_lens(metadata.kv_lens_cuda_runtime),
+    )
+    torch.testing.assert_close(metadata.scheduler_metadata_buffer_expanded, expected_schedule)
+    for name, expected_ptr in stable_buffer_ptrs.items():
+        assert getattr(metadata, name).data_ptr() == expected_ptr
+
+
+@pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
+@skip_pre_blackwell
+def test_prepare_confidence_fixed_budget_rows_cuda_graph_replay() -> None:
+    """Replay ragged V-row DSA preparation without changing persistent buffers."""
+    query_lens_cases = ([6, 3, 1], [2, 2, 6])
+    verifier_token_budget = 10
+    metadata = _create_confidence_fixed_budget_indexer_metadata(
+        num_requests=3, verifier_token_budget=verifier_token_budget
+    )
+    first_req_idx = _set_confidence_fixed_budget_inputs(metadata, query_lens_cases[0])
+
+    warmup_stream = torch.cuda.Stream()
+    warmup_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup_stream):
+        for _ in range(3):
+            Indexer.prepare_confidence_fixed_budget_rows(metadata)
+    torch.cuda.current_stream().wait_stream(warmup_stream)
+
+    stable_buffer_names = (
+        "query_kv_lens_expanded_cuda",
+        "kv_lens_expanded_cuda",
+        "block_table_expanded",
+        "scheduler_metadata_buffer_expanded",
+    )
+    stable_buffer_ptrs = {name: getattr(metadata, name).data_ptr() for name in stable_buffer_names}
+    _set_confidence_fixed_budget_inputs(metadata, query_lens_cases[0])
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        Indexer.prepare_confidence_fixed_budget_rows(metadata)
+
+    graph.replay()
+    torch.cuda.synchronize()
+    _assert_confidence_fixed_budget_rows(
+        metadata, query_lens_cases[0], first_req_idx, stable_buffer_ptrs
+    )
+    second_req_idx = _set_confidence_fixed_budget_inputs(metadata, query_lens_cases[1])
+    graph.replay()
+    torch.cuda.synchronize()
+    _assert_confidence_fixed_budget_rows(
+        metadata, query_lens_cases[1], second_req_idx, stable_buffer_ptrs
+    )
+
+
 def validate_topk_indices(topk_indices_0, topk_indices_1, total_tokens):
     """
     Validate the similarity between two topk indices.

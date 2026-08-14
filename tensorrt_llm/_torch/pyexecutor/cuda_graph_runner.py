@@ -9,6 +9,7 @@ import torch
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.llmapi.llm_args import (BaseSparseAttentionConfig,
                                           DecodingBaseConfig,
+                                          DSparkDecodingConfig,
                                           SeqLenAwareSparseAttentionConfig)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -49,6 +50,9 @@ class KeyType(NamedTuple):
     context_query_len: int = 0
     num_encoder_tokens: int = 0
     peft_cache_data_type: Optional[torch.dtype] = None
+    # Total packed target-verifier token capacity. Zero retains the legacy
+    # per-request ``draft_len + 1`` token count.
+    verifier_num_tokens: int = 0
 
 
 def _save_spec_decode_capture_state(
@@ -364,6 +368,67 @@ class CUDAGraphRunner:
             num_encoder_tokens = sum(
                 int(request.encoder_output_len) for request in context_requests
                 if not request.py_skip_cross_kv_projection)
+            verifier_num_tokens = 0
+            if (not self.config.is_draft_model
+                    and isinstance(self.spec_config, DSparkDecodingConfig)
+                    and self.spec_config.is_fixed_budget_confidence_enabled
+                    and is_all_greedy_sample):
+                configured_budget = self.spec_config.resolve_confidence_verifier_token_budget(
+                    batch_size)
+                is_synthetic_capture = (
+                    self._capture_allowed and num_contexts == 0
+                    and bool(batch.generation_requests) and all(
+                        getattr(request, "is_dummy", False)
+                        for request in batch.generation_requests))
+                if is_synthetic_capture and configured_budget is not None:
+                    retained_budget = (configured_budget -
+                                       len(batch.generation_requests))
+                    base_retained, extra_retained = divmod(
+                        retained_budget, len(batch.generation_requests))
+                    synthetic_effective_lens = [
+                        base_retained + (index < extra_retained)
+                        for index in range(len(batch.generation_requests))
+                    ]
+                    if any(effective_len > physical_len
+                           for effective_len, physical_len in zip(
+                               synthetic_effective_lens, draft_len_list)):
+                        return None
+                    for request, effective_len in zip(batch.generation_requests,
+                                                      synthetic_effective_lens):
+                        request.py_draft_tokens_effective_len = effective_len
+
+                effective_draft_lens = []
+                for request in batch.generation_requests:
+                    effective_len = getattr(request,
+                                            "py_draft_tokens_effective_len",
+                                            None)
+                    if effective_len is None:
+                        effective_len = len(request.py_draft_tokens)
+                    effective_draft_lens.append(int(effective_len))
+                if any(effective_len < 0 or effective_len > physical_len
+                       for effective_len, physical_len in zip(
+                           effective_draft_lens, draft_len_list)):
+                    return None
+
+                is_compact_step = any(effective_len != physical_len
+                                      for effective_len, physical_len in zip(
+                                          effective_draft_lens, draft_len_list))
+                if is_compact_step:
+                    # The fixed budget is a packed, generation-only target
+                    # shape. A partial shape that does not exactly match its
+                    # configured budget must not alias either the compact or
+                    # static-K graph.
+                    if num_contexts or (not is_synthetic_capture and any(
+                            getattr(request, "is_dummy", False)
+                            for request in batch.generation_requests)):
+                        return None
+                    actual_budget = sum(
+                        1 + effective_len
+                        for effective_len in effective_draft_lens)
+                    if (configured_budget is None
+                            or actual_budget != configured_budget):
+                        return None
+                    verifier_num_tokens = configured_budget
             key = KeyType(batch_size=batch_size,
                           draft_len=draft_len,
                           is_first_draft=False,
@@ -372,7 +437,8 @@ class CUDAGraphRunner:
                           num_contexts=num_contexts,
                           context_query_len=context_query_len,
                           num_encoder_tokens=num_encoder_tokens,
-                          peft_cache_data_type=peft_cache_data_type)
+                          peft_cache_data_type=peft_cache_data_type,
+                          verifier_num_tokens=verifier_num_tokens)
         return key
 
     def _get_compatible_mixed_encoder_decoder_key(self,
@@ -582,6 +648,9 @@ class CUDAGraphRunner:
         return self.memory_pool
 
     def _get_num_tokens_for_key(self, key: KeyType) -> int:
+        if key.verifier_num_tokens:
+            assert key.num_contexts == 0
+            return key.verifier_num_tokens
         token_per_generation = key.draft_len + 1
         return (key.num_contexts * key.context_query_len +
                 (key.batch_size * self.max_beam_width - key.num_contexts) *

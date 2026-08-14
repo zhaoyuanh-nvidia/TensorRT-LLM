@@ -181,7 +181,8 @@ void initBindings(nb::module_& m)
         nb::arg("spec_decoding_target_max_draft_tokens") = std::nullopt, nb::arg("quant_scale_qkv") = std::nullopt,
         nb::arg("dsv4_inv_rope_cos_sin_cache") = std::nullopt, nb::arg("enable_dsv4_epilogue_fusion") = false,
         nb::arg("force_prepare_spec_dec_tree_mask") = false, nb::arg("max_num_sequences") = std::nullopt,
-        "Multi-head attention operation", nb::call_guard<nb::gil_scoped_release>());
+        nb::arg("confidence_fixed_budget_active") = false, "Multi-head attention operation",
+        nb::call_guard<nb::gil_scoped_release>());
 
     m.def(
         "get_helix_workspace_size_per_rank",

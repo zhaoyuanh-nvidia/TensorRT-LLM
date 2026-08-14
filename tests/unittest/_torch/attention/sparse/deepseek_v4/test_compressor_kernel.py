@@ -1547,6 +1547,98 @@ def test_decode_mtp(batch_size, compress_ratio, head_dim, overlap, next_n):
         step += actual_n
 
 
+@skip_pre_blackwell
+def test_decode_mtp_ragged_queries_use_cu_seq_lens():
+    """A static NEXT_N dispatch must honor each packed request's actual q_i."""
+    compress_ratio = 4
+    head_dim = 128
+    state_dim = 2 * head_dim
+    page_size = 8
+    query_lens = torch.tensor([6, 1], device="cuda", dtype=torch.int32)
+    start_pos = torch.tensor([6, 7], device="cuda", dtype=torch.int32)
+    kv_lens = start_pos + query_lens
+    batch_size = query_lens.numel()
+    max_blocks = (int(kv_lens.max().item()) + page_size - 1) // page_size
+
+    ape = torch.randn(compress_ratio, state_dim, device="cuda")
+    full_kv = [
+        torch.randn(int(kv_lens[b].item()), state_dim, device="cuda") for b in range(batch_size)
+    ]
+    full_score = [
+        torch.randn(int(kv_lens[b].item()), state_dim, device="cuda") for b in range(batch_size)
+    ]
+
+    num_blocks = batch_size * max_blocks
+    paged_kv = torch.zeros(num_blocks, page_size, state_dim, device="cuda")
+    paged_score = torch.zeros_like(paged_kv)
+    block_table = torch.arange(num_blocks, device="cuda", dtype=torch.int32).view(
+        batch_size, max_blocks
+    )
+
+    expected = []
+    new_kv = []
+    new_score = []
+    output_counts = []
+    for b in range(batch_size):
+        start = int(start_pos[b].item())
+        end = int(kv_lens[b].item())
+        for token_idx in range(start):
+            physical_block = int(block_table[b, token_idx // page_size].item())
+            block_offset = token_idx % page_size
+            paged_kv[physical_block, block_offset] = full_kv[b][token_idx]
+            paged_score[physical_block, block_offset] = (
+                full_score[b][token_idx] + ape[token_idx % compress_ratio]
+            )
+
+        kv_state = torch.zeros(1, 2 * compress_ratio, state_dim, device="cuda")
+        score_state = torch.full_like(kv_state, float("-inf"))
+        full_output = run_pytorch_prefill_reference(
+            full_kv[b].unsqueeze(0),
+            full_score[b].unsqueeze(0),
+            ape,
+            kv_state,
+            score_state,
+            compress_ratio,
+            head_dim,
+            overlap=True,
+        ).squeeze(0)
+        output_start = start // compress_ratio
+        output_end = end // compress_ratio
+        expected.append(full_output[output_start:output_end])
+        output_counts.append(output_end - output_start)
+        new_kv.append(full_kv[b][start:end])
+        new_score.append(full_score[b][start:end])
+
+    cu_seq_lens = torch.zeros(batch_size + 1, device="cuda", dtype=torch.int32)
+    cu_seq_lens[1:] = torch.cumsum(query_lens, dim=0)
+    cu_outputs = torch.zeros_like(cu_seq_lens)
+    cu_outputs[1:] = torch.cumsum(
+        torch.tensor(output_counts, device="cuda", dtype=torch.int32), dim=0
+    )
+    kv_comp = torch.empty(int(cu_outputs[-1].item()), head_dim, device="cuda", dtype=torch.bfloat16)
+
+    decode_kernel(
+        fuse_kv_score(torch.cat(new_kv), torch.cat(new_score)),
+        ape,
+        kv_lens,
+        start_pos,
+        cu_seq_lens,
+        cu_outputs,
+        kv_comp,
+        paged_kv,
+        paged_score,
+        block_table,
+        block_table,
+        compress_ratio,
+        head_dim,
+        page_size,
+        next_n=int(query_lens.max().item()),
+    )
+
+    expected_output = torch.cat(expected).to(kv_comp.dtype)
+    assert torch.allclose(expected_output, kv_comp, rtol=2e-3, atol=5e-3)
+
+
 @pytest.mark.parametrize(
     "next_n,storage_next_n",
     [

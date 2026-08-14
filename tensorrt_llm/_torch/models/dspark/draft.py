@@ -63,6 +63,7 @@ def dspark_propose(
     temperature: float = 0.0,
     confidence_threshold: float = 0.0,
     return_logits: bool = False,
+    return_confidence_logits: bool = False,
 ) -> tuple:
     """Produce DSpark draft tokens for one block (functional-first, static length).
 
@@ -98,15 +99,15 @@ def dspark_propose(
 
         draft_tokens = greedy_or_sample(base_logits, temperature)
 
-    # Scaffolding: confidence-based dynamic drafting is NOT enabled in this PR.
-    # The worker always calls with confidence_threshold=0.0, so the block below is
-    # inert and num_proposed stays == block_size (the full block is proposed). The
-    # returned num_proposed is intentionally not yet consumed by the speculative
-    # scheduler/verifier; wiring it through is a follow-up (see PR description).
+    # The physical proposal stays full-width for CUDA-graph stability. The
+    # legacy threshold path may still report a shorter eager prefix through
+    # num_proposed; production fixed-budget scheduling instead requests the
+    # confidence logits and plans an exact packed verifier budget on device.
     num_proposed = torch.full(
         (batch,), int(block_size), dtype=torch.int32, device=base_logits.device
     )
-    if confidence_head is not None and confidence_threshold > 0.0:
+    confidence_logits = None
+    if confidence_head is not None and (confidence_threshold > 0.0 or return_confidence_logits):
         # prev token at position k is [bonus, draft_0, ..., draft_{k-1}]
         prev_ids = torch.cat([bonus_token_ids.unsqueeze(1), draft_tokens[:, :-1]], dim=1)
         prev_emb = (
@@ -114,17 +115,25 @@ def dspark_propose(
             if (markov_head is not None and getattr(confidence_head, "with_markov", False))
             else None
         )
-        conf_logits = (
+        confidence_logits = (
             confidence_head(block_hidden, prev_embeddings=prev_emb)
             if prev_emb is not None
             else confidence_head(block_hidden)
         )
-        # Per-request prefix truncation (batch handled row-wise to stay simple;
-        # functional-first scope typically runs batch=1 for the draft).
-        for b in range(batch):
-            num_proposed[b] = confident_prefix_length(
-                conf_logits[b : b + 1], block_size=block_size, threshold=confidence_threshold
-            )
+        if confidence_threshold > 0.0:
+            # Legacy eager-only threshold path. Production fixed-budget
+            # scheduling consumes ``confidence_logits`` directly on device and
+            # never enters this host-synchronizing row loop.
+            for b in range(batch):
+                num_proposed[b] = confident_prefix_length(
+                    confidence_logits[b : b + 1],
+                    block_size=block_size,
+                    threshold=confidence_threshold,
+                )
+    if return_logits and return_confidence_logits:
+        return draft_tokens, num_proposed, draft_logits, confidence_logits
     if return_logits:
         return draft_tokens, num_proposed, draft_logits
+    if return_confidence_logits:
+        return draft_tokens, num_proposed, confidence_logits
     return draft_tokens, num_proposed

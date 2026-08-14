@@ -499,6 +499,114 @@ def test_dspark_requires_positive_max_draft_len(tmp_path):
 
 
 @pytest.mark.cpu_only
+def test_dspark_confidence_fixed_budget_defaults_disabled():
+    spec_cfg = DSparkDecodingConfig(max_draft_len=5,
+                                    speculative_model="/tmp/dummy_model")
+
+    assert spec_cfg.confidence_mode == "disabled"
+    assert not spec_cfg.is_fixed_budget_confidence_enabled
+    assert spec_cfg.confidence_verifier_token_budget_schedule is None
+    assert spec_cfg.resolve_confidence_verifier_token_budget(256) is None
+
+
+@pytest.mark.cpu_only
+def test_dspark_confidence_fixed_budget_requires_schedule():
+    with pytest.raises(
+            ValidationError,
+            match=
+            "requires a non-empty confidence_verifier_token_budget_schedule"):
+        DSparkDecodingConfig(max_draft_len=5,
+                             speculative_model="/tmp/dummy_model",
+                             confidence_mode="fixed_budget")
+
+
+@pytest.mark.cpu_only
+def test_dspark_confidence_schedule_requires_fixed_budget_mode():
+    with pytest.raises(ValidationError,
+                       match="requires confidence_mode='fixed_budget'"):
+        DSparkDecodingConfig(
+            max_draft_len=5,
+            speculative_model="/tmp/dummy_model",
+            confidence_verifier_token_budget_schedule={256: 1152})
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("budget", [255, 1537])
+def test_dspark_confidence_fixed_budget_validates_token_bounds(budget):
+    with pytest.raises(ValidationError,
+                       match="G <= V <= G \\* \\(max_draft_len \\+ 1\\)"):
+        DSparkDecodingConfig(
+            max_draft_len=5,
+            speculative_model="/tmp/dummy_model",
+            confidence_mode="fixed_budget",
+            confidence_verifier_token_budget_schedule={256: budget})
+
+
+@pytest.mark.cpu_only
+def test_dspark_confidence_fixed_budget_validates_graph_batch_size():
+    with pytest.raises(ValidationError, match="graph batch sizes must be >= 1"):
+        DSparkDecodingConfig(max_draft_len=5,
+                             speculative_model="/tmp/dummy_model",
+                             confidence_mode="fixed_budget",
+                             confidence_verifier_token_budget_schedule={0: 1})
+
+
+@pytest.mark.cpu_only
+def test_dspark_confidence_fixed_budget_schedule_is_sorted_and_exact():
+    spec_cfg = DSparkDecodingConfig(max_draft_len=5,
+                                    speculative_model="/tmp/dummy_model",
+                                    confidence_mode="fixed_budget",
+                                    confidence_verifier_token_budget_schedule={
+                                        256: 1152,
+                                        128: 640
+                                    })
+
+    assert list(
+        spec_cfg.confidence_verifier_token_budget_schedule) == [128, 256]
+    assert spec_cfg.is_fixed_budget_confidence_enabled
+    assert spec_cfg.resolve_confidence_verifier_token_budget(256) == 1152
+    assert spec_cfg.resolve_confidence_verifier_token_budget(192) is None
+
+
+@pytest.mark.cpu_only
+def test_dspark_confidence_schedule_adds_cuda_graph_batch_sizes(tmp_path):
+    (tmp_path / "config.json").write_text('{"dspark_block_size": 5}')
+    spec_cfg = DSparkDecodingConfig(
+        max_draft_len=5,
+        speculative_model=str(tmp_path),
+        confidence_mode='fixed_budget',
+        confidence_verifier_token_budget_schedule={192: 864})
+
+    args = TorchLlmArgs(
+        model="/tmp/dummy_model",
+        skip_tokenizer_init=True,
+        speculative_config=spec_cfg,
+        cuda_graph_config=CudaGraphConfig(batch_sizes=[1, 128, 256],
+                                          enable_padding=True),
+    )
+
+    assert args.cuda_graph_config.batch_sizes == [1, 128, 192, 256]
+
+
+@pytest.mark.cpu_only
+def test_dspark_confidence_fixed_budget_requires_overlap_scheduler(tmp_path):
+    (tmp_path / "config.json").write_text('{"dspark_block_size": 5}')
+    spec_cfg = DSparkDecodingConfig(
+        max_draft_len=5,
+        speculative_model=str(tmp_path),
+        confidence_mode="fixed_budget",
+        confidence_verifier_token_budget_schedule={192: 864})
+
+    with pytest.raises(ValidationError, match='requires the overlap scheduler'):
+        TorchLlmArgs(
+            model='/tmp/dummy_model',
+            skip_tokenizer_init=True,
+            speculative_config=spec_cfg,
+            disable_overlap_scheduler=True,
+        )
+
+
+@pytest.mark.cpu_only
 def test_post_processor_hook_rejected_with_skip_tokenizer_init():
     """post_processor_hook + skip_tokenizer_init must fail fast.
 

@@ -345,54 +345,57 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 dtype=torch.int64,
                 out=self.gen_cached_token_indptr[1 : self.num_generations + 1],
             )
-            gen_kv_lens = self.kv_lens_cuda[self.num_contexts : self.num_seqs]
-            gen_indexer_kv_lens = self.get_indexer_kv_lens(gen_kv_lens)
-            self.gen_indexer_kv_lens_cuda_runtime = gen_indexer_kv_lens
-            next_n_cap = self.kv_lens_cuda_2d.shape[1]
-            self.kv_lens_cuda_2d[: self.num_generations, :next_n_cap].copy_(
-                gen_indexer_kv_lens.unsqueeze(-1).expand(-1, next_n_cap)
-            )
-            scheduler_metadata_buffer = get_paged_mqa_logits_metadata(
-                gen_indexer_kv_lens.view(-1, 1), _DG_SCHEDULE_BLOCK_KV, self.num_sms
-            )
-            self.scheduler_metadata_buffer.copy_(scheduler_metadata_buffer, non_blocking=True)
-            if self.max_draft_tokens > 0 and not self.use_expanded_buffers_for_mtp:
-                scheduler_metadata_buffer_full_next_n = get_paged_mqa_logits_metadata(
-                    self.kv_lens_cuda_2d[: self.num_generations, :next_n_cap],
-                    _DG_SCHEDULE_BLOCK_KV,
-                    self.num_sms,
+            if self.confidence_fixed_budget_active:
+                Indexer.prepare_confidence_fixed_budget_rows(self)
+            else:
+                gen_kv_lens = self.kv_lens_cuda[self.num_contexts : self.num_seqs]
+                gen_indexer_kv_lens = self.get_indexer_kv_lens(gen_kv_lens)
+                self.gen_indexer_kv_lens_cuda_runtime = gen_indexer_kv_lens
+                next_n_cap = self.kv_lens_cuda_2d.shape[1]
+                self.kv_lens_cuda_2d[: self.num_generations, :next_n_cap].copy_(
+                    gen_indexer_kv_lens.unsqueeze(-1).expand(-1, next_n_cap)
                 )
-                self.scheduler_metadata_buffer_full_next_n.copy_(
-                    scheduler_metadata_buffer_full_next_n, non_blocking=True
+                scheduler_metadata_buffer = get_paged_mqa_logits_metadata(
+                    gen_indexer_kv_lens.view(-1, 1), _DG_SCHEDULE_BLOCK_KV, self.num_sms
                 )
-            if self.use_expanded_buffers_for_mtp:
-                num_draft_tokens = 1 + self.max_draft_tokens
-                num_tokens = self.num_generations * num_draft_tokens
-                kv_lens_expanded = torch.stack([gen_indexer_kv_lens] * num_draft_tokens, dim=0)
-                self.kv_lens_expanded_cuda[:num_tokens] = (
-                    kv_lens_expanded.transpose(0, 1).contiguous().flatten()
-                )
-                scheduler_metadata_buffer_expanded = get_paged_mqa_logits_metadata(
-                    self.kv_lens_expanded_cuda[:num_tokens].view(-1, 1),
-                    _DG_SCHEDULE_BLOCK_KV,
-                    self.num_sms,
-                )
-                self.scheduler_metadata_buffer_expanded.copy_(
-                    scheduler_metadata_buffer_expanded, non_blocking=True
-                )
-            if self.expand_for_dsl and self.dsl_expand_factor > 1:
-                expand_factor = self.dsl_expand_factor
-                num_tokens = self.num_generations * expand_factor
-                gen_kv_lens_expanded = gen_indexer_kv_lens.repeat_interleave(expand_factor)
-                self.kv_lens_expanded_cuda[:num_tokens].copy_(gen_kv_lens_expanded)
-                scheduler_metadata_buffer_expanded = get_paged_mqa_logits_metadata(
-                    self.kv_lens_expanded_cuda[:num_tokens].view(-1, 1),
-                    _DG_SCHEDULE_BLOCK_KV,
-                    self.num_sms,
-                )
-                self.scheduler_metadata_buffer_expanded.copy_(
-                    scheduler_metadata_buffer_expanded, non_blocking=True
-                )
+                self.scheduler_metadata_buffer.copy_(scheduler_metadata_buffer, non_blocking=True)
+                if self.max_draft_tokens > 0 and not self.use_expanded_buffers_for_mtp:
+                    scheduler_metadata_buffer_full_next_n = get_paged_mqa_logits_metadata(
+                        self.kv_lens_cuda_2d[: self.num_generations, :next_n_cap],
+                        _DG_SCHEDULE_BLOCK_KV,
+                        self.num_sms,
+                    )
+                    self.scheduler_metadata_buffer_full_next_n.copy_(
+                        scheduler_metadata_buffer_full_next_n, non_blocking=True
+                    )
+                if self.use_expanded_buffers_for_mtp:
+                    num_draft_tokens = 1 + self.max_draft_tokens
+                    num_tokens = self.num_generations * num_draft_tokens
+                    kv_lens_expanded = torch.stack([gen_indexer_kv_lens] * num_draft_tokens, dim=0)
+                    self.kv_lens_expanded_cuda[:num_tokens] = (
+                        kv_lens_expanded.transpose(0, 1).contiguous().flatten()
+                    )
+                    scheduler_metadata_buffer_expanded = get_paged_mqa_logits_metadata(
+                        self.kv_lens_expanded_cuda[:num_tokens].view(-1, 1),
+                        _DG_SCHEDULE_BLOCK_KV,
+                        self.num_sms,
+                    )
+                    self.scheduler_metadata_buffer_expanded.copy_(
+                        scheduler_metadata_buffer_expanded, non_blocking=True
+                    )
+                if self.expand_for_dsl and self.dsl_expand_factor > 1:
+                    expand_factor = self.dsl_expand_factor
+                    num_tokens = self.num_generations * expand_factor
+                    gen_kv_lens_expanded = gen_indexer_kv_lens.repeat_interleave(expand_factor)
+                    self.kv_lens_expanded_cuda[:num_tokens].copy_(gen_kv_lens_expanded)
+                    scheduler_metadata_buffer_expanded = get_paged_mqa_logits_metadata(
+                        self.kv_lens_expanded_cuda[:num_tokens].view(-1, 1),
+                        _DG_SCHEDULE_BLOCK_KV,
+                        self.num_sms,
+                    )
+                    self.scheduler_metadata_buffer_expanded.copy_(
+                        scheduler_metadata_buffer_expanded, non_blocking=True
+                    )
         self._compute_kv_lens_row_reorder()
         self.prepare_dense_topk_indices(self.kv_lens_cuda, device=True)
 
@@ -402,6 +405,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         if (
             self.enable_heuristic_topk
             and self.use_cute_dsl_topk
+            and not self.confidence_fixed_budget_active
             and self.num_generations * next_n >= 2 * self.num_sms
         ):
             gen_kv_lens = self.kv_lens_cuda[self.num_contexts : self.num_seqs]
@@ -772,6 +776,17 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.cuda_graph_buffers,
             (self.max_num_sequences * (1 + self.max_draft_tokens),),
             cache_name="kv_lens_expanded_cuda",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
+        )
+        # Uncompressed causal KV length for each expanded query row. This is
+        # distinct from kv_lens_expanded_cuda when the indexer cache itself is
+        # compressed. Fixed-budget confidence verification treats its packed
+        # ragged queries as a graph-static V-row, next_n=1 batch.
+        self.query_kv_lens_expanded_cuda = self.get_empty(
+            self.cuda_graph_buffers,
+            (self.max_num_sequences * (1 + self.max_draft_tokens),),
+            cache_name="query_kv_lens_expanded_cuda",
             dtype=torch.int32,
             capture_graph=capture_graph,
         )
