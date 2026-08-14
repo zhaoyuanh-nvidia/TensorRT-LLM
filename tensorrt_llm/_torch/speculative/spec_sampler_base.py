@@ -51,6 +51,7 @@ class SampleStateTensorsSpec(SampleStateTensors):
     new_tokens_lens: torch.Tensor
     next_draft_tokens: torch.Tensor
     next_draft_lens: Optional[torch.Tensor] = None
+    verified_draft_lens: Optional[torch.Tensor] = None
 
 
 @dataclass(kw_only=True)
@@ -119,6 +120,7 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         next_draft_tokens: torch.Tensor
         new_tokens_lens: torch.Tensor
         next_draft_lens: torch.Tensor
+        verified_draft_lens: torch.Tensor
 
     def __init__(self, args: TorchSampler.Args, *, accepted_path_len: Optional[int] = None):
         """
@@ -170,6 +172,7 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             next_draft_tokens=int_tensor((seq_slots, args.max_total_draft_tokens)),
             new_tokens_lens=int_tensor((seq_slots,)),
             next_draft_lens=int_tensor((seq_slots,)),
+            verified_draft_lens=int_tensor((seq_slots,)),
         )
 
     def _request_common_handling(
@@ -227,6 +230,11 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         next_draft_lens_list = (
             state.host.next_draft_lens.tolist() if state.host.next_draft_lens is not None else None
         )
+        verified_draft_lens_list = (
+            state.host.verified_draft_lens.tolist()
+            if state.host.verified_draft_lens is not None
+            else None
+        )
         beam_idx = DEFAULT_BEAM_IDX
         runtime_draft_len = getattr(state, "runtime_draft_len", self.draft_len)
 
@@ -249,17 +257,22 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
                     break
             req.py_num_accepted_draft_tokens = num_new_tokens - 1
             # Pair the acceptance count with the draft count of the SAME step,
-            # snapshotted at sample_async time: _request_common_handling below
-            # replaces py_draft_tokens with the next step's buffer, so its
-            # length must not be used as the denominator (0 for the request's
-            # prefill step, where nothing was verified).
-            req.py_num_draft_tokens_verified = (
-                state.draft_lens[req_idx] if state.draft_lens is not None else 0
+            # emitted by the model beside new_tokens_lens in fixed-budget mode.
+            # This remains iteration-aligned under the overlap scheduler; the
+            # mutable request may already describe a different iteration when
+            # sample_async runs. Other modes retain the request snapshot.
+            completed_draft_len = (
+                verified_draft_lens_list[req.py_seq_slot]
+                if verified_draft_lens_list is not None
+                else (state.draft_lens[req_idx] if state.draft_lens is not None else 0)
             )
-            verified_draft_len = (
-                state.draft_lens[req_idx] if state.draft_lens is not None else runtime_draft_len
-            )
-            req.py_rewind_len = verified_draft_len - req.py_num_accepted_draft_tokens
+            if req.py_num_accepted_draft_tokens > completed_draft_len:
+                raise RuntimeError(
+                    f"accepted {req.py_num_accepted_draft_tokens} draft tokens after "
+                    f"verifying only {completed_draft_len} for request {req.py_request_id}"
+                )
+            req.py_num_draft_tokens_verified = completed_draft_len
+            req.py_rewind_len = completed_draft_len - req.py_num_accepted_draft_tokens
             next_draft_len = (
                 next_draft_lens_list[req.py_seq_slot]
                 if next_draft_lens_list is not None
@@ -326,9 +339,14 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         o_next_new_tokens = outputs["next_new_tokens"][num_skip : num_skip + num_sampling_requests]
         runtime_draft_len = o_next_draft_tokens.shape[1]
         o_next_draft_lens = outputs.get("next_draft_lens")
+        o_verified_draft_lens = outputs.get("verified_draft_lens")
         if o_next_draft_lens is not None:
             o_next_draft_lens = o_next_draft_lens[num_skip : num_skip + num_sampling_requests]
             o_next_draft_lens = o_next_draft_lens.to(dtype=self.store.next_draft_lens.dtype)
+        if o_verified_draft_lens is not None:
+            o_verified_draft_lens = o_verified_draft_lens[
+                num_skip : num_skip + num_sampling_requests
+            ].to(dtype=self.store.verified_draft_lens.dtype)
 
         # Pad or truncate to match fixed-size store buffers for index_copy_.
         # The worker output width tracks runtime_draft_len, which dynamic draft
@@ -362,6 +380,8 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         self.store.next_draft_tokens.index_copy_(0, slots, o_next_draft_tokens)
         if o_next_draft_lens is not None:
             self.store.next_draft_lens.index_copy_(0, slots, o_next_draft_lens)
+        if o_verified_draft_lens is not None:
+            self.store.verified_draft_lens.index_copy_(0, slots, o_verified_draft_lens)
 
         # Create sample state with async D2H copy
         device_tensors = SampleStateTensorsSpec(
@@ -369,6 +389,9 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             new_tokens_lens=self.store.new_tokens_lens,
             next_draft_tokens=self.store.next_draft_tokens,
             next_draft_lens=(self.store.next_draft_lens if o_next_draft_lens is not None else None),
+            verified_draft_lens=(
+                self.store.verified_draft_lens if o_verified_draft_lens is not None else None
+            ),
         )
 
         host_tensors = SampleStateTensorsSpec(
@@ -378,6 +401,11 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             next_draft_lens=(
                 self._copy_to_host(self.store.next_draft_lens)
                 if o_next_draft_lens is not None
+                else None
+            ),
+            verified_draft_lens=(
+                self._copy_to_host(self.store.verified_draft_lens)
+                if o_verified_draft_lens is not None
                 else None
             ),
         )

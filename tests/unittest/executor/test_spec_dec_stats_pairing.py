@@ -133,6 +133,7 @@ def _run_spec_sampler_update(
     new_tokens_lens,
     next_draft_tokens,
     next_draft_lens=None,
+    verified_draft_lens=None,
 ):
     sampler = SpecSampler.__new__(SpecSampler)
     sampler.max_seq_len = 2048
@@ -152,6 +153,11 @@ def _run_spec_sampler_update(
         next_draft_tokens=torch.tensor(next_draft_tokens, dtype=torch.int),
         next_draft_lens=(
             torch.tensor(next_draft_lens, dtype=torch.int) if next_draft_lens is not None else None
+        ),
+        verified_draft_lens=(
+            torch.tensor(verified_draft_lens, dtype=torch.int)
+            if verified_draft_lens is not None
+            else None
         ),
     )
     state = SampleStateSpec(
@@ -218,6 +224,27 @@ class TestSpecSamplerPairing:
         assert request.py_rewind_len == 3
         assert request.py_draft_tokens == [31, 32, 33, 34, 35]
         assert request.py_draft_tokens_effective_len == 2
+
+    def test_fixed_budget_uses_model_step_length_under_overlap(self):
+        request = _make_llm_request(4, 0)
+        request.py_draft_tokens = [21, 22, 23, 24, 25]
+
+        # The request snapshot has already advanced to a zero-draft next step,
+        # while the model output belongs to a step that verified five drafts.
+        # The model-emitted length must remain paired with its accepted count.
+        _run_spec_sampler_update(
+            request,
+            draft_lens=[0],
+            new_tokens_lens=[5],
+            next_draft_tokens=[[31, 32, 33, 34, 35]],
+            next_draft_lens=[3],
+            verified_draft_lens=[5],
+        )
+
+        assert request.py_num_accepted_draft_tokens == 4
+        assert request.py_num_draft_tokens_verified == 5
+        assert request.py_rewind_len == 1
+        assert request.py_draft_tokens_effective_len == 3
 
 
 class TestDrafterPadRecordsEffectiveLen:

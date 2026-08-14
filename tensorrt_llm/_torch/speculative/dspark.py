@@ -31,7 +31,12 @@ from tensorrt_llm.mapping import Mapping
 
 from ..distributed import AllReduce, AllReduceStrategy
 from ..pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
-from .dspark_confidence import plan_fixed_verifier_budget, verify_packed_greedy
+from .dspark_confidence import (
+    load_sts_temperatures,
+    plan_fixed_verifier_budget,
+    verify_packed_greedy,
+)
+from .dspark_trace import ConfidenceTraceRing, confidence_trace_path_from_env
 from .interface import SpecMetadata, SpecWorkerBase
 
 if TYPE_CHECKING:
@@ -120,6 +125,8 @@ class DSparkSpecMetadata(SpecMetadata):
                     worker._ctx_len[slot] = 0
                     worker._kv_windows[slot].zero_()
                     worker._free_slots.append(slot)
+                    if worker._confidence_recorder is not None:
+                        worker._confidence_recorder.invalidate_slot(slot)
             # Assign a persistent rolling-window slot to every real generation
             # request that never ran a context/seed forward on this worker. In
             # disaggregated serving the prompt is prefilled (and the window
@@ -239,6 +246,8 @@ class DSparkWorker(SpecWorkerBase):
             )
             else None
         )
+        self._confidence_recorder: Optional[ConfidenceTraceRing] = None
+        self._confidence_sts_temperatures: Optional[torch.Tensor] = None
 
         # Per-slot rolling captured-context KV windows, built lazily on the
         # first forward (fixed-size for slot-indexed reads/writes).
@@ -286,6 +295,13 @@ class DSparkWorker(SpecWorkerBase):
 
         if self._win_inited:
             return
+
+        sts_path = getattr(self.spec_config, "confidence_sts_path", None)
+        if sts_path:
+            self._confidence_sts_temperatures = load_sts_temperatures(sts_path, block_size).to(
+                device="cuda"
+            )
+            logger.info(f"DSpark: loaded per-position STS calibration from {sts_path}")
         max_batch = spec_metadata.max_num_requests
         num_stages = draft_model.num_stages
         self._win = int(draft_model._attn_params["window_size"])
@@ -319,6 +335,27 @@ class DSparkWorker(SpecWorkerBase):
         )
         self._ctx_len = torch.zeros(num_rows, dtype=torch.long, device="cuda")
         self._batch_to_slot = torch.zeros(max_batch, dtype=torch.long, device="cuda")
+
+        trace_path = confidence_trace_path_from_env()
+        if trace_path and self.mapping.tp_rank == 0:
+            schedule = self.spec_config.confidence_verifier_token_budget_schedule or {}
+            trimmed = {
+                graph_batch_size: budget
+                for graph_batch_size, budget in schedule.items()
+                if budget != graph_batch_size * (block_size + 1)
+            }
+            if trimmed:
+                raise ValueError(
+                    "DSpark confidence traces must be collected with full-K "
+                    f"verification; trimmed schedule entries: {trimmed}"
+                )
+            self._confidence_recorder = ConfidenceTraceRing(
+                path_stem=trace_path,
+                rank=int(self.mapping.rank),
+                num_slots=num_rows,
+                max_draft_len=block_size,
+                scratch_slot=self._scratch_slot,
+            )
         self._free_slots = deque(range(max_batch))
         self._req_to_slot = {}
         self._win_inited = True
@@ -335,6 +372,8 @@ class DSparkWorker(SpecWorkerBase):
             self._ctx_len[old] = 0
             self._kv_windows[old].zero_()
             self._free_slots.append(old)
+            if self._confidence_recorder is not None:
+                self._confidence_recorder.invalidate_slot(old)
         if req_id not in self._req_to_slot:
             if not self._free_slots:
                 raise RuntimeError(
@@ -345,6 +384,8 @@ class DSparkWorker(SpecWorkerBase):
             self._req_to_slot[req_id] = slot
             self._ctx_len[slot] = 0
             self._kv_windows[slot].zero_()
+            if self._confidence_recorder is not None:
+                self._confidence_recorder.invalidate_slot(slot)
         return self._req_to_slot[req_id]
 
     def _seed_context_windows(
@@ -760,8 +801,17 @@ class DSparkWorker(SpecWorkerBase):
                     )
                     if isinstance(confidence_logits, tuple):
                         confidence_logits = confidence_logits[0]
+                if self._confidence_recorder is not None:
+                    slots = self._batch_to_slot[num_contexts:batch_size]
+                    self._confidence_recorder.record_and_update(
+                        slots=slots,
+                        confidence_logits=confidence_logits,
+                        num_accepted_tokens=num_accepted_tokens[num_contexts:batch_size],
+                    )
                 confidence_plan = plan_fixed_verifier_budget(
-                    confidence_logits, verifier_token_budget
+                    confidence_logits,
+                    verifier_token_budget,
+                    temperatures=self._confidence_sts_temperatures,
                 )
                 next_draft_lens = confidence_plan.retained_lens
 
@@ -784,6 +834,9 @@ class DSparkWorker(SpecWorkerBase):
             "next_draft_tokens": next_draft_tokens,
             "next_new_tokens": next_new_tokens,
         }
+        if spec_metadata.confidence_fixed_budget_active:
+            assert spec_metadata.draft_lens is not None
+            outputs["verified_draft_lens"] = spec_metadata.draft_lens[:batch_size]
         if next_draft_lens is not None:
             outputs["next_draft_lens"] = next_draft_lens
         return outputs

@@ -2870,6 +2870,15 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         "G <= V <= G * (max_draft_len + 1). Only exact configured graph batch "
         "sizes use fixed-budget confidence scheduling.")
 
+    confidence_sts_path: Optional[str] = Field(
+        default=None,
+        description=
+        "Path to a JSON file containing per-position sequential-temperature-"
+        "scaling values. The loader accepts either the TensorRT-LLM "
+        "'sts_temperatures' key or SGLang's 'temperatures' key. Calibration "
+        "must be fitted for the same confidence head and max_draft_len. If "
+        "None, fixed-budget ranking uses the raw sigmoid probabilities.")
+
     decoding_type: Literal["DSpark"] = Field(default="DSpark")
 
     @model_validator(mode="after")
@@ -2880,6 +2889,9 @@ class DSparkDecodingConfig(DecodingBaseConfig):
                 raise ValueError(
                     "DSpark confidence_verifier_token_budget_schedule requires "
                     "confidence_mode='fixed_budget'")
+            if self.confidence_sts_path is not None:
+                raise ValueError("DSpark confidence_sts_path requires "
+                                 "confidence_mode='fixed_budget'")
             return self
 
         if not schedule:

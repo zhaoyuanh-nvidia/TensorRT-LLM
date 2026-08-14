@@ -14,15 +14,26 @@
 # limitations under the License.
 """Tests for fixed-budget DSpark confidence planning."""
 
+import json
 from dataclasses import dataclass
 
+import numpy as np
 import pytest
 import torch
 
 from tensorrt_llm._torch.speculative.dspark_confidence import (
+    apply_sts,
+    load_sts_temperatures,
     plan_fixed_verifier_budget,
     verify_packed_greedy,
 )
+from tensorrt_llm._torch.speculative.dspark_planner import (
+    SpsCostTable,
+    derive_fixed_verifier_budget_candidates,
+    select_fixed_verifier_budget,
+    select_fixed_verifier_budget_from_traces,
+)
+from tensorrt_llm._torch.speculative.dspark_trace import ConfidenceTraceRing
 
 
 @dataclass
@@ -265,6 +276,151 @@ def test_fixed_budget_plan_pack_verify_and_rewind_integration() -> None:
     ]
 
 
+def test_load_sts_accepts_both_runtime_key_spellings(tmp_path) -> None:
+    trtllm_path = tmp_path / "trtllm.json"
+    sglang_path = tmp_path / "sglang.json"
+    trtllm_path.write_text(json.dumps({"sts_temperatures": [0.5, 1.0, 2.0]}))
+    sglang_path.write_text(json.dumps({"temperatures": [0.5, 1.0, 2.0]}))
+
+    expected = torch.tensor([0.5, 1.0, 2.0])
+    assert torch.equal(load_sts_temperatures(trtllm_path, 3), expected)
+    assert torch.equal(load_sts_temperatures(sglang_path, 3), expected)
+
+
+def test_sts_changes_cross_position_ranking() -> None:
+    logits = torch.tensor([[2.0, 2.0], [1.5, 1.5]])
+    identity = plan_fixed_verifier_budget(logits, verifier_token_budget=4)
+    calibrated = plan_fixed_verifier_budget(
+        logits,
+        verifier_token_budget=4,
+        temperatures=torch.tensor([10.0, 0.1]),
+    )
+
+    assert torch.equal(apply_sts(logits, None), torch.sigmoid(logits.float()))
+    assert identity.retained_lens.tolist() != calibrated.retained_lens.tolist()
+
+
+def test_sts_sanitizes_non_finite_confidence_logits() -> None:
+    logits = torch.tensor([[float("nan"), float("inf"), float("-inf")]])
+
+    probabilities = apply_sts(logits, None)
+    calibrated = apply_sts(logits, torch.ones(3))
+
+    expected = torch.tensor([[0.0, 1.0, 0.0]])
+    torch.testing.assert_close(probabilities, expected)
+    torch.testing.assert_close(calibrated, expected)
+
+
+def test_cost_table_selects_gain_and_falls_back_when_gain_is_small() -> None:
+    survival = np.asarray(
+        [
+            [0.95, 0.90, 0.85, 0.80, 0.75],
+            [0.80, 0.60, 0.40, 0.20, 0.10],
+        ]
+    )
+    decisive = SpsCostTable(
+        token_counts=(2, 6, 12),
+        step_time_ms=(1.0, 1.1, 3.0),
+        minimum_predicted_gain=0.01,
+    )
+    guarded = SpsCostTable(
+        token_counts=(2, 6, 12),
+        step_time_ms=(1.0, 1.0, 1.01),
+        minimum_predicted_gain=0.05,
+    )
+
+    assert (
+        select_fixed_verifier_budget(
+            survival=survival,
+            candidate_budgets=(6, 12),
+            cost_table=decisive,
+        )
+        == 6
+    )
+    assert (
+        select_fixed_verifier_budget(
+            survival=survival,
+            candidate_budgets=(6, 12),
+            cost_table=guarded,
+        )
+        == 12
+    )
+
+
+def test_candidate_derivation_is_bounded_and_keeps_full_budget() -> None:
+    table = SpsCostTable(
+        token_counts=(0, 512, 768, 1024, 1280, 1536),
+        step_time_ms=(1.0, 1.0, 1.4, 1.5, 2.5, 2.7),
+    )
+
+    candidates = derive_fixed_verifier_budget_candidates(
+        cost_table=table,
+        num_requests=256,
+        max_draft_len=5,
+        max_candidates=3,
+    )
+
+    assert len(candidates) <= 3
+    assert 1536 in candidates
+    assert all(512 <= value <= 1536 for value in candidates)
+
+
+def test_trace_optimizer_uses_one_schedule_value_per_batch_size() -> None:
+    survival_steps = np.asarray(
+        [
+            [
+                [0.95, 0.90, 0.80, 0.70, 0.60],
+                [0.80, 0.60, 0.40, 0.20, 0.10],
+            ],
+            [
+                [0.90, 0.80, 0.70, 0.60, 0.50],
+                [0.85, 0.70, 0.55, 0.30, 0.15],
+            ],
+        ]
+    )
+    table = SpsCostTable(
+        token_counts=(2, 6, 12),
+        step_time_ms=(1.0, 1.1, 3.0),
+        minimum_predicted_gain=0.01,
+    )
+
+    budget, scores = select_fixed_verifier_budget_from_traces(
+        survival_steps=survival_steps,
+        candidate_budgets=(6, 12),
+        cost_table=table,
+    )
+
+    assert budget == 6
+    assert set(scores) == {6, 12}
+
+
+def test_trace_optimizer_scores_observed_acceptance_under_confidence_order() -> None:
+    survival_steps = np.asarray([[[0.9, 0.8]]])
+    prefix_mask_steps = np.asarray([[[0.0, 0.0]]])
+    table = SpsCostTable(
+        token_counts=(2, 3),
+        step_time_ms=(1.0, 1.2),
+        minimum_predicted_gain=0.01,
+    )
+
+    probability_budget, _ = select_fixed_verifier_budget_from_traces(
+        survival_steps=survival_steps,
+        candidate_budgets=(2, 3),
+        cost_table=table,
+    )
+    observed_budget, scores = select_fixed_verifier_budget_from_traces(
+        survival_steps=survival_steps,
+        candidate_budgets=(2, 3),
+        cost_table=table,
+        prefix_mask_steps=prefix_mask_steps,
+    )
+
+    assert probability_budget == 3
+    assert observed_budget == 2
+    assert scores[2] == pytest.approx(1.0)
+    assert scores[3] == pytest.approx(1.0 / 1.2)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
 def test_cuda_graph_capture_and_replay() -> None:
     num_requests, max_draft_len = 4, 5
@@ -297,3 +453,75 @@ def test_cuda_graph_capture_and_replay() -> None:
     assert captured_plan.retained_lens.cpu().tolist() == expected.retained_lens
     assert captured_plan.packed_to_dense.cpu().tolist() == expected.packed_to_dense
     assert not torch.equal(first_retained_lens, captured_plan.retained_lens)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_confidence_trace_ring_captures_dynamic_replay_rows(tmp_path) -> None:
+    max_draft_len = 3
+    slots = torch.tensor([0, 1], dtype=torch.long, device="cuda")
+
+    # Prime allocator/library paths outside the graph under test.
+    warmup = ConfidenceTraceRing(
+        path_stem=str(tmp_path / "warmup"),
+        rank=0,
+        num_slots=3,
+        max_draft_len=max_draft_len,
+        scratch_slot=2,
+        capacity=16,
+    )
+    for _ in range(3):
+        warmup.record_and_update(
+            slots=slots,
+            confidence_logits=torch.zeros((2, max_draft_len), device="cuda"),
+            num_accepted_tokens=torch.ones(2, dtype=torch.int32, device="cuda"),
+        )
+    warmup._flushed = True
+
+    ring = ConfidenceTraceRing(
+        path_stem=str(tmp_path / "trace"),
+        rank=0,
+        num_slots=3,
+        max_draft_len=max_draft_len,
+        scratch_slot=2,
+        capacity=16,
+    )
+    logits_a = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], device="cuda")
+    ring.record_and_update(
+        slots=slots,
+        confidence_logits=logits_a,
+        num_accepted_tokens=torch.ones(2, dtype=torch.int32, device="cuda"),
+    )
+
+    static_logits = torch.tensor([[7.0, 8.0, 9.0], [10.0, 11.0, 12.0]], device="cuda")
+    static_accepted = torch.tensor([4, 2], dtype=torch.int32, device="cuda")
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        ring.record_and_update(
+            slots=slots,
+            confidence_logits=static_logits,
+            num_accepted_tokens=static_accepted,
+        )
+
+    graph.replay()
+    torch.cuda.synchronize()
+
+    static_logits.add_(10.0)
+    static_accepted.copy_(torch.tensor([1, 3], dtype=torch.int32, device="cuda"))
+    graph.replay()
+    torch.cuda.synchronize()
+    ring.flush()
+
+    payload = torch.load(ring.path, map_location="cpu", weights_only=True)
+    assert payload["pairing"] == "draft_seq_ring"
+    torch.testing.assert_close(
+        payload["logits"], torch.cat((logits_a.cpu(), (static_logits - 10.0).cpu()))
+    )
+    torch.testing.assert_close(
+        payload["prefix_mask"],
+        torch.tensor(
+            [[1, 1, 1], [1, 0, 0], [0, 0, 0], [1, 1, 0]],
+            dtype=torch.float32,
+        ),
+    )
+    assert payload["graph_batch_size"].tolist() == [2, 2, 2, 2]
+    assert payload["step_id"].tolist() == [0, 0, 1, 1]

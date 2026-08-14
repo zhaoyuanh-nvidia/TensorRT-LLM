@@ -506,6 +506,7 @@ def test_dspark_confidence_fixed_budget_defaults_disabled():
     assert spec_cfg.confidence_mode == "disabled"
     assert not spec_cfg.is_fixed_budget_confidence_enabled
     assert spec_cfg.confidence_verifier_token_budget_schedule is None
+    assert spec_cfg.confidence_sts_path is None
     assert spec_cfg.resolve_confidence_verifier_token_budget(256) is None
 
 
@@ -528,6 +529,17 @@ def test_dspark_confidence_schedule_requires_fixed_budget_mode():
             max_draft_len=5,
             speculative_model="/tmp/dummy_model",
             confidence_verifier_token_budget_schedule={256: 1152})
+
+
+@pytest.mark.cpu_only
+def test_dspark_confidence_sts_requires_fixed_budget_mode():
+    with pytest.raises(ValidationError,
+                       match="requires confidence_mode='fixed_budget'"):
+        DSparkDecodingConfig(
+            max_draft_len=5,
+            speculative_model="/tmp/dummy_model",
+            confidence_sts_path="/tmp/sts.json",
+        )
 
 
 @pytest.mark.cpu_only
@@ -559,13 +571,15 @@ def test_dspark_confidence_fixed_budget_schedule_is_sorted_and_exact():
                                     confidence_verifier_token_budget_schedule={
                                         256: 1152,
                                         128: 640
-                                    })
+                                    },
+                                    confidence_sts_path="/tmp/sts.json")
 
     assert list(
         spec_cfg.confidence_verifier_token_budget_schedule) == [128, 256]
     assert spec_cfg.is_fixed_budget_confidence_enabled
     assert spec_cfg.resolve_confidence_verifier_token_budget(256) == 1152
     assert spec_cfg.resolve_confidence_verifier_token_budget(192) is None
+    assert spec_cfg.confidence_sts_path == "/tmp/sts.json"
 
 
 @pytest.mark.cpu_only

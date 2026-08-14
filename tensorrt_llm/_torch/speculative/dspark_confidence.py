@@ -14,12 +14,16 @@
 # limitations under the License.
 """GPU-only planning for fixed-budget DSpark verification."""
 
+import json
+from pathlib import Path
 from typing import NamedTuple
 
 import torch
 
 __all__ = [
     "FixedBudgetPlan",
+    "apply_sts",
+    "load_sts_temperatures",
     "plan_fixed_verifier_budget",
     "verify_packed_greedy",
 ]
@@ -44,8 +48,49 @@ class FixedBudgetPlan(NamedTuple):
     packed_local_positions: torch.Tensor
 
 
+def load_sts_temperatures(path: str | Path, max_draft_len: int) -> torch.Tensor:
+    """Load a per-position sequential-temperature-scaling vector.
+
+    TensorRT-LLM emits ``sts_temperatures`` while SGLang emits
+    ``temperatures``.  Accept both spellings so a calibration fitted from the
+    same checkpoint/head/block geometry is portable between the runtimes.
+    """
+    with Path(path).open(encoding="utf-8") as file:
+        payload = json.load(file)
+    values = payload.get("sts_temperatures", payload.get("temperatures"))
+    if values is None:
+        raise ValueError(f"{path} has neither 'sts_temperatures' nor 'temperatures'")
+    temperatures = torch.tensor(values, dtype=torch.float32)
+    if temperatures.ndim != 1 or temperatures.numel() != max_draft_len:
+        raise ValueError(
+            f"STS temperature vector must have length {max_draft_len}; "
+            f"got shape {tuple(temperatures.shape)}"
+        )
+    if not torch.all(torch.isfinite(temperatures)) or not torch.all(temperatures > 0):
+        raise ValueError("STS temperatures must be positive and finite")
+    return temperatures
+
+
+def apply_sts(
+    confidence_logits: torch.Tensor,
+    temperatures: torch.Tensor | None,
+) -> torch.Tensor:
+    """Convert raw confidence logits to calibrated conditional probabilities.
+
+    A NaN confidence is conservatively ranked as zero survival probability.
+    """
+    logits = torch.nan_to_num(confidence_logits.float(), nan=float("-inf"))
+    if temperatures is None:
+        return torch.sigmoid(logits)
+    if temperatures.ndim != 1 or temperatures.numel() != logits.shape[-1]:
+        raise ValueError("temperatures must be a vector matching the confidence-logit width")
+    return torch.sigmoid(logits / temperatures.to(device=logits.device, dtype=torch.float32))
+
+
 def plan_fixed_verifier_budget(
-    confidence_logits: torch.Tensor, verifier_token_budget: int
+    confidence_logits: torch.Tensor,
+    verifier_token_budget: int,
+    temperatures: torch.Tensor | None = None,
 ) -> FixedBudgetPlan:
     """Allocate an exact, fixed verifier budget using confidence logits.
 
@@ -65,6 +110,8 @@ def plan_fixed_verifier_budget(
         confidence_logits: Conditional-acceptance logits with shape
             ``[num_requests, max_draft_len]``. The tensor may reside on CPU or
             GPU.
+        temperatures: Optional per-position STS vector. ``None`` preserves the
+            identity-temperature behavior.
         verifier_token_budget: Exact number of packed verifier tokens,
             including one anchor for every request.
 
@@ -98,7 +145,7 @@ def plan_fixed_verifier_budget(
     # A draft at position j is useful only if every conditional prediction up
     # to j is accepted. Compute in FP32 so the ranking remains useful when the
     # head or model executes in a lower precision.
-    conditional_probabilities = torch.sigmoid(confidence_logits.float())
+    conditional_probabilities = apply_sts(confidence_logits, temperatures)
     prefix_scores = torch.cumprod(conditional_probabilities, dim=1)
 
     # Stable sorting a position-major view implements the deterministic tie
