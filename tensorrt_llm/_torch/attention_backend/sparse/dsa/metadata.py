@@ -180,6 +180,23 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.create_buffers_for_indexer(capture_graph=capture_graph)
 
     def prepare(self):
+        # All pinned staging buffers below are mutable and copied with
+        # non_blocking=True.  Fence their previous use before the overlap
+        # scheduler rewrites them for a later step.
+        if not torch.cuda.is_current_stream_capturing():
+            evt = getattr(self, "_prepare_stage_evt", None)
+            if evt is None:
+                self._prepare_stage_evt = torch.cuda.Event()
+            else:
+                evt.synchronize()
+        try:
+            self._prepare_impl()
+        finally:
+            evt = getattr(self, "_prepare_stage_evt", None)
+            if evt is not None and not torch.cuda.is_current_stream_capturing():
+                evt.record()
+
+    def _prepare_impl(self):
         super().prepare()
         self._invalidate_pool_view_cache()
 
@@ -495,7 +512,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # update_spec_dec_param) or it is left too small once MTP raises the
         # generation-row count.
         _radix_max_blocks_per_row = 10
-        _radix_max_gen_tokens = self.max_num_sequences * (1 + self.max_draft_tokens)
+        _radix_max_gen_tokens = self.max_num_sequences * (1 + self._draft_sizing_cap)
         self.radix_aux_indices = self.get_empty(
             self.cuda_graph_buffers,
             (_radix_max_gen_tokens, _radix_max_blocks_per_row, self.num_sparse_topk),
@@ -728,7 +745,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.heuristic_prev_topk.zero_()
             # The C++ top-k path needs a stable scratch address.
             if not self.use_cute_dsl_topk:
-                max_gen_tokens = self.max_num_sequences * (1 + self.max_draft_tokens)
+                max_gen_tokens = self.max_num_sequences * (1 + self._draft_sizing_cap)
                 self.heuristic_scratch_values = self.get_empty(
                     self.cuda_graph_buffers,
                     (max_gen_tokens, self.num_sparse_topk),
@@ -754,6 +771,14 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # Create expanded buffers for MTP support
         self.create_expanded_buffers(capture_graph=capture_graph)
 
+    @property
+    def _draft_sizing_cap(self) -> int:
+        """Static draft ceiling used only for address-stable buffer capacity."""
+        cap = getattr(self, "_draft_alloc_cap", None)
+        if cap is None:
+            return self.max_draft_tokens
+        return max(cap, self.max_draft_tokens)
+
     def _create_kv_lens_2d_buffer(self, capture_graph=False):
         """Pre-allocated buffer for the DeepGEMM 2D context_lens API.
 
@@ -763,7 +788,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         """
         self.kv_lens_cuda_2d = self.get_empty(
             self.cuda_graph_buffers,
-            (self.max_num_sequences, 1 + self.max_draft_tokens),
+            (self.max_num_sequences, 1 + self._draft_sizing_cap),
             cache_name="kv_lens_cuda_2d",
             dtype=torch.int32,
             capture_graph=capture_graph,
@@ -774,7 +799,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         """Create expanded KV-length and block-table buffers for speculative decoding."""
         self.kv_lens_expanded_cuda = self.get_empty(
             self.cuda_graph_buffers,
-            (self.max_num_sequences * (1 + self.max_draft_tokens),),
+            (self.max_num_sequences * (1 + self._draft_sizing_cap),),
             cache_name="kv_lens_expanded_cuda",
             dtype=torch.int32,
             capture_graph=capture_graph,
@@ -785,7 +810,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # ragged queries as a graph-static V-row, next_n=1 batch.
         self.query_kv_lens_expanded_cuda = self.get_empty(
             self.cuda_graph_buffers,
-            (self.max_num_sequences * (1 + self.max_draft_tokens),),
+            (self.max_num_sequences * (1 + self._draft_sizing_cap),),
             cache_name="query_kv_lens_expanded_cuda",
             dtype=torch.int32,
             capture_graph=capture_graph,
@@ -798,7 +823,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.block_table_expanded = self.get_empty(
             self.cuda_graph_buffers,
             [
-                self.max_num_sequences * (1 + self.max_draft_tokens),
+                self.max_num_sequences * (1 + self._draft_sizing_cap),
                 self.kv_cache_manager.max_blocks_per_seq,
             ],
             cache_name="block_table_expanded",
@@ -814,7 +839,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.draft_block_table_expanded = self.get_empty(
                 self.cuda_graph_buffers,
                 [
-                    self.max_num_sequences * (1 + self.max_draft_tokens),
+                    self.max_num_sequences * (1 + self._draft_sizing_cap),
                     self.draft_kv_cache_manager.max_blocks_per_seq,
                 ],
                 cache_name="draft_block_table_expanded",
@@ -863,15 +888,22 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             num_contexts=num_contexts,
         )
         self.max_draft_tokens = max_draft_len
+        self._draft_alloc_cap = max(
+            int(max_total_draft_tokens),
+            getattr(self, "_draft_alloc_cap", 0) or 0,
+        )
         capture_graph = self.is_cuda_graph
-        if self.kv_lens_cuda_2d.shape[1] != 1 + self.max_draft_tokens:
+        ratchet = max(
+            self._draft_sizing_cap,
+            getattr(self, "_expanded_alloc_draft_cap", -1),
+        )
+        if ratchet > getattr(self, "_expanded_alloc_draft_cap", -1):
+            self._expanded_alloc_draft_cap = ratchet
             self._create_kv_lens_2d_buffer(capture_graph=capture_graph)
-        init_shape = self.kv_lens_expanded_host.shape[0]
-        if self.max_num_sequences * (1 + self.max_draft_tokens) != init_shape:
             self.create_expanded_buffers(capture_graph=capture_graph)
             # Resize heuristic scratch buffer for new max_draft_tokens.
             if self.enable_heuristic_topk and not self.use_cute_dsl_topk:
-                max_gen_tokens = self.max_num_sequences * (1 + self.max_draft_tokens)
+                max_gen_tokens = self.max_num_sequences * (1 + self._draft_sizing_cap)
                 self.heuristic_scratch_values = self.get_empty(
                     self.cuda_graph_buffers,
                     (max_gen_tokens, self.num_sparse_topk),

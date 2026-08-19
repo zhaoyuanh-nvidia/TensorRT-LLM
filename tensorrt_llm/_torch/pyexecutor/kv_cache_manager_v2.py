@@ -1716,8 +1716,9 @@ class KVCacheManagerV2(BaseResourceManager):
         num_seqs: int,
     ) -> None:
         device_copy_idx = self._copy_idx_to_device(copy_idx)
+        host_block_offsets = self._stage_host_block_offsets_for_copy()
         self._device_kv_cache_block_offsets_input.copy_(
-            self.host_kv_cache_block_offsets,
+            host_block_offsets,
             non_blocking=True,
         )
         scratch_begs, scratch_ends, scratch_slots = self._copy_scratch_metadata_to_device(
@@ -1746,6 +1747,35 @@ class KVCacheManagerV2(BaseResourceManager):
             ],
             non_blocking=True,
         )
+
+    def _stage_host_block_offsets_for_copy(self) -> torch.Tensor:
+        """Snapshot mutable page indices before an asynchronous device copy.
+
+        The allocator rewrites ``host_kv_cache_block_offsets`` in place while
+        the overlap scheduler may still have the previous step's H2D queued.
+        A private pinned snapshot prevents the queued copy from observing a
+        later block layout.
+        """
+        src = self.host_kv_cache_block_offsets
+        host_block_offsets = torch.empty(
+            src.shape,
+            dtype=src.dtype,
+            device="cpu",
+            pin_memory=prefer_pinned(),
+        )
+        host_block_offsets.copy_(src)
+        return host_block_offsets
+
+    def _retain_flat_snapshot(self, snapshot: torch.Tensor) -> None:
+        """Retain a C++ H2D source until its stream has consumed it."""
+        retained = getattr(self, "_flat_snapshots_in_flight", None)
+        if retained is None:
+            retained = self._flat_snapshots_in_flight = []
+        event = torch.cuda.Event()
+        with torch.cuda.stream(self._stream):
+            event.record()
+        retained.append((event, snapshot))
+        retained[:] = [(evt, tensor) for evt, tensor in retained if not evt.query()]
 
     def _build_base_config(
         self,
@@ -3664,14 +3694,16 @@ class KVCacheManagerV2(BaseResourceManager):
             )
             return
 
+        host_block_offsets = self._stage_host_block_offsets_for_copy()
         copy_batch_block_offsets_to_device(
-            self.host_kv_cache_block_offsets,
+            host_block_offsets,
             dst_tensor,
             copy_idx,
             self.index_scales,
             self.kv_offset,
             self._stream.cuda_stream,
         )
+        self._retain_flat_snapshot(host_block_offsets)
 
     @staticmethod
     def _derive_reuse_salt(cache_salt: str | None) -> int | None:

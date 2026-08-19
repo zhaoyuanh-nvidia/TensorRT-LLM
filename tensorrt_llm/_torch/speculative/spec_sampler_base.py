@@ -22,6 +22,7 @@ output into slot-indexed buffers, starts the async D2H copy, and updates
 requests host-side. Buffer shapes derive entirely from ``TorchSampler.Args``.
 """
 
+import os
 from dataclasses import dataclass
 from typing import Optional
 
@@ -135,6 +136,9 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         """
         self._async_worker_init(args.enable_async_worker)
         self.mapping = None
+        self._trace_dspark_budget = os.environ.get(
+            "TLLM_DSPARK_BUDGET_TRACE", ""
+        ).strip().lower() not in ("", "0", "false", "no", "off")
         self.max_seq_len = args.max_seq_len
         # Wire width minus one: the number of draft slots the target verifies
         # per step. Linear modes set max_total_draft_tokens == max_draft_len;
@@ -173,6 +177,44 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             new_tokens_lens=int_tensor((seq_slots,)),
             next_draft_lens=int_tensor((seq_slots,)),
             verified_draft_lens=int_tensor((seq_slots,)),
+        )
+
+    def _trace_dspark_budget_transition(
+        self,
+        state: SampleStateSpec,
+        next_draft_lens: list[int] | None,
+    ) -> None:
+        """Log the effective local V transition without another device sync.
+
+        ``update_requests`` has already synchronized the sampler's existing
+        asynchronous D2H copy before this helper runs. The opt-in trace only
+        sums those host lists, so it does not add a transfer or perturb the
+        CUDA-graph path when disabled. Attention-DP diagnostics can compare
+        one line per rank to prove that every rank selected the same graph
+        tier while retaining different request-local prefixes.
+        """
+        if not self._trace_dspark_budget or next_draft_lens is None:
+            return
+
+        active_indices = [
+            index
+            for index, request in enumerate(state.requests)
+            if request.state != LlmRequestState.GENERATION_COMPLETE
+        ]
+        current_lens = state.draft_lens or [0] * len(state.requests)
+        current_budget = len(active_indices) + sum(
+            int(current_lens[index]) for index in active_indices
+        )
+        next_budget = len(active_indices) + sum(
+            int(next_draft_lens[state.requests[index].py_seq_slot]) for index in active_indices
+        )
+        rank = getattr(self.mapping, "rank", "unknown")
+        logger.info(
+            "DSPARK_BUDGET_TRACE rank=%s requests=%d current_v=%d next_v=%d",
+            rank,
+            len(active_indices),
+            current_budget,
+            next_budget,
         )
 
     def _request_common_handling(
@@ -235,6 +277,7 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             if state.host.verified_draft_lens is not None
             else None
         )
+        self._trace_dspark_budget_transition(state, next_draft_lens_list)
         beam_idx = DEFAULT_BEAM_IDX
         runtime_draft_len = getattr(state, "runtime_draft_len", self.draft_len)
 

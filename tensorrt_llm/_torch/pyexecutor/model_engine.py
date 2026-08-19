@@ -11,7 +11,8 @@ import os
 import weakref
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+from typing import (Any, Callable, Dict, Iterable, List, Optional, Sequence,
+                    Tuple, Union)
 
 import torch
 import torch._dynamo.config
@@ -145,6 +146,36 @@ def _make_single_token_context_graph_batch(
     promoted_context_request_ids = frozenset(request.py_request_id
                                              for request in context_requests)
     return graph_batch, promoted_context_request_ids
+
+
+def _expand_generation_graph_capture_shapes(
+    graphs_to_capture: Sequence[Tuple[int, int]],
+    spec_config: Optional[DecodingBaseConfig],
+) -> Tuple[bool, List[Tuple[int, int, Optional[int]]]]:
+    """Expand generation graph shapes with every executable confidence tier.
+
+    Dynamic confidence planning uses compact greedy ``(G, V)`` graphs only at
+    measured graph batch sizes.  A draining serving batch can still pad to one
+    of those ``G`` values while taking the safe ordinary full-K fallback, so
+    that greedy ``V=None`` shape must be captured alongside the compact tiers.
+    """
+    confidence_capture = (isinstance(spec_config, DSparkDecodingConfig)
+                          and spec_config.is_confidence_budget_enabled)
+    expanded_graphs = []
+    for batch_size, draft_len in graphs_to_capture:
+        budgets = (
+            spec_config.resolve_confidence_verifier_token_budget_candidates(
+                batch_size) if confidence_capture and draft_len > 0 else ())
+        if budgets:
+            expanded_graphs.extend(
+                (batch_size, draft_len, budget) for budget in budgets)
+            expanded_graphs.append((batch_size, draft_len, None))
+        else:
+            expanded_graphs.append((batch_size, draft_len, None))
+    expanded_graphs.sort(key=lambda graph: (graph[0], graph[1], -1
+                                            if graph[2] is None else graph[2]),
+                         reverse=True)
+    return confidence_capture, expanded_graphs
 
 
 class ModelEngine(ABC):
@@ -393,15 +424,12 @@ class PyTorchModelEngine(ModelEngine):
         # Disaggregated attention-DP can backfill a batch before the overlap
         # scheduler releases the previous batch's terminal sequence slots.
         from ._util import (compute_max_num_sequences,
-                            should_enable_adp_dummy_fixes,
                             should_enable_disagg_adp_overlap_headroom,
-                            should_enable_non_overlap_adp_forward_intent,
-                            should_enable_scheduler_aware_adp_dummy)
+                            should_enable_dsv4_adp_dummy_fixes)
         self._enable_disagg_adp_overlap_headroom = (
             should_enable_disagg_adp_overlap_headroom(
                 mapping, llm_args.cache_transceiver_config,
                 llm_args.disable_overlap_scheduler))
-        self._enable_adp_dummy_fixes = should_enable_adp_dummy_fixes(mapping)
         self.max_num_seq_slots = compute_max_num_sequences(
             mapping,
             self.batch_size,
@@ -491,12 +519,8 @@ class PyTorchModelEngine(ModelEngine):
             self.model = model
         pretrained_config = self.model.model_config.pretrained_config
         model_type = getattr(pretrained_config, "model_type", None)
-        self._enable_scheduler_aware_adp_dummy = (
-            should_enable_scheduler_aware_adp_dummy(
-                model_type, mapping, llm_args.disable_overlap_scheduler))
-        self._enable_non_overlap_adp_forward_intent = (
-            should_enable_non_overlap_adp_forward_intent(
-                mapping, llm_args.disable_overlap_scheduler))
+        self._enable_dsv4_adp_dummy_fixes = should_enable_dsv4_adp_dummy_fixes(
+            model_type, mapping)
         if drafting_loop_wrapper is not None:
             self.model = drafting_loop_wrapper(self.model)
             self.model_is_wrapped = True
@@ -968,6 +992,17 @@ class PyTorchModelEngine(ModelEngine):
 
         self._prepare_inputs_event: Optional[torch.cuda.Event] = None
 
+        # Persistent double-buffered pinned staging for non-blocking H2D input
+        # copies.  A freshly allocated pinned tensor can go out of scope while
+        # its copy is still queued, while a single persistent buffer can be
+        # rewritten by the next prepare before its previous copy completes.
+        # Alternating two slots and retiring each slot with a CUDA event closes
+        # both lifetime windows without serializing consecutive steps.
+        self._pinned_host_cache: Dict[str, List[Optional[torch.Tensor]]] = {}
+        self._pinned_host_events: Dict[Tuple[str, int], torch.cuda.Event] = {}
+        self._pinned_host_active: Dict[str, int] = {}
+        self._dspark_graph_route_trace_count = 0
+
         # Cache for enc-dec cross-attention stable generation steps.
         # Populated on the first CUDA-graph generation step; cleared whenever
         # the batch composition changes (new encoder request arrives).
@@ -976,6 +1011,44 @@ class PyTorchModelEngine(ModelEngine):
 
     def register_forward_pass_callable(self, callable: Callable):
         self.forward_pass_callable = callable
+
+    def _pinned_host(self, key: str, values: Iterable[int],
+                     dtype: torch.dtype) -> torch.Tensor:
+        """Stage values in a persistent pinned slot safe for async H2D."""
+        values = list(values)
+        slot = 1 - self._pinned_host_active.get(key, 1)
+        event = self._pinned_host_events.get((key, slot))
+        if event is not None:
+            event.synchronize()
+
+        buffers = self._pinned_host_cache.setdefault(key, [None, None])
+        buffer = buffers[slot]
+        if (buffer is None or buffer.numel() < len(values)
+                or buffer.dtype != dtype):
+            buffer = torch.empty(max(len(values), 1),
+                                 dtype=dtype,
+                                 pin_memory=prefer_pinned())
+            buffers[slot] = buffer
+
+        self._pinned_host_active[key] = slot
+        view = buffer[:len(values)]
+        if values:
+            view.copy_(torch.tensor(values, dtype=dtype))
+        return view
+
+    def _pinned_host_record(self, *keys: str) -> None:
+        """Retire the active staging slot after its H2D is enqueued."""
+        if torch.cuda.is_current_stream_capturing():
+            return
+        for key in keys:
+            slot = self._pinned_host_active.get(key)
+            if slot is None:
+                continue
+            event_key = (key, slot)
+            event = self._pinned_host_events.get(event_key)
+            if event is None:
+                event = self._pinned_host_events[event_key] = torch.cuda.Event()
+            event.record()
 
     def get_kv_cache_dtype_byte_size(self) -> float:
         """
@@ -2179,20 +2252,9 @@ class PyTorchModelEngine(ModelEngine):
         # Determine which graph shapes to process.
         graphs_to_capture = self._get_graphs_to_capture(cuda_graph_batch_sizes,
                                                         spec_resource_manager)
-        confidence_capture = (isinstance(self.spec_config, DSparkDecodingConfig)
-                              and self.spec_config.is_confidence_budget_enabled)
-        expanded_graphs = []
-        for bs, draft_len in graphs_to_capture:
-            budgets = (self.spec_config.
-                       resolve_confidence_verifier_token_budget_candidates(bs)
-                       if confidence_capture and draft_len > 0 else ())
-            if budgets:
-                expanded_graphs.extend(
-                    (bs, draft_len, budget) for budget in budgets)
-            else:
-                expanded_graphs.append((bs, draft_len, None))
-        graphs_to_capture = expanded_graphs
-        graphs_to_capture = sorted(graphs_to_capture, reverse=True)
+        confidence_capture, graphs_to_capture = (
+            _expand_generation_graph_capture_shapes(graphs_to_capture,
+                                                    self.spec_config))
         # Create CUDA graphs for short and long sequences separately for sparse attention.
         # self.max_seq_len is the global max sequence length. For Helix CP each
         # rank only holds max_seq_len / cp_size tokens, so scale accordingly to
@@ -2331,6 +2393,7 @@ class PyTorchModelEngine(ModelEngine):
                             logger.info(
                                 f"Run generation-only CUDA graph {operation} ({label}) "
                                 f"for batch size={bs}, draft_len={draft_len}, "
+                                f"verifier_token_budget={confidence_budget}, "
                                 f"max_seq_len={max_seq_len}")
                             self.enable_spec_decode = draft_len > 0 or self.is_draft_model or (
                                 self.spec_config is not None and
@@ -2366,29 +2429,36 @@ class PyTorchModelEngine(ModelEngine):
                         f"Cleared capture-only sampling override from {cleared} "
                         "cached CUDA graph spec metadata object(s).")
 
-        # Pass 1: greedy fast-path (dummy requests carry no sampling params,
-        # so is_all_greedy_sample is naturally True).
-        _run_capture_pass(force_non_greedy=False, label="greedy")
-        # Pass 2: advanced sampling variant. Required because on-the-fly capture
-        # is disabled outside warmup, so any inference batch that contains a
-        # non-greedy request would otherwise fall back to eager. Only meaningful
-        # for one-engine spec dec (where is_all_greedy_sample participates in
-        # the graph key); other paths default to True and would never key into
-        # this variant.
-        needs_non_greedy_capture = (
-            self.spec_config is not None
-            and self.spec_config.spec_dec_mode.use_one_engine())
-        if needs_non_greedy_capture:
-            _run_capture_pass(force_non_greedy=True, label="advanced sampling")
-        # Set the value back to the original value after cuda graph warmups are complete
-        self.enable_spec_decode = self.is_spec_decode
-        # The advanced-sampling capture pass above leaves is_all_greedy_sample
-        # set to False on spec_metadata. Reset it to the default so the first
-        # real iteration's graph-key selection is not seeded with this
-        # capture-only value. (update_is_all_greedy_sample refreshes it every
-        # iteration; this is a defensive guard.)
-        if self.spec_metadata is not None:
-            self.spec_metadata.is_all_greedy_sample = True
+        saved_runtime_draft_len = self.runtime_draft_len
+        try:
+            # Pass 1: greedy fast-path (dummy requests carry no sampling params,
+            # so is_all_greedy_sample is naturally True).
+            _run_capture_pass(force_non_greedy=False, label="greedy")
+            # Pass 2: advanced sampling variant. Required because on-the-fly capture
+            # is disabled outside warmup, so any inference batch that contains a
+            # non-greedy request would otherwise fall back to eager. Only meaningful
+            # for one-engine spec dec (where is_all_greedy_sample participates in
+            # the graph key); other paths default to True and would never key into
+            # this variant.
+            needs_non_greedy_capture = (
+                self.spec_config is not None
+                and self.spec_config.spec_dec_mode.use_one_engine())
+            if needs_non_greedy_capture:
+                _run_capture_pass(force_non_greedy=True,
+                                  label="advanced sampling")
+        finally:
+            # Capture mutates live engine and metadata state. Restore the
+            # serving defaults before any post-capture warmup or replay.
+            self.runtime_draft_len = saved_runtime_draft_len
+            self.enable_spec_decode = self.is_spec_decode
+            if confidence_capture:
+                self.spec_config.set_confidence_capture_verifier_token_budget(
+                    None)
+            if self.spec_metadata is not None:
+                self.spec_metadata.is_all_greedy_sample = True
+                if isinstance(self.spec_metadata, DSparkSpecMetadata):
+                    self.spec_metadata.confidence_fixed_budget_active = False
+                    self.spec_metadata.confidence_verifier_token_budget = 0
 
     def _capture_mixed_encoder_decoder_cuda_graphs(
             self, resource_manager: ResourceManager) -> None:
@@ -3531,21 +3601,32 @@ class PyTorchModelEngine(ModelEngine):
     def _sync_group_all_greedy_sample(self, spec_metadata) -> None:
         """All-gather the per-rank greedy flags and store the group AND.
 
-        Why the sampling-path choice must be group-uniform under
-        ADP + LM-head TP is documented on the anchor,
-        ``SpecMetadata.group_all_greedy_sample``. Local contract: called once
-        per iteration, right after ``update_is_all_greedy_sample`` and BEFORE
-        the CUDA graph key is built. The gate is pure config (identical on
-        every rank), so ranks also agree on whether the exchange happens; the
-        gather spans the whole TP group, a superset of any LM-head-TP
-        subgroup. A dedicated host all-gather rather than a piggyback on the
-        ``all_rank_num_tokens`` exchange, which runs in ``_prepare_inputs`` --
-        after the graph key, too late for the key to see the synced value.
+        Why the sampling-path choice must be group-uniform under ADP + LM-head
+        TP is documented on the anchor,
+        ``SpecMetadata.group_all_greedy_sample``. Dynamic confidence planning
+        has the same requirement: every attention-DP rank must either enter or
+        skip the candidate-yield all-reduce in the drafter CUDA graph.
+
+        Local contract: called once per iteration, right after
+        ``update_is_all_greedy_sample`` and BEFORE the CUDA graph key is built.
+        The gate is pure config (identical on every rank), so ranks also agree
+        on whether the exchange happens; the gather spans the whole TP group,
+        a superset of any LM-head-TP subgroup. A dedicated host all-gather
+        rather than a piggyback on the ``all_rank_num_tokens`` exchange, which
+        runs in ``_prepare_inputs`` -- after the graph key, too late for the key
+        or the planner to see the synced value.
         """
         # enable_lm_head_tp_in_adp implies enable_attention_dp (asserted in
-        # Mapping.__init__), so ADP needs no separate check here.
-        if not (self.mapping.enable_lm_head_tp_in_adp
-                and spec_metadata.use_rejection_sampling):
+        # Mapping.__init__). Dynamic confidence explicitly checks ADP because
+        # its per-tier yield collective is present only in that configuration.
+        lm_head_tp_requires_sync = (getattr(self.mapping,
+                                            "enable_lm_head_tp_in_adp", False)
+                                    and spec_metadata.use_rejection_sampling)
+        confidence_planner_requires_sync = (getattr(
+            self.mapping, "enable_attention_dp", False) and bool(
+                getattr(self.spec_config,
+                        "is_dynamic_budget_confidence_enabled", False)))
+        if not (lm_head_tp_requires_sync or confidence_planner_requires_sync):
             return
         local_flag = bool(spec_metadata.is_all_greedy_sample)
         all_flags = self.dist.tp_allgather(local_flag)
@@ -5138,13 +5219,17 @@ class PyTorchModelEngine(ModelEngine):
                 and (next_draft_tokens_device is not None or
                      (self.is_warmup and bool(extend_requests)
                       and all(request.is_dummy for request in extend_requests)))
+                and (self.is_warmup
+                     or all(request.py_draft_tokens_effective_len is not None
+                            and request.py_batch_idx is not None
+                            for request in extend_requests))
                 and num_ctx_requests == 0 and not generation_requests
                 and not first_draft_requests
                 and (not any(request.is_dummy for request in extend_requests) or
                      (self.is_warmup and all(request.is_dummy
                                              for request in extend_requests)))
                 and not self.use_mrope and self.guided_decoder is None
-                and not self.enable_attention_dp and spec_metadata is not None
+                and spec_metadata is not None
                 and spec_metadata.is_all_greedy_sample):
             resolver = getattr(spec_config,
                                "resolve_confidence_verifier_token_budget", None)
@@ -5744,13 +5829,12 @@ class PyTorchModelEngine(ModelEngine):
                         for row, query_len in enumerate(query_lens)
                         for local in range(query_len)
                     ]
-                    pack_indices_host = torch.tensor(
-                        pack_indices,
-                        dtype=torch.long,
-                        pin_memory=prefer_pinned(),
-                    )
+                    pack_indices_host = self._pinned_host(
+                        "confidence_input_pack_indices", pack_indices,
+                        torch.long)
                     self.dspark_confidence_pack_indices_cuda[:previous_batch_tokens].copy_(
                         pack_indices_host, non_blocking=True)
+                    self._pinned_host_record("confidence_input_pack_indices")
                     dense_new_tokens = new_tokens_device.transpose(
                         0, 1)[previous_slots, :runtime_tokens_per_gen_step]
                     new_tokens = dense_new_tokens.reshape(-1).index_select(
@@ -5783,13 +5867,13 @@ class PyTorchModelEngine(ModelEngine):
                                 confidence_input_draft_lens)
                             for local in range(draft_len)
                         ]
-                        draft_pack_indices_host = torch.tensor(
-                            draft_pack_indices,
-                            dtype=torch.long,
-                            pin_memory=prefer_pinned(),
-                        )
+                        draft_pack_indices_host = self._pinned_host(
+                            "confidence_draft_pack_indices", draft_pack_indices,
+                            torch.long)
                         self.dspark_confidence_pack_indices_cuda[:previous_batch_draft_tokens].copy_(
                             draft_pack_indices_host, non_blocking=True)
+                        self._pinned_host_record(
+                            "confidence_draft_pack_indices")
                         packed_draft_tokens = dense_draft_tokens.reshape(
                             -1
                         ).index_select(
@@ -5806,11 +5890,8 @@ class PyTorchModelEngine(ModelEngine):
                                                non_blocking=True)
                 # prepare data for the preprocess inputs
                 if confidence_fixed_budget_active:
-                    query_lens_host = torch.tensor(
-                        query_lens,
-                        dtype=torch.int,
-                        pin_memory=prefer_pinned(),
-                    )
+                    query_lens_host = self._pinned_host("confidence_query_lens",
+                                                        query_lens, torch.int32)
                     confidence_previous_slots = (
                         self.
                         dspark_confidence_previous_slots_cuda[:
@@ -5823,18 +5904,26 @@ class PyTorchModelEngine(ModelEngine):
                         confidence_previous_slots,
                         query_lens_host.to(device="cuda", non_blocking=True),
                     )
+                    self._pinned_host_record("confidence_query_lens")
                     kv_len_offsets_device = (
                         new_tokens_lens_device -
                         self.dspark_confidence_query_lens_cuda)
                 else:
                     kv_len_offsets_device = (new_tokens_lens_device -
                                              runtime_tokens_per_gen_step)
-                previous_pos_indices_host = torch.tensor(
-                    previous_pos_indices,
-                    dtype=torch.int,
-                    pin_memory=prefer_pinned())
+                # A slot which has not yet been written by the sampler can
+                # contain a stale count during roster transitions. Its
+                # physically possible offset is bounded by one speculative
+                # window, so clamp before it can influence captured KV append
+                # addresses.
+                kv_offset_limit = int(self.runtime_draft_len + 1)
+                kv_len_offsets_device = kv_len_offsets_device.clamp_(
+                    min=-kv_offset_limit, max=kv_offset_limit)
+                previous_pos_indices_host = self._pinned_host(
+                    "previous_pos_indices", previous_pos_indices, torch.int32)
                 self.previous_pos_indices_cuda[0:previous_batch_tokens].copy_(
                     previous_pos_indices_host, non_blocking=True)
+                self._pinned_host_record("previous_pos_indices")
 
                 # The order of requests in a batch: [context requests, generation requests]
                 # generation requests: ['requests that do not have previous batch', 'requests that already have previous batch', 'dummy requests']
@@ -6126,13 +6215,11 @@ class PyTorchModelEngine(ModelEngine):
                     confidence_verifier_token_budget
                     if confidence_fixed_budget_active else 0)
                 if confidence_fixed_budget_active:
-                    draft_lens_host = torch.tensor(
-                        draft_lens,
-                        dtype=torch.int,
-                        pin_memory=prefer_pinned(),
-                    )
+                    draft_lens_host = self._pinned_host(
+                        "confidence_draft_lens_inputs", draft_lens, torch.int32)
                     spec_metadata.draft_lens[:len(draft_lens)].copy_(
                         draft_lens_host, non_blocking=True)
+                    self._pinned_host_record("confidence_draft_lens_inputs")
             spec_metadata.request_ids = request_ids
             spec_metadata.gather_ids = self.gather_ids_cuda[:len(gather_ids)]
             spec_metadata.num_generations = len(
@@ -7255,6 +7342,25 @@ class PyTorchModelEngine(ModelEngine):
 
             return outputs
 
+    def _align_dspark_confidence_lengths_to_graph(
+            self, scheduled_requests: ScheduledRequests,
+            graph_key: Any) -> bool:
+        """Make request state describe the full-K fallback graph exactly."""
+        if (graph_key is None or graph_key.verifier_num_tokens != 0
+                or self.is_draft_model
+                or not isinstance(self.spec_config, DSparkDecodingConfig)
+                or not self.spec_config.is_confidence_budget_enabled):
+            return False
+        changed = False
+        for request in scheduled_requests.generation_requests:
+            if request.py_draft_tokens_effective_len is None:
+                continue
+            physical_len = len(request.py_draft_tokens)
+            if request.py_draft_tokens_effective_len != physical_len:
+                request.py_draft_tokens_effective_len = physical_len
+                changed = True
+        return changed
+
     @torch.inference_mode()
     @with_model_extra_attrs(lambda self: self.model.extra_attrs)
     def forward(self,
@@ -7313,9 +7419,13 @@ class PyTorchModelEngine(ModelEngine):
                     (not any(request.is_dummy for request in gen_requests) or
                      (self.is_warmup and all(request.is_dummy
                                              for request in gen_requests)))
-                        and spec_metadata.is_all_greedy_sample
-                        and not self.use_mrope and self.guided_decoder is None
-                        and not self.enable_attention_dp):
+                        and spec_metadata.is_all_greedy_sample and
+                    (self.is_warmup or
+                     (new_tensors_device is not None
+                      and all(request.py_draft_tokens_effective_len is not None
+                              and request.py_batch_idx is not None
+                              for request in gen_requests)))
+                        and not self.use_mrope and self.guided_decoder is None):
                     budget = None
                     retained_lens = None
                     if gen_requests:
@@ -7345,13 +7455,13 @@ class PyTorchModelEngine(ModelEngine):
                         if (max(retained_lens) <= self.max_draft_len
                                 and len(retained_lens) + sum(retained_lens)
                                 == budget):
-                            retained_lens_host = torch.tensor(
-                                retained_lens,
-                                dtype=torch.int,
-                                pin_memory=prefer_pinned(),
-                            )
+                            retained_lens_host = self._pinned_host(
+                                "confidence_draft_lens_attn", retained_lens,
+                                torch.int32)
                             spec_metadata.draft_lens[:len(retained_lens)].copy_(
                                 retained_lens_host, non_blocking=True)
+                            self._pinned_host_record(
+                                "confidence_draft_lens_attn")
                             spec_metadata.confidence_fixed_budget_active = True
                             spec_metadata.confidence_verifier_token_budget = budget
 
@@ -7477,7 +7587,21 @@ class PyTorchModelEngine(ModelEngine):
             )
 
             can_run_graph = key is not None
+            if (os.environ.get("TLLM_DSPARK_TRACE_GRAPH_ROUTE", "0") == "1"
+                    and not self.is_warmup
+                    and scheduled_requests.num_context_requests == 0
+                    and scheduled_requests.num_generation_requests > 0
+                    and self._dspark_graph_route_trace_count < 512):
+                logger.info(
+                    "DSpark graph route trace: "
+                    f"index={self._dspark_graph_route_trace_count}, "
+                    f"actual_g={scheduled_requests.num_generation_requests}, "
+                    f"execution_g={padded_graph_requests.num_generation_requests}, "
+                    f"graph={can_run_graph}, key={key}")
+                self._dspark_graph_route_trace_count += 1
             if can_run_graph:
+                self._align_dspark_confidence_lengths_to_graph(
+                    padded_graph_requests, key)
                 attn_metadata = maybe_attn_metadata
                 spec_metadata = maybe_spec_metadata
                 execution_requests = padded_graph_requests
@@ -7516,7 +7640,7 @@ class PyTorchModelEngine(ModelEngine):
             self._prepare_inputs_event = torch.cuda.Event()
             self._prepare_inputs_event.record()
 
-            with with_shared_pool(self.cuda_graph_runner.get_graph_pool()):
+            with with_shared_pool(self.cuda_graph_runner.get_graph_pool(key)):
                 if not can_run_graph:
                     # Fallback to eager execution if graph was not used
                     with MoeLoadBalancerIterContext(moe_load_balancer):

@@ -440,7 +440,9 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             if is_compress_layer(extend_compress_ratios[layer_idx])
         }
 
-    def prepare(self):
+    def _prepare_impl(self):
+        # DSAtrtllmAttentionMetadata.prepare() owns the write-after-read guard
+        # around all mutable pinned staging used by this implementation.
         assert self.kv_cache_manager is not None
         assert self.request_ids is not None
 

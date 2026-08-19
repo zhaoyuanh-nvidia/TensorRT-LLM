@@ -88,7 +88,11 @@ class UtilsSamplingParams:
 
 
 def int_tensor(shape: tuple[int, ...], device: str = "cuda") -> torch.Tensor:
-    return torch.empty(shape, dtype=torch.int, device=device)
+    # Several consumers treat these as slot-indexed stores and can read a
+    # previous roster's slot before the current sampler writes it.  Zero is a
+    # legal neutral value; uninitialized bytes can become an invalid KV-length
+    # correction and corrupt a captured append address.
+    return torch.zeros(shape, dtype=torch.int, device=device)
 
 
 def add_token(

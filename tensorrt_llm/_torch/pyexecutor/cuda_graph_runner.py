@@ -1,5 +1,6 @@
 import bisect
 import contextlib
+import os
 from dataclasses import dataclass
 from typing import (Any, Callable, Dict, Iterator, List, NamedTuple, Optional,
                     Tuple, TypeAlias)
@@ -160,6 +161,10 @@ class CUDAGraphRunner:
                                  Callable[[], Optional[torch.Tensor]]] = {}
         self.graph_metadata: Dict[KeyType, Dict[str, Any]] = {}
         self.memory_pool = config.cuda_graph_mem_pool
+        # Alternative verifier budgets have different live allocation
+        # layouts. Keep each (BS, physical DL, V) shape in its own graph pool
+        # so later captures cannot recycle addresses held by an earlier graph.
+        self._confidence_memory_pools: Dict[Tuple[int, int, int], Any] = {}
         self.padding_dummy_requests: Dict[int, LlmRequest] = {}
         self.dynamic_draft_len_mapping = config.dynamic_draft_len_mapping
 
@@ -246,6 +251,20 @@ class CUDAGraphRunner:
         return (batch.can_run_cuda_graph
                 or (self.enable_encoder_decoder_mixed_cuda_graph
                     and self._is_mixed_encoder_decoder_batch(batch)))
+
+    def _trace_dspark_graph_reject(self, reason: str, **fields: Any) -> None:
+        """Emit bounded diagnostics only after graph dispatch is live."""
+        if (not self.enabled or os.environ.get("TLLM_DSPARK_TRACE_GRAPH_REJECT",
+                                               "0") != "1"):
+            return
+        count = getattr(self, "_dspark_graph_reject_trace_count", 0)
+        if count >= 512:
+            return
+        details = ", ".join(f"{name}={value}" for name, value in fields.items())
+        logger.info(
+            f"DSpark graph route reject: index={count}, reason={reason}" +
+            (f", {details}" if details else ""))
+        self._dspark_graph_reject_trace_count = count + 1
 
     def _get_seq_len_mode(
         self,
@@ -364,6 +383,10 @@ class CUDAGraphRunner:
                 if any(
                         int(request.context_chunk_size) != context_query_len
                         for request in context_requests[1:]):
+                    self._trace_dspark_graph_reject(
+                        "context_query_len_mismatch",
+                        batch_size=batch_size,
+                        context_query_len=context_query_len)
                     return None
             num_encoder_tokens = sum(
                 int(request.encoder_output_len) for request in context_requests
@@ -392,6 +415,10 @@ class CUDAGraphRunner:
                     if any(effective_len > physical_len
                            for effective_len, physical_len in zip(
                                synthetic_effective_lens, draft_len_list)):
+                        self._trace_dspark_graph_reject(
+                            "synthetic_effective_len_exceeds_physical",
+                            batch_size=batch_size,
+                            configured_budget=configured_budget)
                         return None
                     for request, effective_len in zip(batch.generation_requests,
                                                       synthetic_effective_lens):
@@ -408,20 +435,76 @@ class CUDAGraphRunner:
                 if any(effective_len < 0 or effective_len > physical_len
                        for effective_len, physical_len in zip(
                            effective_draft_lens, draft_len_list)):
+                    self._trace_dspark_graph_reject(
+                        "invalid_effective_draft_len",
+                        batch_size=batch_size,
+                        effective_lens=effective_draft_lens,
+                        physical_lens=draft_len_list)
                     return None
 
                 is_compact_step = any(effective_len != physical_len
                                       for effective_len, physical_len in zip(
                                           effective_draft_lens, draft_len_list))
+                confidence_shape_active = (
+                    configured_budget is not None or bool(
+                        getattr(spec_metadata, "confidence_fixed_budget_active",
+                                False)))
+                has_live_dummy = (not is_synthetic_capture and any(
+                    getattr(request, "is_dummy", False)
+                    for request in batch.generation_requests))
+                if num_contexts and (is_compact_step
+                                     or confidence_shape_active):
+                    self._trace_dspark_graph_reject(
+                        "confidence_context_unsupported",
+                        batch_size=batch_size,
+                        num_contexts=num_contexts)
+                    return None
+
+                # Padding requests do not have a live confidence allocation or
+                # packed-row map.  Replaying an exact-V graph in that state can
+                # reuse stale compact metadata.  The ordinary full-K graph is
+                # already captured for this (batch_size, draft_len), and the
+                # model engine realigns every request to its physical draft
+                # length before preparing its inputs.  Returning its V=0 key
+                # also lets the attention-DP shape agreement gate make every
+                # rank take the same safe graph when only one rank has padding.
+                compact_shape_ready = not has_live_dummy
+                if has_live_dummy:
+                    self._trace_dspark_graph_reject(
+                        "confidence_live_dummy_fallback_full_k",
+                        batch_size=batch_size)
                 if is_compact_step:
-                    # The fixed budget is a packed, generation-only target
-                    # shape. A partial shape that does not exactly match its
-                    # configured budget must not alias either the compact or
-                    # static-K graph.
-                    if num_contexts or (not is_synthetic_capture and any(
-                            getattr(request, "is_dummy", False)
-                            for request in batch.generation_requests)):
-                        return None
+                    # A compact key is valid only when input preparation can
+                    # stage the matching packed rows in this same iteration.
+                    # Under the overlap scheduler, request-local retained
+                    # lengths can outlive the device tensors / batch-index
+                    # mapping that produced them during roster transitions.
+                    # Keying a compact graph in that state would replay the
+                    # previous compact step's row maps and KV extents.
+                    compact_inputs_ready = (
+                        new_tensors_device is not None and all(
+                            getattr(request, "py_draft_tokens_effective_len",
+                                    None) is not None and
+                            getattr(request, "py_batch_idx", None) is not None
+                            for request in batch.generation_requests))
+                    compact_shape_ready = (compact_shape_ready
+                                           and (is_synthetic_capture
+                                                or compact_inputs_ready))
+                    if not compact_shape_ready and not has_live_dummy:
+                        self._trace_dspark_graph_reject(
+                            "compact_inputs_fallback_full_k",
+                            batch_size=batch_size,
+                            has_new_tensors=new_tensors_device is not None)
+                if confidence_shape_active and compact_shape_ready:
+                    # Every confidence-selected target shape, including the
+                    # physical full-K tier, needs an explicit V key.  Otherwise
+                    # the full-K confidence capture aliases the ordinary DSpark
+                    # graph while their ragged row maps / attention metadata
+                    # can differ.  Dynamic mode deliberately does not infer
+                    # confidence activity from physical request lengths alone:
+                    # generic model-memory warmup also presents full-K dummy
+                    # requests but prepares the ordinary (non-confidence)
+                    # metadata path.
                     actual_budget = sum(
                         1 + effective_len
                         for effective_len in effective_draft_lens)
@@ -430,8 +513,22 @@ class CUDAGraphRunner:
                             batch_size, effective_draft_lens)
                     if (configured_budget is None
                             or actual_budget != configured_budget):
+                        self._trace_dspark_graph_reject(
+                            "confidence_budget_not_executable",
+                            batch_size=batch_size,
+                            actual_budget=actual_budget,
+                            configured_budget=configured_budget,
+                            candidates=self.spec_config.
+                            resolve_confidence_verifier_token_budget_candidates(
+                                batch_size),
+                            effective_lens=effective_draft_lens)
                         return None
                     verifier_num_tokens = configured_budget
+                elif is_compact_step and not confidence_shape_active:
+                    self._trace_dspark_graph_reject(
+                        "compact_confidence_fallback_full_k",
+                        batch_size=batch_size,
+                        effective_lens=effective_draft_lens)
             key = KeyType(batch_size=batch_size,
                           draft_len=draft_len,
                           is_first_draft=False,
@@ -518,23 +615,60 @@ class CUDAGraphRunner:
         """
         # disable when doing statistic
         if ExpertStatistic.should_record():
+            self._trace_dspark_graph_reject("expert_statistics_active")
             return None, None, None
 
         is_mixed_encoder_decoder = self._is_mixed_encoder_decoder_batch(batch)
         can_run_cuda_graph = self._can_run_cuda_graph_batch(batch)
         batch_size = batch.batch_size
+        key = (self.get_graph_key(
+            batch, new_tensors_device, spec_resource_manager, spec_metadata,
+            promoted_context_request_ids, peft_cache_data_type)
+               if self.enabled and can_run_cuda_graph else None)
         if self.enabled and self.config.enable_attention_dp and self.config.mapping.tp_size > 1:
-            graph_batch_info = self.config.dist.tp_allgather(
-                [can_run_cuda_graph, batch_size])
+            # A compact verifier graph has a second static shape axis: V.  ADP
+            # peers must therefore agree on both G and V (and on physical K),
+            # not merely on graph eligibility and batch size.  In particular,
+            # a rank whose overlap tensors are not ready returns key=None above;
+            # all peers then fall back together instead of mixing a compact
+            # replay with a full-K path across one TP/EP collective group.
+            graph_batch_info = self.config.dist.tp_allgather([
+                can_run_cuda_graph,
+                batch_size,
+                -1 if key is None else int(key.verifier_num_tokens),
+                -1 if key is None else int(key.draft_len),
+            ])
             all_can_run_cuda_graph = all(rank_info[0]
                                          for rank_info in graph_batch_info)
             all_batch_sizes_equal = all(rank_info[1] == graph_batch_info[0][1]
                                         for rank_info in graph_batch_info)
+            all_verifier_shapes_equal = all(
+                rank_info[2] == graph_batch_info[0][2]
+                for rank_info in graph_batch_info)
+            all_draft_lens_equal = all(rank_info[3] == graph_batch_info[0][3]
+                                       for rank_info in graph_batch_info)
 
-            if not all_can_run_cuda_graph or not all_batch_sizes_equal:
+            if (not all_can_run_cuda_graph or not all_batch_sizes_equal
+                    or not all_draft_lens_equal or key is None):
+                self._trace_dspark_graph_reject(
+                    "attention_dp_shape_gate",
+                    local_key=key,
+                    graph_batch_info=graph_batch_info)
                 return None, None, None
+            if not all_verifier_shapes_equal:
+                self._trace_dspark_graph_reject(
+                    "attention_dp_verifier_fallback_full_k",
+                    local_key=key,
+                    graph_batch_info=graph_batch_info)
+                key = key._replace(verifier_num_tokens=0)
 
         if not self.enabled or not can_run_cuda_graph:
+            self._trace_dspark_graph_reject(
+                "runner_disabled_or_batch_ineligible",
+                enabled=self.enabled,
+                can_run_cuda_graph=can_run_cuda_graph,
+                batch_size=batch_size,
+                batch_can_run_cuda_graph=batch.can_run_cuda_graph)
             return None, None, None
         if self.config.use_mrope and any(
                 self._needs_mrope_delta_cache_update(request)
@@ -546,11 +680,9 @@ class CUDAGraphRunner:
             return None, None, None
         # Propagate the execution-view identity through graph lookup. Existing
         # callers pass the empty default and retain generation-only behavior.
-        key = self.get_graph_key(batch, new_tensors_device,
-                                 spec_resource_manager, spec_metadata,
-                                 promoted_context_request_ids,
-                                 peft_cache_data_type)
         if key is None:
+            self._trace_dspark_graph_reject("graph_key_unresolved",
+                                            batch_size=batch_size)
             return None, None, None
         if is_mixed_encoder_decoder:
             key = self._get_compatible_mixed_encoder_decoder_key(key)
@@ -564,9 +696,17 @@ class CUDAGraphRunner:
         # workspace after older graph pointers have been fixed. Only shapes
         # captured by the two-pass startup warmup may replay.
         if not self._capture_allowed:
+            self._trace_dspark_graph_reject("key_not_captured",
+                                            key=key,
+                                            captured_keys=tuple(
+                                                self.graph_metadata.keys()))
             return None, None, None
 
         if batch_size not in self.supported_batch_sizes:
+            self._trace_dspark_graph_reject(
+                "unsupported_capture_batch_size",
+                batch_size=batch_size,
+                supported_batch_sizes=self.supported_batch_sizes)
             return None, None, None
 
         num_sequences_in_batch = batch_size * self.max_beam_width
@@ -641,14 +781,24 @@ class CUDAGraphRunner:
         finally:
             self._capture_allowed = False
 
-    def get_graph_pool(self):
+    @staticmethod
+    def _get_memory_pool_key(key: KeyType) -> Tuple[int, int, int]:
+        return (int(key.batch_size), int(key.draft_len),
+                int(key.verifier_num_tokens))
+
+    def get_graph_pool(self, key: Optional[KeyType] = None):
         """Returns the CUDA memory pool used by this graph runner.
 
         Returns:
             The CUDA memory pool associated with captured graphs, or None if
             no graphs have been captured yet.
         """
-        return self.memory_pool
+        if key is None:
+            return self.memory_pool
+        pool_key = self._get_memory_pool_key(KeyType(*key))
+        if pool_key[2] == 0:
+            return self.memory_pool
+        return self._confidence_memory_pools.get(pool_key)
 
     def _get_num_tokens_for_key(self, key: KeyType) -> int:
         if key.verifier_num_tokens:
@@ -753,7 +903,10 @@ class CUDAGraphRunner:
                 return output
 
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, pool=self.memory_pool):
+            pool_key = self._get_memory_pool_key(key)
+            capture_pool = (self.memory_pool if pool_key[2] == 0 else
+                            self._confidence_memory_pools.get(pool_key))
+            with torch.cuda.graph(graph, pool=capture_pool):
                 output = _setup_spec_decoding_and_forward(
                     key, forward_fn, capture_inputs)
             if postprocess_fn is not None:
@@ -764,7 +917,11 @@ class CUDAGraphRunner:
         self.graphs[key] = graph
         graph_output = make_weak_ref(output)
         self.graph_outputs[key] = graph_output
-        self.memory_pool = graph.pool()
+        captured_pool = graph.pool()
+        if pool_key[2] == 0:
+            self.memory_pool = captured_pool
+        else:
+            self._confidence_memory_pools[pool_key] = captured_pool
         return graph_output
 
     def replay(self, key: KeyType,
@@ -1149,6 +1306,7 @@ class CUDAGraphRunner:
         self.graph_outputs.clear()
         self.graph_metadata.clear()
         self.padding_dummy_requests = {}
+        self._confidence_memory_pools.clear()
         del self.memory_pool
         self.memory_pool = None
         torch.cuda.empty_cache()

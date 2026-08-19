@@ -29,11 +29,12 @@ from typing import Sequence
 import numpy as np
 
 __all__ = [
-    "select_fixed_verifier_budget_from_traces",
     "SpsCostTable",
     "derive_fixed_verifier_budget_candidates",
     "load_sps_cost_table",
     "select_fixed_verifier_budget",
+    "select_fixed_verifier_budget_from_traces",
+    "validate_sps_cost_table_payload",
 ]
 
 
@@ -122,6 +123,101 @@ def load_sps_cost_table(path: str | Path) -> tuple[SpsCostTable, dict[str, objec
         minimum_predicted_gain=float(payload.get("minimum_predicted_gain", 0.01)),
     )
     return table, payload
+
+
+def validate_sps_cost_table_payload(
+    payload: dict[str, object],
+    *,
+    verifier_token_budget_tiers: dict[int, Sequence[int]],
+    max_draft_len: int,
+) -> dict[str, object]:
+    """Fail closed when a dynamic cost artifact does not match its runtime.
+
+    Dynamic serving must only replay tiers measured for the same local graph
+    request width and K.  A one-dimensional SPS artifact represents one exact
+    graph batch size; accepting an unmeasured tier would silently interpolate
+    a different CUDA-graph shape and defeat the measured ``T(G, V)`` contract.
+    """
+    if not isinstance(payload, dict):
+        raise TypeError("SPS cost artifact must contain a JSON object")
+    fingerprint = payload.get("engine_fingerprint")
+    if not isinstance(fingerprint, dict):
+        raise TypeError("SPS cost artifact requires an engine_fingerprint object")
+
+    required_fingerprint_keys = {
+        "gpu",
+        "gpu_count",
+        "max_draft_len",
+        "rank_local_graph_batch_size",
+        "runtime_snapshot",
+        "source_head",
+        "topology",
+    }
+    missing_fingerprint_keys = sorted(required_fingerprint_keys - fingerprint.keys())
+    if missing_fingerprint_keys:
+        raise ValueError(
+            "SPS engine_fingerprint is missing required keys: "
+            + ", ".join(missing_fingerprint_keys)
+        )
+
+    normalized_tiers = {
+        int(graph_batch_size): tuple(int(value) for value in values)
+        for graph_batch_size, values in verifier_token_budget_tiers.items()
+    }
+    if len(normalized_tiers) != 1:
+        raise ValueError(
+            "A one-dimensional SPS cost artifact must configure exactly one "
+            "rank-local graph batch size"
+        )
+    graph_batch_size, candidate_budgets = next(iter(normalized_tiers.items()))
+    if int(fingerprint["rank_local_graph_batch_size"]) != graph_batch_size:
+        raise ValueError(
+            "SPS engine_fingerprint rank_local_graph_batch_size does not match "
+            f"configured G={graph_batch_size}"
+        )
+    if int(fingerprint["max_draft_len"]) != max_draft_len:
+        raise ValueError(
+            f"SPS engine_fingerprint max_draft_len does not match runtime K={max_draft_len}"
+        )
+
+    measured_budgets = {int(value) for value in payload.get("token_counts", ())}
+    unmeasured_budgets = sorted(set(candidate_budgets) - measured_budgets)
+    if unmeasured_budgets:
+        raise ValueError(
+            "Dynamic verifier tiers must be directly measured SPS token_counts; "
+            f"unmeasured tiers: {unmeasured_budgets}"
+        )
+    full_budget = graph_batch_size * (max_draft_len + 1)
+    if full_budget not in candidate_budgets:
+        raise ValueError(f"Dynamic verifier tiers must include full-K fallback V={full_budget}")
+
+    measurements = payload.get("measurements")
+    if not isinstance(measurements, list) or not measurements:
+        raise ValueError("SPS cost artifact requires non-empty measurement provenance")
+    provenance_budgets = {
+        int(item["rank_local_verifier_budget"])
+        for item in measurements
+        if isinstance(item, dict) and "rank_local_verifier_budget" in item
+    }
+    missing_provenance = sorted(set(candidate_budgets) - provenance_budgets)
+    if missing_provenance:
+        raise ValueError(
+            f"SPS measurement provenance does not cover configured tiers: {missing_provenance}"
+        )
+
+    gpu_count = int(fingerprint["gpu_count"])
+    if gpu_count < 1:
+        raise ValueError("SPS engine_fingerprint gpu_count must be positive")
+    global_graph_batch_size = fingerprint.get("global_graph_batch_size")
+    if (
+        global_graph_batch_size is not None
+        and int(global_graph_batch_size) != graph_batch_size * gpu_count
+    ):
+        raise ValueError(
+            "SPS engine_fingerprint global_graph_batch_size is inconsistent "
+            "with rank-local G and gpu_count"
+        )
+    return fingerprint
 
 
 def derive_fixed_verifier_budget_candidates(

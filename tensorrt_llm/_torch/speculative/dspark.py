@@ -37,7 +37,7 @@ from .dspark_confidence import (
     plan_fixed_verifier_budget,
     verify_packed_greedy,
 )
-from .dspark_planner import load_sps_cost_table
+from .dspark_planner import load_sps_cost_table, validate_sps_cost_table_payload
 from .dspark_trace import ConfidenceTraceRing, confidence_trace_path_from_env
 from .interface import SpecMetadata, SpecWorkerBase
 
@@ -248,6 +248,23 @@ class DSparkWorker(SpecWorkerBase):
             )
             else None
         )
+        # Attention-DP ranks own different requests but must replay the same
+        # target graph tier.  Sum each rank's fixed-shape candidate-yield
+        # vector so tier choice maximizes global predicted TPS rather than
+        # letting one noisy rank force the largest locally selected tier.
+        self._confidence_yield_all_reduce = (
+            AllReduce(
+                mapping,
+                strategy=AllReduceStrategy.NCCL,
+                dtype=torch.float32,
+            )
+            if (
+                getattr(spec_config, "is_dynamic_budget_confidence_enabled", False)
+                and mapping.tp_size > 1
+                and mapping.enable_attention_dp
+            )
+            else None
+        )
         self._confidence_recorder: Optional[ConfidenceTraceRing] = None
         self._confidence_sts_temperatures: Optional[torch.Tensor] = None
         self._confidence_dynamic_tables: dict[int, tuple[torch.Tensor, torch.Tensor, float]] = {}
@@ -293,6 +310,15 @@ class DSparkWorker(SpecWorkerBase):
         if self._confidence_recorder is not None:
             self._confidence_recorder.reset()
 
+    def _reduce_confidence_candidate_yields(self, expected_yield: torch.Tensor) -> torch.Tensor:
+        """Sum fixed-shape candidate yields across attention-DP ranks."""
+        if self._confidence_yield_all_reduce is None:
+            return expected_yield
+        reduced = self._confidence_yield_all_reduce(expected_yield.contiguous())
+        if isinstance(reduced, tuple):
+            reduced = reduced[0]
+        return reduced
+
     def _lazy_init(self, draft_model, spec_metadata) -> None:
         block_size = int(draft_model.block_size)
         if block_size != self.max_draft_len:
@@ -312,8 +338,13 @@ class DSparkWorker(SpecWorkerBase):
             logger.info(f"DSpark: loaded per-position STS calibration from {sts_path}")
         if getattr(self.spec_config, "is_dynamic_budget_confidence_enabled", False):
             cost_path = self.spec_config.confidence_sps_cost_table_path
-            cost_table, _ = load_sps_cost_table(cost_path)
+            cost_table, cost_payload = load_sps_cost_table(cost_path)
             tiers = self.spec_config.confidence_verifier_token_budget_tiers or {}
+            fingerprint = validate_sps_cost_table_payload(
+                cost_payload,
+                verifier_token_budget_tiers=tiers,
+                max_draft_len=block_size,
+            )
             for graph_batch_size, candidate_budgets in tiers.items():
                 budgets = torch.tensor(candidate_budgets, dtype=torch.int64, device="cuda")
                 step_times = torch.tensor(
@@ -332,7 +363,10 @@ class DSparkWorker(SpecWorkerBase):
             logger.info(
                 "DSpark: loaded dynamic verifier tiers and measured SPS costs "
                 f"from {cost_path}: "
-                f"{self.spec_config.confidence_verifier_token_budget_tiers}"
+                f"{self.spec_config.confidence_verifier_token_budget_tiers}; "
+                f"profile_source_head={fingerprint['source_head']}, "
+                f"profile_runtime={fingerprint['runtime_snapshot']}, "
+                f"profile_topology={fingerprint['topology']}"
             )
         max_batch = spec_metadata.max_num_requests
         num_stages = draft_model.num_stages
@@ -369,7 +403,7 @@ class DSparkWorker(SpecWorkerBase):
         self._batch_to_slot = torch.zeros(max_batch, dtype=torch.long, device="cuda")
 
         trace_path = confidence_trace_path_from_env()
-        if trace_path and self.mapping.tp_rank == 0:
+        if trace_path and (self.mapping.tp_rank == 0 or self.mapping.enable_attention_dp):
             if getattr(self.spec_config, "is_dynamic_budget_confidence_enabled", False):
                 schedule = {
                     graph_batch_size: min(candidate_budgets)
@@ -820,11 +854,17 @@ class DSparkWorker(SpecWorkerBase):
             next_draft_tokens = gen_draft_tokens
 
         next_draft_lens = None
+        adp_batches_agree = not self.mapping.enable_attention_dp or (
+            all_rank_num_gens is not None
+            and len(all_rank_num_gens) == self.mapping.tp_size
+            and all(int(value) == num_gens for value in all_rank_num_gens)
+        )
         if (
             num_contexts == 0
             and confidence_logits is not None
             and getattr(self.spec_config, "is_confidence_budget_enabled", False)
             and spec_metadata.is_all_greedy_sample
+            and adp_batches_agree
         ):
             candidates = self.spec_config.resolve_confidence_verifier_token_budget_candidates(
                 num_gens
@@ -862,6 +902,11 @@ class DSparkWorker(SpecWorkerBase):
                         candidate_step_times,
                         minimum_predicted_gain=minimum_gain,
                         temperatures=self._confidence_sts_temperatures,
+                        candidate_yield_reducer=(
+                            self._reduce_confidence_candidate_yields
+                            if self._confidence_yield_all_reduce is not None
+                            else None
+                        ),
                     )
                 else:
                     confidence_plan = plan_fixed_verifier_budget(
@@ -893,6 +938,14 @@ class DSparkWorker(SpecWorkerBase):
         if spec_metadata.confidence_fixed_budget_active:
             assert spec_metadata.draft_lens is not None
             outputs["verified_draft_lens"] = spec_metadata.draft_lens[:batch_size]
+        elif getattr(self.spec_config, "is_confidence_budget_enabled", False) and num_contexts == 0:
+            # A dynamic-budget batch can leave its captured G when requests
+            # finish. That iteration falls back to standard full-K verification,
+            # while the host request still carries the previous compact
+            # effective length. Publish the length actually verified by this
+            # step so acceptance and KV rewind stay iteration-aligned; omitting
+            # it would pair full-K acceptance with the stale compact snapshot.
+            outputs["verified_draft_lens"] = torch.full_like(num_accepted_tokens, K)
         if next_draft_lens is not None:
             outputs["next_draft_lens"] = next_draft_lens
         return outputs

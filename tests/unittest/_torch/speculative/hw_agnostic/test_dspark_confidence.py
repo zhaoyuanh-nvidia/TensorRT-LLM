@@ -33,6 +33,7 @@ from tensorrt_llm._torch.speculative.dspark_planner import (
     derive_fixed_verifier_budget_candidates,
     select_fixed_verifier_budget,
     select_fixed_verifier_budget_from_traces,
+    validate_sps_cost_table_payload,
 )
 from tensorrt_llm._torch.speculative.dspark_trace import ConfidenceTraceRing
 
@@ -143,6 +144,86 @@ def test_dynamic_budget_guard_falls_back_to_full_k() -> None:
     assert int(guarded.verifier_token_budget) == 6
 
 
+def test_dynamic_single_tier_skips_redundant_yield_reducer() -> None:
+    logits = torch.tensor([[2.0, -1.0], [0.5, 0.25]], dtype=torch.float32)
+    budgets = torch.tensor([6], dtype=torch.int64)
+    step_times = torch.tensor([1.4], dtype=torch.float32)
+
+    def fail_if_called(_: torch.Tensor) -> torch.Tensor:
+        raise AssertionError("a one-tier ladder cannot need cross-rank yield reduction")
+
+    plan = plan_dynamic_verifier_budget(
+        logits,
+        budgets,
+        step_times,
+        candidate_yield_reducer=fail_if_called,
+    )
+
+    assert int(plan.verifier_token_budget) == 6
+    assert int(plan.retained_lens.sum()) == 4
+
+
+def test_dynamic_budget_reducer_selects_global_goodput_not_max_local_tier() -> None:
+    budgets = torch.tensor([2, 4, 6], dtype=torch.int64)
+    step_times = torch.tensor([1.0, 1.6, 2.4], dtype=torch.float32)
+    low_logits = torch.full((2, 2), -20.0, dtype=torch.float32)
+    high_logits = torch.full((2, 2), 20.0, dtype=torch.float32)
+
+    def candidate_yields(logits: torch.Tensor) -> torch.Tensor:
+        observed = []
+
+        def capture(values: torch.Tensor) -> torch.Tensor:
+            observed.append(values.clone())
+            return values
+
+        plan_dynamic_verifier_budget(
+            logits,
+            budgets,
+            step_times,
+            candidate_yield_reducer=capture,
+        )
+        return observed[0]
+
+    low_local = plan_dynamic_verifier_budget(low_logits, budgets, step_times)
+    high_local = plan_dynamic_verifier_budget(high_logits, budgets, step_times)
+    global_yields = candidate_yields(low_logits) + candidate_yields(high_logits)
+
+    def reducer(_local: torch.Tensor) -> torch.Tensor:
+        return global_yields
+
+    low_global = plan_dynamic_verifier_budget(
+        low_logits,
+        budgets,
+        step_times,
+        candidate_yield_reducer=reducer,
+    )
+    high_global = plan_dynamic_verifier_budget(
+        high_logits,
+        budgets,
+        step_times,
+        candidate_yield_reducer=reducer,
+    )
+
+    assert int(low_local.verifier_token_budget) == 2
+    assert int(high_local.verifier_token_budget) == 6
+    assert int(low_global.verifier_token_budget) == 2
+    assert int(high_global.verifier_token_budget) == 2
+
+
+def test_dynamic_budget_reducer_must_preserve_candidate_shape() -> None:
+    logits = torch.zeros((2, 2), dtype=torch.float32)
+    budgets = torch.tensor([2, 4, 6], dtype=torch.int64)
+    step_times = torch.tensor([1.0, 1.2, 1.4], dtype=torch.float32)
+
+    with pytest.raises(ValueError, match="preserve the candidate shape"):
+        plan_dynamic_verifier_budget(
+            logits,
+            budgets,
+            step_times,
+            candidate_yield_reducer=lambda values: values[:2],
+        )
+
+
 @pytest.mark.parametrize("verifier_token_budget", [4, 5, 11, 24])
 def test_plan_matches_cpu_reference_and_exact_budget(
     verifier_token_budget: int,
@@ -160,6 +241,75 @@ def test_plan_matches_cpu_reference_and_exact_budget(
     plan = plan_fixed_verifier_budget(confidence_logits, verifier_token_budget)
     for retained_len in plan.retained_lens.tolist():
         assert 0 <= retained_len <= confidence_logits.shape[1]
+
+
+def test_randomized_plans_match_cpu_reference_and_preserve_invariants() -> None:
+    generator = torch.Generator().manual_seed(20260818)
+    for num_requests in (1, 2, 7, 128):
+        for max_draft_len in (1, 3, 5):
+            logits = torch.randn(
+                num_requests,
+                max_draft_len,
+                generator=generator,
+            )
+            full = num_requests * (max_draft_len + 1)
+            budgets = {
+                num_requests,
+                min(full, num_requests + 1),
+                (num_requests + full) // 2,
+                full,
+            }
+            for budget in sorted(budgets):
+                _assert_matches_reference(logits, budget)
+                plan = plan_fixed_verifier_budget(logits, budget)
+                assert int(plan.query_lens.sum()) == budget
+                assert int(plan.retained_lens.sum()) == budget - num_requests
+                assert torch.all(plan.retained_lens >= 0)
+                assert torch.all(plan.retained_lens <= max_draft_len)
+                assert torch.equal(
+                    plan.cu_query_lens[1:] - plan.cu_query_lens[:-1],
+                    plan.query_lens,
+                )
+
+
+def test_eight_rank_reduced_yield_selects_one_identical_tier() -> None:
+    generator = torch.Generator().manual_seed(8)
+    rank_logits = [torch.randn(4, 5, generator=generator) for _ in range(8)]
+    budgets = torch.tensor([8, 16, 24], dtype=torch.int64)
+    step_times = torch.tensor([1.0, 1.25, 1.65], dtype=torch.float32)
+    rank_yields: list[torch.Tensor] = []
+
+    def make_capture(sink: list[torch.Tensor]):
+        def capture(values: torch.Tensor) -> torch.Tensor:
+            sink.append(values.clone())
+            return values
+
+        return capture
+
+    for logits in rank_logits:
+        captured: list[torch.Tensor] = []
+        plan_dynamic_verifier_budget(
+            logits,
+            budgets,
+            step_times,
+            candidate_yield_reducer=make_capture(captured),
+        )
+        rank_yields.append(captured[0])
+
+    global_yield = torch.stack(rank_yields).sum(dim=0)
+    selected = []
+    for logits in rank_logits:
+        plan = plan_dynamic_verifier_budget(
+            logits,
+            budgets,
+            step_times,
+            candidate_yield_reducer=lambda _local: global_yield,
+        )
+        selected.append(int(plan.verifier_token_budget))
+
+    assert len(set(selected)) == 1
+    expected = int(budgets[torch.argmax(global_yield / step_times)])
+    assert selected == [expected] * 8
 
 
 def test_equal_scores_prefer_earlier_positions_then_requests() -> None:
@@ -318,6 +468,78 @@ def test_load_sts_accepts_both_runtime_key_spellings(tmp_path) -> None:
     expected = torch.tensor([0.5, 1.0, 2.0])
     assert torch.equal(load_sts_temperatures(trtllm_path, 3), expected)
     assert torch.equal(load_sts_temperatures(sglang_path, 3), expected)
+
+
+def test_load_sts_rejects_inconsistent_artifact_metadata(tmp_path) -> None:
+    wrong_k_path = tmp_path / "wrong-k.json"
+    wrong_k_path.write_text(json.dumps({"max_draft_len": 4, "sts_temperatures": [0.5, 1.0, 2.0]}))
+    inconsistent_keys_path = tmp_path / "inconsistent-keys.json"
+    inconsistent_keys_path.write_text(
+        json.dumps(
+            {
+                "max_draft_len": 3,
+                "sts_temperatures": [0.5, 1.0, 2.0],
+                "temperatures": [0.5, 1.0, 3.0],
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match="artifact max_draft_len"):
+        load_sts_temperatures(wrong_k_path, 3)
+    with pytest.raises(ValueError, match="inconsistent"):
+        load_sts_temperatures(inconsistent_keys_path, 3)
+
+
+def _sps_payload() -> dict[str, object]:
+    return {
+        "token_counts": [8, 16, 24],
+        "step_time_ms": [1.0, 1.2, 1.5],
+        "engine_fingerprint": {
+            "gpu": "B300",
+            "gpu_count": 8,
+            "global_graph_batch_size": 32,
+            "max_draft_len": 5,
+            "rank_local_graph_batch_size": 4,
+            "runtime_snapshot": "runtime-v1",
+            "source_head": "abc123",
+            "topology": "TP8_EP8_attention_DP8",
+        },
+        "measurements": [
+            {"rank_local_verifier_budget": 8},
+            {"rank_local_verifier_budget": 16},
+            {"rank_local_verifier_budget": 24},
+        ],
+    }
+
+
+def test_sps_artifact_validation_accepts_exact_measured_tiers() -> None:
+    fingerprint = validate_sps_cost_table_payload(
+        _sps_payload(),
+        verifier_token_budget_tiers={4: [8, 16, 24]},
+        max_draft_len=5,
+    )
+
+    assert fingerprint["topology"] == "TP8_EP8_attention_DP8"
+
+
+@pytest.mark.parametrize(
+    ("tiers", "max_draft_len", "message"),
+    [
+        ({4: [8, 12, 24]}, 5, "unmeasured tiers"),
+        ({8: [16, 48]}, 5, "rank_local_graph_batch_size"),
+        ({4: [8, 16, 24]}, 4, "max_draft_len"),
+        ({4: [8, 16], 8: [16, 48]}, 5, "exactly one"),
+    ],
+)
+def test_sps_artifact_validation_rejects_runtime_mismatch(
+    tiers: dict[int, list[int]], max_draft_len: int, message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        validate_sps_cost_table_payload(
+            _sps_payload(),
+            verifier_token_budget_tiers=tiers,
+            max_draft_len=max_draft_len,
+        )
 
 
 def test_sts_changes_cross_position_ranking() -> None:

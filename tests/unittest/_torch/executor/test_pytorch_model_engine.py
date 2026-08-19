@@ -728,13 +728,16 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         first = _make_request_stub(1)
         first.py_draft_tokens = [11, 12, 13, 14, 15]
         first.py_draft_tokens_effective_len = 4
+        first.py_batch_idx = 0
         second = _make_request_stub(2)
         second.py_draft_tokens = [21, 22, 23, 24, 25]
         second.py_draft_tokens_effective_len = 3
+        second.py_batch_idx = 1
         batch = ScheduledRequests()
         batch.generation_requests = [first, second]
 
-        key = CUDAGraphRunner.get_graph_key(runner, batch)
+        key = CUDAGraphRunner.get_graph_key(
+            runner, batch, new_tensors_device=SimpleNamespace())
 
         assert key is not None
         self.assertEqual(key.verifier_num_tokens, 9)
@@ -829,6 +832,100 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         self.assertEqual(CUDAGraphRunner._get_num_tokens_for_key(runner, key),
                          6)
 
+    def test_dspark_dynamic_full_k_capture_uses_explicit_verifier_key(
+            self) -> None:
+        runner = Mock()
+        runner.config = SimpleNamespace(is_draft_model=False)
+        runner.max_beam_width = 1
+        runner._capture_allowed = True
+        runner.spec_config = DSparkDecodingConfig(
+            max_draft_len=5,
+            speculative_model="/tmp/dummy_model",
+            confidence_mode="dynamic_budget",
+            confidence_verifier_token_budget_tiers={2: [9, 12]},
+            confidence_sps_cost_table_path="/tmp/dummy-sps.json")
+        runner.spec_config.set_confidence_capture_verifier_token_budget(12)
+        runner._get_seq_len_mode.return_value = False
+        requests = [_make_request_stub(1), _make_request_stub(2)]
+        for request in requests:
+            request.is_dummy = True
+            request.py_draft_tokens = [11, 12, 13, 14, 15]
+            request.py_draft_tokens_effective_len = None
+        batch = ScheduledRequests()
+        batch.generation_requests = requests
+
+        key = CUDAGraphRunner.get_graph_key(
+            runner,
+            batch,
+            spec_metadata=SimpleNamespace(is_all_greedy_sample=True,
+                                          confidence_fixed_budget_active=True),
+        )
+
+        assert key is not None
+        self.assertEqual(key.verifier_num_tokens, 12)
+
+    def test_dspark_dynamic_selected_full_k_uses_explicit_verifier_key(
+            self) -> None:
+        runner = Mock()
+        runner.config = SimpleNamespace(is_draft_model=False)
+        runner.max_beam_width = 1
+        runner._capture_allowed = False
+        runner.spec_config = DSparkDecodingConfig(
+            max_draft_len=5,
+            speculative_model="/tmp/dummy_model",
+            confidence_mode="dynamic_budget",
+            confidence_verifier_token_budget_tiers={2: [9, 12]},
+            confidence_sps_cost_table_path="/tmp/dummy-sps.json")
+        runner._get_seq_len_mode.return_value = False
+        requests = [_make_request_stub(1), _make_request_stub(2)]
+        for index, request in enumerate(requests):
+            request.py_draft_tokens = [11, 12, 13, 14, 15]
+            request.py_draft_tokens_effective_len = 5
+            request.py_batch_idx = index
+        batch = ScheduledRequests()
+        batch.generation_requests = requests
+
+        key = CUDAGraphRunner.get_graph_key(
+            runner,
+            batch,
+            new_tensors_device=SimpleNamespace(),
+            spec_metadata=SimpleNamespace(is_all_greedy_sample=True,
+                                          confidence_fixed_budget_active=True),
+        )
+
+        assert key is not None
+        self.assertEqual(key.verifier_num_tokens, 12)
+
+    def test_dspark_dynamic_ordinary_full_k_does_not_alias_confidence_key(
+            self) -> None:
+        runner = Mock()
+        runner.config = SimpleNamespace(is_draft_model=False)
+        runner.max_beam_width = 1
+        runner._capture_allowed = False
+        runner.spec_config = DSparkDecodingConfig(
+            max_draft_len=5,
+            speculative_model="/tmp/dummy_model",
+            confidence_mode="dynamic_budget",
+            confidence_verifier_token_budget_tiers={2: [9, 12]},
+            confidence_sps_cost_table_path="/tmp/dummy-sps.json")
+        runner._get_seq_len_mode.return_value = False
+        requests = [_make_request_stub(1), _make_request_stub(2)]
+        for request in requests:
+            request.py_draft_tokens = [11, 12, 13, 14, 15]
+            request.py_draft_tokens_effective_len = None
+        batch = ScheduledRequests()
+        batch.generation_requests = requests
+
+        key = CUDAGraphRunner.get_graph_key(
+            runner,
+            batch,
+            spec_metadata=SimpleNamespace(is_all_greedy_sample=True,
+                                          confidence_fixed_budget_active=False),
+        )
+
+        assert key is not None
+        self.assertEqual(key.verifier_num_tokens, 0)
+
     def test_dspark_confidence_rejects_compact_shape_off_budget(self) -> None:
         runner = Mock()
         runner.config = SimpleNamespace(is_draft_model=False)
@@ -842,13 +939,69 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         first = _make_request_stub(1)
         first.py_draft_tokens = [11, 12, 13, 14, 15]
         first.py_draft_tokens_effective_len = 3
+        first.py_batch_idx = 0
         second = _make_request_stub(2)
         second.py_draft_tokens = [21, 22, 23, 24, 25]
         second.py_draft_tokens_effective_len = 3
+        second.py_batch_idx = 1
         batch = ScheduledRequests()
         batch.generation_requests = [first, second]
 
+        self.assertIsNone(
+            CUDAGraphRunner.get_graph_key(runner,
+                                          batch,
+                                          new_tensors_device=SimpleNamespace()))
+
+    def test_dspark_confidence_rejects_compact_key_without_overlap_inputs(
+            self) -> None:
+        runner = Mock()
+        runner.config = SimpleNamespace(is_draft_model=False)
+        runner.max_beam_width = 1
+        runner._capture_allowed = False
+        runner.spec_config = DSparkDecodingConfig(
+            max_draft_len=5,
+            speculative_model="/tmp/dummy_model",
+            confidence_mode="fixed_budget",
+            confidence_verifier_token_budget_schedule={2: 9})
+        runner._get_seq_len_mode.return_value = False
+        requests = [_make_request_stub(1), _make_request_stub(2)]
+        for index, request in enumerate(requests):
+            request.py_draft_tokens = [11, 12, 13, 14, 15]
+            request.py_draft_tokens_effective_len = 4 - index
+            request.py_batch_idx = index
+        batch = ScheduledRequests()
+        batch.generation_requests = requests
+
         self.assertIsNone(CUDAGraphRunner.get_graph_key(runner, batch))
+
+    def test_dspark_confidence_rejects_compact_key_with_unstaged_request(
+            self) -> None:
+        runner = Mock()
+        runner.config = SimpleNamespace(is_draft_model=False)
+        runner.max_beam_width = 1
+        runner._capture_allowed = False
+        runner.spec_config = DSparkDecodingConfig(
+            max_draft_len=5,
+            speculative_model="/tmp/dummy_model",
+            confidence_mode="fixed_budget",
+            confidence_verifier_token_budget_schedule={2: 9})
+        runner._get_seq_len_mode.return_value = False
+        first = _make_request_stub(1)
+        first.py_draft_tokens = [11, 12, 13, 14, 15]
+        first.py_draft_tokens_effective_len = 4
+        first.py_batch_idx = 0
+        second = _make_request_stub(2)
+        second.py_draft_tokens = [21, 22, 23, 24, 25]
+        second.py_draft_tokens_effective_len = 3
+        # A newly admitted request has no prior overlap slot yet.
+        second.py_batch_idx = None
+        batch = ScheduledRequests()
+        batch.generation_requests = [first, second]
+
+        self.assertIsNone(
+            CUDAGraphRunner.get_graph_key(runner,
+                                          batch,
+                                          new_tensors_device=SimpleNamespace()))
 
     def test_dspark_confidence_rejects_runtime_padding_dummy(self) -> None:
         runner = Mock()
@@ -882,6 +1035,44 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
             CUDAGraphRunner._get_num_tokens_for_key(Mock(), static_key), 12)
         self.assertEqual(
             CUDAGraphRunner._get_num_tokens_for_key(Mock(), compact_key), 9)
+
+    def test_attention_dp_rejects_peer_verifier_shape_mismatch(self) -> None:
+        runner = Mock()
+        runner.enabled = True
+        runner.config = SimpleNamespace(
+            enable_attention_dp=True,
+            use_mrope=False,
+            mapping=SimpleNamespace(tp_size=8),
+            dist=Mock(),
+        )
+        key = KeyType(batch_size=2,
+                      draft_len=5,
+                      is_first_draft=False,
+                      verifier_num_tokens=9)
+        runner.get_graph_key.return_value = key
+        runner._is_mixed_encoder_decoder_batch.return_value = False
+        runner._can_run_cuda_graph_batch.return_value = True
+        runner.config.dist.tp_allgather.return_value = [
+            [True, 2, 9, 5],
+            [True, 2, 12, 5],
+        ]
+        batch = ScheduledRequests()
+        batch.generation_requests = [
+            _make_request_stub(1), _make_request_stub(2)
+        ]
+
+        with patch(
+                "tensorrt_llm._torch.pyexecutor.cuda_graph_runner.ExpertStatistic.should_record",
+                return_value=False):
+            result = CUDAGraphRunner.maybe_get_cuda_graph(
+                runner,
+                batch,
+                enable_spec_decode=True,
+                attn_metadata=object(),
+                new_tensors_device=SimpleNamespace(),
+            )
+
+        self.assertEqual(result, (None, None, None))
 
     def test_graph_dtype_change_falls_back_to_eager(self) -> None:
         runner = Mock()

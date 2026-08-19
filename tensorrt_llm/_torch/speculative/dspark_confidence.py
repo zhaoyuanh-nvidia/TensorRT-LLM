@@ -16,7 +16,7 @@
 
 import json
 from pathlib import Path
-from typing import NamedTuple
+from typing import Callable, NamedTuple
 
 import torch
 
@@ -66,6 +66,21 @@ def load_sts_temperatures(path: str | Path, max_draft_len: int) -> torch.Tensor:
     """
     with Path(path).open(encoding="utf-8") as file:
         payload = json.load(file)
+    if not isinstance(payload, dict):
+        raise TypeError(f"{path} must contain a JSON object")
+    artifact_max_draft_len = payload.get("max_draft_len")
+    if artifact_max_draft_len is not None and int(artifact_max_draft_len) != max_draft_len:
+        raise ValueError(
+            f"STS artifact max_draft_len={artifact_max_draft_len} does not match "
+            f"runtime max_draft_len={max_draft_len}"
+        )
+    if "sts_temperatures" in payload and "temperatures" in payload:
+        sts_values = torch.as_tensor(payload["sts_temperatures"], dtype=torch.float32)
+        compatibility_values = torch.as_tensor(payload["temperatures"], dtype=torch.float32)
+        if not torch.equal(sts_values, compatibility_values):
+            raise ValueError(
+                "STS artifact contains inconsistent 'sts_temperatures' and 'temperatures' vectors"
+            )
     values = payload.get("sts_temperatures", payload.get("temperatures"))
     if values is None:
         raise ValueError(f"{path} has neither 'sts_temperatures' nor 'temperatures'")
@@ -102,6 +117,7 @@ def plan_dynamic_verifier_budget(
     candidate_step_times_ms: torch.Tensor,
     minimum_predicted_gain: float = 0.01,
     temperatures: torch.Tensor | None = None,
+    candidate_yield_reducer: Callable[[torch.Tensor], torch.Tensor] | None = None,
 ) -> DynamicBudgetPlan:
     """Select and allocate one captured verifier-token budget on device.
 
@@ -117,6 +133,13 @@ def plan_dynamic_verifier_budget(
     total to the host, where the following target step selects the matching
     pre-captured ``(G,V)`` graph.  No confidence snapshot or additional D2H
     transfer is introduced.
+
+    ``candidate_yield_reducer`` optionally aggregates the fixed-size yield
+    vector before scoring. Attention-DP uses it to sum yield across ranks so
+    every rank selects one globally optimal graph tier while retaining a
+    rank-local, exact-size ragged allocation. A one-tier ladder skips the
+    reducer because the selected graph tier is configuration-invariant; this
+    avoids a redundant captured collective without changing the allocation.
     """
     if confidence_logits.ndim != 2:
         raise ValueError("confidence_logits must have shape [num_requests, max_draft_len]")
@@ -157,7 +180,17 @@ def plan_dynamic_verifier_budget(
 
     retained_candidates = candidate_budgets.to(torch.long) - num_requests
     expected_yield = float(num_requests) + torch.gather(cumulative_yield, 0, retained_candidates)
-    scores = expected_yield / candidate_step_times_ms.to(torch.float32)
+    # Cross-rank yield is only needed to choose among multiple graph tiers.
+    # A one-tier ladder has a configuration-invariant selection, so bypassing
+    # the reducer avoids a redundant captured collective without changing the
+    # selected budget or its rank-local ragged allocation.
+    if candidate_yield_reducer is not None and candidate_budgets.numel() > 1:
+        expected_yield = candidate_yield_reducer(expected_yield.contiguous())
+        if expected_yield.shape != candidate_budgets.shape:
+            raise ValueError("candidate_yield_reducer must preserve the candidate shape")
+        if expected_yield.device != confidence_logits.device:
+            raise ValueError("candidate_yield_reducer must preserve the confidence-logit device")
+    scores = expected_yield.to(torch.float32) / candidate_step_times_ms.to(torch.float32)
 
     # Prefer the larger tier on an exact score tie, matching the offline
     # planner and making the conservative choice deterministic.
