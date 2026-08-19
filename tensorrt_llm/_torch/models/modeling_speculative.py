@@ -2090,6 +2090,10 @@ def external_drafter_config_kwargs(model_config, spec_config) -> dict:
         spec_config=None,  # Avoid recursive spec-dec
         max_num_tokens=model_config.max_num_tokens,
         moe_max_num_tokens=model_config.moe_max_num_tokens,
+        # A one-engine drafter executes inside the target model's graph.  MoE
+        # communication backends consume this flag at construction time to
+        # select their graph-compatible allocation and synchronization path.
+        use_cuda_graph=model_config.use_cuda_graph,
     )
     if spec_config.spec_dec_mode.is_dspark():
         kwargs["moe_load_balancer"] = model_config.moe_load_balancer

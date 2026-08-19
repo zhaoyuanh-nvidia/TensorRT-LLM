@@ -56,7 +56,7 @@ def _lb_config(layer_ids=None, layer_updates_per_iter=0):
     )
 
 
-def _model_config(lb_config=None, num_hidden_layers=NUM_HIDDEN_LAYERS):
+def _model_config(lb_config=None, num_hidden_layers=NUM_HIDDEN_LAYERS, use_cuda_graph=True):
     return SimpleNamespace(
         moe_load_balancer=lb_config,
         attn_backend="TRTLLM",
@@ -64,6 +64,7 @@ def _model_config(lb_config=None, num_hidden_layers=NUM_HIDDEN_LAYERS):
         mapping=object(),
         max_num_tokens=8192,
         moe_max_num_tokens=8192,
+        use_cuda_graph=use_cuda_graph,
         pretrained_config=SimpleNamespace(num_hidden_layers=num_hidden_layers),
     )
 
@@ -101,6 +102,18 @@ def test_dspark_draft_config_does_not_recurse_into_spec_dec():
         _model_config(_lb_config(DSPARK_LAYERS)), _spec_config(SpeculativeDecodingMode.DSPARK)
     )
     assert kwargs["spec_config"] is None
+
+
+@pytest.mark.parametrize("use_cuda_graph", [False, True])
+def test_dspark_draft_config_inherits_cuda_graph_mode(use_cuda_graph):
+    # DSpark executes in the target model's one-engine forward.  In particular,
+    # DeepEP must see use_cuda_graph=True at construction time so capture avoids
+    # its host-polled dynamic receive-count path.
+    kwargs = external_drafter_config_kwargs(
+        _model_config(use_cuda_graph=use_cuda_graph),
+        _spec_config(SpeculativeDecodingMode.DSPARK),
+    )
+    assert kwargs["use_cuda_graph"] is use_cuda_graph
 
 
 @pytest.mark.parametrize(
