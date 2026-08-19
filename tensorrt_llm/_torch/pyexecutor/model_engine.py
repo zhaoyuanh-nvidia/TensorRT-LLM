@@ -760,9 +760,9 @@ class PyTorchModelEngine(ModelEngine):
             self.dspark_confidence_query_lens_cuda = None
             self.dspark_confidence_previous_slots_cuda = None
             if (isinstance(spec_config, DSparkDecodingConfig)
-                    and spec_config.is_fixed_budget_confidence_enabled):
-                # Fixed-capacity DSpark confidence scheduling packs a dense
-                # [G, K+1] proposal buffer into a constant V-token verifier
+                    and spec_config.is_confidence_budget_enabled):
+                # DSpark confidence scheduling packs a dense [G, K+1]
+                # proposal buffer into the selected V-token verifier
                 # input. Allocate the maps once so graph replay never observes
                 # a data-dependent allocation or address.
                 self.dspark_confidence_pack_indices_cuda = torch.empty(
@@ -1391,6 +1391,16 @@ class PyTorchModelEngine(ModelEngine):
         # fails every step and padded batches silently run eager.
         self.cuda_graph_runner.preallocate_padding_dummies(resource_manager)
         log_mem_snapshot("warmup/after_preallocate_padding_dummies")
+
+        # Confidence tracing is part of captured DSpark graphs, so capture must
+        # execute its tensor-only ring operations. Discard those synthetic rows
+        # only after every warmup/capture pass; the captured buffers remain in
+        # place and subsequent graph replays populate a runtime-only trace.
+        spec_worker = self._get_spec_worker()
+        reset_confidence_trace = getattr(spec_worker, "reset_confidence_trace",
+                                         None)
+        if reset_confidence_trace is not None:
+            reset_confidence_trace()
 
     def _warmup_dg_paged_mqa_logits_metadata(self) -> None:
         """Pre-compile DeepGEMM's `get_paged_mqa_logits_metadata` helper for
@@ -2169,6 +2179,19 @@ class PyTorchModelEngine(ModelEngine):
         # Determine which graph shapes to process.
         graphs_to_capture = self._get_graphs_to_capture(cuda_graph_batch_sizes,
                                                         spec_resource_manager)
+        confidence_capture = (isinstance(self.spec_config, DSparkDecodingConfig)
+                              and self.spec_config.is_confidence_budget_enabled)
+        expanded_graphs = []
+        for bs, draft_len in graphs_to_capture:
+            budgets = (self.spec_config.
+                       resolve_confidence_verifier_token_budget_candidates(bs)
+                       if confidence_capture and draft_len > 0 else ())
+            if budgets:
+                expanded_graphs.extend(
+                    (bs, draft_len, budget) for budget in budgets)
+            else:
+                expanded_graphs.append((bs, draft_len, None))
+        graphs_to_capture = expanded_graphs
         graphs_to_capture = sorted(graphs_to_capture, reverse=True)
         # Create CUDA graphs for short and long sequences separately for sparse attention.
         # self.max_seq_len is the global max sequence length. For Helix CP each
@@ -2272,10 +2295,23 @@ class PyTorchModelEngine(ModelEngine):
                 # in this pass uses the non-greedy key; populate's override
                 # below will keep it False on every subsequent iteration.
                 spec_metadata.is_all_greedy_sample = False
+            advanced_shapes = set()
             try:
-                for bs, draft_len in graphs_to_capture:
+                for bs, draft_len, confidence_budget in graphs_to_capture:
                     if bs > self.batch_size:
                         continue
+                    if force_non_greedy and confidence_capture:
+                        shape = (bs, draft_len)
+                        if shape in advanced_shapes:
+                            continue
+                        advanced_shapes.add(shape)
+                        # Confidence packing is greedy-only. Capture one static
+                        # advanced-sampling graph rather than duplicating it for
+                        # every greedy (G,V) tier.
+                        confidence_budget = None
+                    if confidence_capture:
+                        self.spec_config.set_confidence_capture_verifier_token_budget(
+                            confidence_budget)
 
                     for max_seq_len in max_seq_len_list:
                         warmup_request = self._create_cuda_graph_warmup_request(
@@ -2309,6 +2345,9 @@ class PyTorchModelEngine(ModelEngine):
                                          resource_manager=resource_manager)
                             torch.cuda.synchronize()
             finally:
+                if confidence_capture:
+                    self.spec_config.set_confidence_capture_verifier_token_budget(
+                        None)
                 if force_non_greedy and spec_metadata is not None:
                     spec_metadata._force_non_greedy_for_capture = False
                     # The base object is not the only holder of the flag: every
@@ -5086,7 +5125,7 @@ class PyTorchModelEngine(ModelEngine):
             self.runtime_draft_len)
         runtime_draft_token_buffer_width = runtime_tokens_per_gen_step - 1
 
-        # DSpark fixed-budget mode keeps the physical draft block at K while
+        # DSpark confidence-budget modes keep the physical draft block at K while
         # verifying a prefix-closed, per-request subset whose total query width
         # is the graph-static budget V. Host request state already carries the
         # retained lengths copied by SpecSampler, so metadata preparation needs
@@ -5094,8 +5133,8 @@ class PyTorchModelEngine(ModelEngine):
         confidence_fixed_budget_active = False
         confidence_verifier_token_budget = None
         confidence_input_draft_lens = None
-        if (isinstance(spec_config, DSparkDecodingConfig) and getattr(
-                spec_config, "is_fixed_budget_confidence_enabled", False)
+        if (isinstance(spec_config, DSparkDecodingConfig)
+                and getattr(spec_config, "is_confidence_budget_enabled", False)
                 and (next_draft_tokens_device is not None or
                      (self.is_warmup and bool(extend_requests)
                       and all(request.is_dummy for request in extend_requests)))
@@ -5110,24 +5149,38 @@ class PyTorchModelEngine(ModelEngine):
             resolver = getattr(spec_config,
                                "resolve_confidence_verifier_token_budget", None)
             if resolver is not None:
-                confidence_verifier_token_budget = resolver(
-                    len(extend_requests))
-            if confidence_verifier_token_budget is not None:
                 if self.is_warmup and all(request.is_dummy
                                           for request in extend_requests):
-                    retained_budget = (confidence_verifier_token_budget -
-                                       len(extend_requests))
-                    base, extra = divmod(retained_budget, len(extend_requests))
-                    confidence_input_draft_lens = [
-                        base + (idx < extra)
-                        for idx in range(len(extend_requests))
-                    ]
+                    confidence_verifier_token_budget = resolver(
+                        len(extend_requests))
+                    if confidence_verifier_token_budget is None:
+                        confidence_input_draft_lens = None
+                    else:
+                        retained_budget = (confidence_verifier_token_budget -
+                                           len(extend_requests))
+                        base, extra = divmod(retained_budget,
+                                             len(extend_requests))
+                        confidence_input_draft_lens = [
+                            base + (idx < extra)
+                            for idx in range(len(extend_requests))
+                        ]
                 else:
                     confidence_input_draft_lens = [
                         (request.py_draft_tokens_effective_len
                          if request.py_draft_tokens_effective_len is not None
                          else get_draft_token_length(request))
                         for request in extend_requests
+                    ]
+                    confidence_verifier_token_budget = resolver(
+                        len(extend_requests), confidence_input_draft_lens)
+            if confidence_verifier_token_budget is not None:
+                if confidence_input_draft_lens is None:
+                    retained_budget = (confidence_verifier_token_budget -
+                                       len(extend_requests))
+                    base, extra = divmod(retained_budget, len(extend_requests))
+                    confidence_input_draft_lens = [
+                        base + (idx < extra)
+                        for idx in range(len(extend_requests))
                     ]
                 confidence_fixed_budget_active = (
                     len(confidence_input_draft_lens) > 0
@@ -7252,7 +7305,7 @@ class PyTorchModelEngine(ModelEngine):
                 gen_requests = scheduled_requests.generation_requests
                 if (isinstance(spec_config, DSparkDecodingConfig) and getattr(
                         spec_config,
-                        "is_fixed_budget_confidence_enabled",
+                        "is_confidence_budget_enabled",
                         False,
                 ) and scheduled_requests.num_context_requests == 0
                         and len(gen_requests) == scheduled_requests.batch_size
@@ -7263,18 +7316,13 @@ class PyTorchModelEngine(ModelEngine):
                         and spec_metadata.is_all_greedy_sample
                         and not self.use_mrope and self.guided_decoder is None
                         and not self.enable_attention_dp):
-                    budget = spec_config.resolve_confidence_verifier_token_budget(
-                        len(gen_requests))
-                    if budget is not None and gen_requests:
+                    budget = None
+                    retained_lens = None
+                    if gen_requests:
                         if self.is_warmup and all(request.is_dummy
                                                   for request in gen_requests):
-                            retained_budget = budget - len(gen_requests)
-                            base, extra = divmod(retained_budget,
-                                                 len(gen_requests))
-                            retained_lens = [
-                                base + (idx < extra)
-                                for idx in range(len(gen_requests))
-                            ]
+                            budget = spec_config.resolve_confidence_verifier_token_budget(
+                                len(gen_requests))
                         else:
                             retained_lens = [
                                 (request.py_draft_tokens_effective_len
@@ -7282,6 +7330,17 @@ class PyTorchModelEngine(ModelEngine):
                                  is not None else
                                  get_draft_token_length(request))
                                 for request in gen_requests
+                            ]
+                            budget = spec_config.resolve_confidence_verifier_token_budget(
+                                len(gen_requests), retained_lens)
+                    if budget is not None and gen_requests:
+                        if retained_lens is None:
+                            retained_budget = budget - len(gen_requests)
+                            base, extra = divmod(retained_budget,
+                                                 len(gen_requests))
+                            retained_lens = [
+                                base + (idx < extra)
+                                for idx in range(len(gen_requests))
                             ]
                         if (max(retained_lens) <= self.max_draft_len
                                 and len(retained_lens) + sum(retained_lens)

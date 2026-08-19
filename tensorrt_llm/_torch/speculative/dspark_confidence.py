@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""GPU-only planning for fixed-budget DSpark verification."""
+"""GPU-only planning for fixed- and dynamic-budget DSpark verification."""
 
 import json
 from pathlib import Path
@@ -21,12 +21,21 @@ from typing import NamedTuple
 import torch
 
 __all__ = [
+    "DynamicBudgetPlan",
     "FixedBudgetPlan",
     "apply_sts",
     "load_sts_temperatures",
+    "plan_dynamic_verifier_budget",
     "plan_fixed_verifier_budget",
     "verify_packed_greedy",
 ]
+
+
+class DynamicBudgetPlan(NamedTuple):
+    """Fixed-shape result of selecting one captured verifier-token tier."""
+
+    retained_lens: torch.Tensor
+    verifier_token_budget: torch.Tensor
 
 
 class FixedBudgetPlan(NamedTuple):
@@ -85,6 +94,100 @@ def apply_sts(
     if temperatures.ndim != 1 or temperatures.numel() != logits.shape[-1]:
         raise ValueError("temperatures must be a vector matching the confidence-logit width")
     return torch.sigmoid(logits / temperatures.to(device=logits.device, dtype=torch.float32))
+
+
+def plan_dynamic_verifier_budget(
+    confidence_logits: torch.Tensor,
+    candidate_budgets: torch.Tensor,
+    candidate_step_times_ms: torch.Tensor,
+    minimum_predicted_gain: float = 0.01,
+    temperatures: torch.Tensor | None = None,
+) -> DynamicBudgetPlan:
+    """Select and allocate one captured verifier-token budget on device.
+
+    The small candidate ladder and its measured ``T(G,V)`` values are static
+    tensors.  Confidence determines the expected accepted-token yield of each
+    tier, and the selected tier maximizes predicted yield divided by measured
+    step time.  The full-K tier must be the final (largest) candidate and is
+    retained unless a compact tier clears ``minimum_predicted_gain``.
+
+    All output shapes are independent of the selected tier.  This lets the
+    planner run inside the drafter CUDA graph; the existing asynchronous
+    ``next_draft_lens`` copy carries both the per-request allocation and its
+    total to the host, where the following target step selects the matching
+    pre-captured ``(G,V)`` graph.  No confidence snapshot or additional D2H
+    transfer is introduced.
+    """
+    if confidence_logits.ndim != 2:
+        raise ValueError("confidence_logits must have shape [num_requests, max_draft_len]")
+    num_requests, max_draft_len = confidence_logits.shape
+    if num_requests == 0 or max_draft_len == 0:
+        raise ValueError("confidence_logits must have non-zero dimensions")
+    if candidate_budgets.ndim != 1 or candidate_step_times_ms.ndim != 1:
+        raise ValueError("candidate budgets and step times must be vectors")
+    if candidate_budgets.numel() == 0 or (
+        candidate_budgets.numel() != candidate_step_times_ms.numel()
+    ):
+        raise ValueError("candidate budgets and step times must have the same non-zero length")
+    if minimum_predicted_gain < 0.0:
+        raise ValueError("minimum_predicted_gain must be non-negative")
+
+    dense_capacity = num_requests * (max_draft_len + 1)
+    if candidate_budgets.device != confidence_logits.device:
+        raise ValueError("candidate budgets must be on the confidence-logit device")
+    if candidate_step_times_ms.device != confidence_logits.device:
+        raise ValueError("candidate step times must be on the confidence-logit device")
+    # Candidate values are configuration constants validated before they are
+    # copied to the GPU.  Shape/range checks here intentionally avoid reading
+    # their contents back to the host during capture.
+    if candidate_budgets.numel() > dense_capacity:
+        raise ValueError("candidate ladder cannot exceed dense verifier capacity")
+
+    conditional = apply_sts(confidence_logits, temperatures)
+    survival = torch.cumprod(conditional, dim=1)
+    position_major = survival.transpose(0, 1).contiguous().view(-1)
+    selection_order = torch.argsort(position_major, descending=True, stable=True)
+    ordered_survival = position_major[selection_order]
+    cumulative_yield = torch.cat(
+        (
+            torch.zeros(1, dtype=torch.float32, device=confidence_logits.device),
+            torch.cumsum(ordered_survival, dim=0, dtype=torch.float32),
+        )
+    )
+
+    retained_candidates = candidate_budgets.to(torch.long) - num_requests
+    expected_yield = float(num_requests) + torch.gather(cumulative_yield, 0, retained_candidates)
+    scores = expected_yield / candidate_step_times_ms.to(torch.float32)
+
+    # Prefer the larger tier on an exact score tie, matching the offline
+    # planner and making the conservative choice deterministic.
+    reverse_best = torch.argmax(torch.flip(scores, dims=(0,)))
+    best_index = scores.numel() - 1 - reverse_best
+    full_index = torch.full_like(best_index, scores.numel() - 1)
+    best_score = torch.gather(scores, 0, best_index.reshape(1)).squeeze(0)
+    full_score = scores[-1]
+    clears_guard = best_score >= full_score * (1.0 + float(minimum_predicted_gain))
+    selected_index = torch.where(clears_guard, best_index, full_index)
+    selected_retained = torch.gather(retained_candidates, 0, selected_index.reshape(1)).squeeze(0)
+
+    # Convert the global stable rank to a prefix-closed per-request length.
+    # The comparison against a device scalar has a fixed output shape even
+    # though the selected V changes between graph replays.
+    selection_ranks = torch.empty_like(selection_order)
+    selection_ranks.scatter_(
+        0,
+        selection_order,
+        torch.arange(selection_order.numel(), device=confidence_logits.device),
+    )
+    selected_position_major = selection_ranks < selected_retained
+    selected_drafts = selected_position_major.view(max_draft_len, num_requests).transpose(0, 1)
+    retained_lens = selected_drafts.sum(dim=1, dtype=torch.int32)
+    return DynamicBudgetPlan(
+        retained_lens=retained_lens,
+        verifier_token_budget=torch.gather(candidate_budgets, 0, selected_index.reshape(1)).squeeze(
+            0
+        ),
+    )
 
 
 def plan_fixed_verifier_budget(

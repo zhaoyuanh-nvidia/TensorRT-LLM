@@ -2852,14 +2852,16 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         "read from the draft model config (dspark_markov_head_type), "
         "defaulting to \"vanilla\".")
 
-    confidence_mode: Literal["disabled", "fixed_budget"] = Field(
+    confidence_mode: Literal["disabled", "fixed_budget", "dynamic_budget"] = Field(
         default="disabled",
         description=
         "Confidence-based DSpark scheduling mode. \"disabled\" preserves "
         "static K-token verification. \"fixed_budget\" keeps the physical "
         "draft width at max_draft_len, ranks draft prefixes with the confidence "
         "head, and packs target verification into a fixed token budget selected "
-        "by confidence_verifier_token_budget_schedule.")
+        "by confidence_verifier_token_budget_schedule. \"dynamic_budget\" "
+        "selects one pre-captured verifier-token tier per iteration using the "
+        "confidence head and a measured SPS cost table.")
 
     confidence_verifier_token_budget_schedule: Optional[dict[int, int]] = Field(
         default=None,
@@ -2869,6 +2871,22 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         "token per generation request, so each entry must satisfy "
         "G <= V <= G * (max_draft_len + 1). Only exact configured graph batch "
         "sizes use fixed-budget confidence scheduling.")
+
+    confidence_verifier_token_budget_tiers: Optional[dict[int, List[int]]] = Field(
+        default=None,
+        description=
+        "Map from CUDA-graph batch size G to the exact verifier-token budgets "
+        "captured for dynamic confidence scheduling. Each ladder includes one "
+        "mandatory anchor per request and is normalized to include the full-K "
+        "fallback G * (max_draft_len + 1).")
+
+    confidence_sps_cost_table_path: Optional[str] = Field(
+        default=None,
+        description=
+        "Measured SPS step-cost JSON used by dynamic-budget confidence "
+        "scheduling. Token counts include the per-request anchor tokens. The "
+        "table is evaluated once at initialization for every configured (G,V) "
+        "tier; serving performs no interpolation or file access.")
 
     confidence_sts_path: Optional[str] = Field(
         default=None,
@@ -2882,57 +2900,156 @@ class DSparkDecodingConfig(DecodingBaseConfig):
     decoding_type: Literal["DSpark"] = Field(default="DSpark")
 
     @model_validator(mode="after")
-    def validate_confidence_fixed_budget(self):
+    def validate_confidence_budget(self):
         schedule = self.confidence_verifier_token_budget_schedule
+        tiers = self.confidence_verifier_token_budget_tiers
         if self.confidence_mode == "disabled":
             if schedule is not None:
                 raise ValueError(
                     "DSpark confidence_verifier_token_budget_schedule requires "
                     "confidence_mode='fixed_budget'")
+            if tiers is not None:
+                raise ValueError(
+                    "DSpark confidence_verifier_token_budget_tiers requires "
+                    "confidence_mode='dynamic_budget'")
+            if self.confidence_sps_cost_table_path is not None:
+                raise ValueError(
+                    "DSpark confidence_sps_cost_table_path requires "
+                    "confidence_mode='dynamic_budget'")
             if self.confidence_sts_path is not None:
-                raise ValueError("DSpark confidence_sts_path requires "
-                                 "confidence_mode='fixed_budget'")
+                raise ValueError(
+                    "DSpark confidence_sts_path requires a confidence budget mode"
+                )
             return self
 
-        if not schedule:
-            raise ValueError(
-                "DSpark confidence_mode='fixed_budget' requires a non-empty "
-                "confidence_verifier_token_budget_schedule")
         if not self.max_draft_len:
-            raise ValueError("DSpark confidence_mode='fixed_budget' requires "
-                             "max_draft_len > 0")
+            raise ValueError(
+                "DSpark confidence scheduling requires max_draft_len > 0")
 
-        for graph_batch_size, verifier_tokens in schedule.items():
+        if self.confidence_mode == "fixed_budget":
+            if not schedule:
+                raise ValueError(
+                    "DSpark confidence_mode='fixed_budget' requires a non-empty "
+                    "confidence_verifier_token_budget_schedule")
+            if tiers is not None or self.confidence_sps_cost_table_path is not None:
+                raise ValueError(
+                    "DSpark dynamic confidence tiers/cost table require "
+                    "confidence_mode='dynamic_budget'")
+            normalized: dict[int, tuple[int, ...]] = {
+                int(graph_batch_size): (int(verifier_tokens), )
+                for graph_batch_size, verifier_tokens in schedule.items()
+            }
+        else:
+            if schedule is not None:
+                raise ValueError(
+                    "DSpark confidence_verifier_token_budget_schedule requires "
+                    "confidence_mode='fixed_budget'")
+            if not tiers:
+                raise ValueError(
+                    "DSpark confidence_mode='dynamic_budget' requires non-empty "
+                    "confidence_verifier_token_budget_tiers")
+            if self.confidence_sps_cost_table_path is None:
+                raise ValueError(
+                    "DSpark confidence_mode='dynamic_budget' requires "
+                    "confidence_sps_cost_table_path")
+            normalized = {
+                int(graph_batch_size):
+                tuple(sorted({int(value)
+                              for value in values}))
+                for graph_batch_size, values in tiers.items()
+            }
+
+        normalized_tiers: dict[int, List[int]] = {}
+        for graph_batch_size, verifier_tokens_values in normalized.items():
             if graph_batch_size < 1:
                 raise ValueError(
                     "DSpark confidence verifier schedule graph batch sizes must "
                     f"be >= 1; got {graph_batch_size}")
             minimum_tokens = graph_batch_size
             maximum_tokens = graph_batch_size * (self.max_draft_len + 1)
-            if not minimum_tokens <= verifier_tokens <= maximum_tokens:
+            if not verifier_tokens_values:
                 raise ValueError(
-                    "DSpark confidence verifier token budget must satisfy "
-                    "G <= V <= G * (max_draft_len + 1); got "
-                    f"G={graph_batch_size}, V={verifier_tokens}, "
-                    f"max_draft_len={self.max_draft_len}")
+                    "DSpark confidence verifier tier ladders must be non-empty")
+            for verifier_tokens in verifier_tokens_values:
+                if not minimum_tokens <= verifier_tokens <= maximum_tokens:
+                    raise ValueError(
+                        "DSpark confidence verifier token budget must satisfy "
+                        "G <= V <= G * (max_draft_len + 1); got "
+                        f"G={graph_batch_size}, V={verifier_tokens}, "
+                        f"max_draft_len={self.max_draft_len}")
+            normalized_tiers[graph_batch_size] = sorted(
+                {*verifier_tokens_values, maximum_tokens})
 
-        self.confidence_verifier_token_budget_schedule = dict(
-            sorted(schedule.items()))
+        if self.confidence_mode == "fixed_budget":
+            self.confidence_verifier_token_budget_schedule = {
+                graph_batch_size: values[0]
+                for graph_batch_size, values in sorted(normalized_tiers.items())
+            }
+        else:
+            self.confidence_verifier_token_budget_tiers = dict(
+                sorted(normalized_tiers.items()))
         return self
+
+    _confidence_capture_verifier_token_budget: Optional[int] = PrivateAttr(
+        default=None)
 
     @property
     def is_fixed_budget_confidence_enabled(self) -> bool:
         """Whether DSpark confidence-based fixed-budget packing is enabled."""
         return self.confidence_mode == "fixed_budget"
 
+    @property
+    def is_dynamic_budget_confidence_enabled(self) -> bool:
+        """Whether DSpark selects a captured verifier budget per iteration."""
+        return self.confidence_mode == "dynamic_budget"
+
+    @property
+    def is_confidence_budget_enabled(self) -> bool:
+        """Whether either compact verifier-budget mode is enabled."""
+        return self.confidence_mode in ("fixed_budget", "dynamic_budget")
+
+    def resolve_confidence_verifier_token_budget_candidates(
+            self, graph_batch_size: int) -> tuple[int, ...]:
+        """Return every exact V captured for one graph batch size."""
+        if not self.is_confidence_budget_enabled:
+            return ()
+        if self.is_fixed_budget_confidence_enabled:
+            value = self.confidence_verifier_token_budget_schedule.get(
+                graph_batch_size
+            ) if self.confidence_verifier_token_budget_schedule else None
+            return () if value is None else (value, )
+        values = self.confidence_verifier_token_budget_tiers.get(
+            graph_batch_size
+        ) if self.confidence_verifier_token_budget_tiers else None
+        return () if values is None else tuple(values)
+
+    def set_confidence_capture_verifier_token_budget(
+            self, verifier_token_budget: Optional[int]) -> None:
+        """Set the startup-only V whose synthetic graph is being captured."""
+        if verifier_token_budget is not None:
+            verifier_token_budget = int(verifier_token_budget)
+        self._confidence_capture_verifier_token_budget = verifier_token_budget
+
     def resolve_confidence_verifier_token_budget(
-            self, graph_batch_size: int) -> Optional[int]:
-        """Return the configured verifier capacity for an exact graph size."""
-        if (not self.is_fixed_budget_confidence_enabled
-                or self.confidence_verifier_token_budget_schedule is None):
+        self,
+        graph_batch_size: int,
+        effective_draft_lens: Optional[List[int]] = None,
+    ) -> Optional[int]:
+        """Resolve V for capture, fixed mode, or host-visible dynamic lengths."""
+        if not self.is_confidence_budget_enabled:
             return None
-        return self.confidence_verifier_token_budget_schedule.get(
+        if self._confidence_capture_verifier_token_budget is not None:
+            return self._confidence_capture_verifier_token_budget
+        candidates = self.resolve_confidence_verifier_token_budget_candidates(
             graph_batch_size)
+        if self.is_fixed_budget_confidence_enabled:
+            return candidates[0] if candidates else None
+        if effective_draft_lens is None or len(
+                effective_draft_lens) != graph_batch_size:
+            return None
+        budget = graph_batch_size + sum(
+            int(value) for value in effective_draft_lens)
+        return budget if budget in candidates else None
 
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):
@@ -5968,14 +6085,19 @@ class TorchLlmArgs(BaseLlmArgs):
                     f"draft_len_schedule keys added to cuda_graph_config.batch_sizes, current batch_sizes: {self.cuda_graph_config.batch_sizes}"
                 )
 
-            if (isinstance(self.speculative_config, DSparkDecodingConfig) and
-                    self.speculative_config.confidence_mode == "fixed_budget"):
+            if (isinstance(self.speculative_config, DSparkDecodingConfig)
+                    and self.speculative_config.is_confidence_budget_enabled):
                 if self.disable_overlap_scheduler:
                     raise ValueError(
-                        "DSpark confidence_mode='fixed_budget' requires the "
+                        "DSpark confidence budget scheduling requires the "
                         "overlap scheduler")
                 if self.cuda_graph_config is not None:
-                    confidence_schedule = self.speculative_config.confidence_verifier_token_budget_schedule
+                    confidence_schedule = (
+                        self.speculative_config.
+                        confidence_verifier_token_budget_schedule if self.
+                        speculative_config.is_fixed_budget_confidence_enabled
+                        else self.speculative_config.
+                        confidence_verifier_token_budget_tiers)
                     assert confidence_schedule is not None
                     self.cuda_graph_config.batch_sizes = CudaGraphConfig._merge_schedule_keys(
                         self.cuda_graph_config.batch_sizes, confidence_schedule)

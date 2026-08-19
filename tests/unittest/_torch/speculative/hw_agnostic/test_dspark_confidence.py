@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests for fixed-budget DSpark confidence planning."""
+"""Tests for fixed- and dynamic-budget DSpark confidence planning."""
 
 import json
 from dataclasses import dataclass
@@ -24,6 +24,7 @@ import torch
 from tensorrt_llm._torch.speculative.dspark_confidence import (
     apply_sts,
     load_sts_temperatures,
+    plan_dynamic_verifier_budget,
     plan_fixed_verifier_budget,
     verify_packed_greedy,
 )
@@ -108,6 +109,38 @@ def _assert_matches_reference(confidence_logits: torch.Tensor, verifier_token_bu
         actual.packed_local_positions,
         torch.remainder(actual.packed_to_dense, dense_width),
     )
+
+
+@pytest.mark.parametrize(
+    ("logit", "expected_budget"),
+    [(-20.0, 2), (20.0, 6)],
+)
+def test_dynamic_budget_selects_measured_goodput_tier(
+    logit: float,
+    expected_budget: int,
+) -> None:
+    logits = torch.full((2, 2), logit, dtype=torch.float32)
+    budgets = torch.tensor([2, 4, 6], dtype=torch.int64)
+    step_times = torch.tensor([1.0, 1.2, 1.4], dtype=torch.float32)
+
+    plan = plan_dynamic_verifier_budget(logits, budgets, step_times)
+
+    assert int(plan.verifier_token_budget) == expected_budget
+    assert int(plan.retained_lens.sum()) == expected_budget - logits.shape[0]
+
+
+def test_dynamic_budget_guard_falls_back_to_full_k() -> None:
+    logits = torch.zeros((2, 2), dtype=torch.float32)
+    budgets = torch.tensor([2, 6], dtype=torch.int64)
+    step_times = torch.tensor([1.0, 1.8], dtype=torch.float32)
+
+    unguarded = plan_dynamic_verifier_budget(
+        logits, budgets, step_times, minimum_predicted_gain=0.01
+    )
+    guarded = plan_dynamic_verifier_budget(logits, budgets, step_times, minimum_predicted_gain=0.05)
+
+    assert int(unguarded.verifier_token_budget) == 2
+    assert int(guarded.verifier_token_budget) == 6
 
 
 @pytest.mark.parametrize("verifier_token_budget", [4, 5, 11, 24])
@@ -456,6 +489,35 @@ def test_cuda_graph_capture_and_replay() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_dynamic_budget_changes_tier_during_cuda_graph_replay() -> None:
+    static_logits = torch.full((4, 5), -20.0, device="cuda")
+    budgets = torch.tensor([8, 16, 24], dtype=torch.int64, device="cuda")
+    step_times = torch.tensor([1.0, 1.2, 1.4], dtype=torch.float32, device="cuda")
+
+    warmup_stream = torch.cuda.Stream()
+    warmup_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup_stream):
+        for _ in range(3):
+            plan_dynamic_verifier_budget(static_logits, budgets, step_times)
+    torch.cuda.current_stream().wait_stream(warmup_stream)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured_plan = plan_dynamic_verifier_budget(static_logits, budgets, step_times)
+
+    graph.replay()
+    torch.cuda.synchronize()
+    assert int(captured_plan.verifier_token_budget) == 8
+    assert int(captured_plan.retained_lens.sum()) == 4
+
+    static_logits.fill_(20.0)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert int(captured_plan.verifier_token_budget) == 24
+    assert int(captured_plan.retained_lens.sum()) == 20
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
 def test_confidence_trace_ring_captures_dynamic_replay_rows(tmp_path) -> None:
     max_draft_len = 3
     slots = torch.tensor([0, 1], dtype=torch.long, device="cuda")
@@ -525,3 +587,69 @@ def test_confidence_trace_ring_captures_dynamic_replay_rows(tmp_path) -> None:
     )
     assert payload["graph_batch_size"].tolist() == [2, 2, 2, 2]
     assert payload["step_id"].tolist() == [0, 0, 1, 1]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_confidence_trace_ring_reset_discards_capture_rows(tmp_path) -> None:
+    max_draft_len = 3
+    slots = torch.tensor([0, 1], dtype=torch.long, device="cuda")
+    ring = ConfidenceTraceRing(
+        path_stem=str(tmp_path / "trace-reset"),
+        rank=0,
+        num_slots=3,
+        max_draft_len=max_draft_len,
+        scratch_slot=2,
+        capacity=16,
+    )
+    static_logits = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], device="cuda")
+    static_accepted = torch.tensor([1, 1], dtype=torch.int32, device="cuda")
+    for _ in range(3):
+        ring.record_and_update(
+            slots=slots,
+            confidence_logits=static_logits,
+            num_accepted_tokens=static_accepted,
+        )
+    ring.reset()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        ring.record_and_update(
+            slots=slots,
+            confidence_logits=static_logits,
+            num_accepted_tokens=static_accepted,
+        )
+
+    ring.reset()
+    graph.replay()
+    static_accepted.copy_(torch.tensor([4, 2], dtype=torch.int32, device="cuda"))
+    graph.replay()
+    torch.cuda.synchronize()
+    ring.flush()
+
+    payload = torch.load(ring.path, map_location="cpu", weights_only=True)
+    torch.testing.assert_close(payload["logits"], static_logits.cpu())
+    torch.testing.assert_close(
+        payload["prefix_mask"],
+        torch.tensor([[1, 1, 1], [1, 0, 0]], dtype=torch.float32),
+    )
+    assert payload["graph_batch_size"].tolist() == [2, 2]
+    assert payload["step_id"].tolist() == [0, 0]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_confidence_trace_ring_resets_inference_tensors(tmp_path) -> None:
+    with torch.inference_mode():
+        ring = ConfidenceTraceRing(
+            path_stem=str(tmp_path / "inference-trace-reset"),
+            rank=0,
+            num_slots=3,
+            max_draft_len=3,
+            scratch_slot=2,
+            capacity=16,
+        )
+
+    ring.reset()
+    ring._flushed = True
+    assert int(ring._counter) == 0
+    assert int(ring._event_counter) == 0
+    assert not bool(ring._slot_valid.any())

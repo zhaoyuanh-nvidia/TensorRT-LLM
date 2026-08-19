@@ -371,7 +371,7 @@ class CUDAGraphRunner:
             verifier_num_tokens = 0
             if (not self.config.is_draft_model
                     and isinstance(self.spec_config, DSparkDecodingConfig)
-                    and self.spec_config.is_fixed_budget_confidence_enabled
+                    and self.spec_config.is_confidence_budget_enabled
                     and is_all_greedy_sample):
                 configured_budget = self.spec_config.resolve_confidence_verifier_token_budget(
                     batch_size)
@@ -425,6 +425,9 @@ class CUDAGraphRunner:
                     actual_budget = sum(
                         1 + effective_len
                         for effective_len in effective_draft_lens)
+                    if configured_budget is None:
+                        configured_budget = self.spec_config.resolve_confidence_verifier_token_budget(
+                            batch_size, effective_draft_lens)
                     if (configured_budget is None
                             or actual_budget != configured_budget):
                         return None

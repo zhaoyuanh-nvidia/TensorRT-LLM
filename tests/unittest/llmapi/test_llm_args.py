@@ -505,7 +505,11 @@ def test_dspark_confidence_fixed_budget_defaults_disabled():
 
     assert spec_cfg.confidence_mode == "disabled"
     assert not spec_cfg.is_fixed_budget_confidence_enabled
+    assert not spec_cfg.is_dynamic_budget_confidence_enabled
+    assert not spec_cfg.is_confidence_budget_enabled
     assert spec_cfg.confidence_verifier_token_budget_schedule is None
+    assert spec_cfg.confidence_verifier_token_budget_tiers is None
+    assert spec_cfg.confidence_sps_cost_table_path is None
     assert spec_cfg.confidence_sts_path is None
     assert spec_cfg.resolve_confidence_verifier_token_budget(256) is None
 
@@ -532,9 +536,9 @@ def test_dspark_confidence_schedule_requires_fixed_budget_mode():
 
 
 @pytest.mark.cpu_only
-def test_dspark_confidence_sts_requires_fixed_budget_mode():
+def test_dspark_confidence_sts_requires_budget_mode():
     with pytest.raises(ValidationError,
-                       match="requires confidence_mode='fixed_budget'"):
+                       match="requires a confidence budget mode"):
         DSparkDecodingConfig(
             max_draft_len=5,
             speculative_model="/tmp/dummy_model",
@@ -580,6 +584,53 @@ def test_dspark_confidence_fixed_budget_schedule_is_sorted_and_exact():
     assert spec_cfg.resolve_confidence_verifier_token_budget(256) == 1152
     assert spec_cfg.resolve_confidence_verifier_token_budget(192) is None
     assert spec_cfg.confidence_sts_path == "/tmp/sts.json"
+
+
+@pytest.mark.cpu_only
+def test_dspark_confidence_dynamic_budget_requires_tiers_and_cost_table():
+    with pytest.raises(
+            ValidationError,
+            match="requires non-empty confidence_verifier_token_budget_tiers"):
+        DSparkDecodingConfig(max_draft_len=5,
+                             speculative_model="/tmp/dummy_model",
+                             confidence_mode="dynamic_budget",
+                             confidence_sps_cost_table_path="/tmp/sps.json")
+    with pytest.raises(ValidationError,
+                       match="requires confidence_sps_cost_table_path"):
+        DSparkDecodingConfig(
+            max_draft_len=5,
+            speculative_model="/tmp/dummy_model",
+            confidence_mode="dynamic_budget",
+            confidence_verifier_token_budget_tiers={4: [8, 16]},
+        )
+
+
+@pytest.mark.cpu_only
+def test_dspark_confidence_dynamic_budget_resolves_captured_tiers():
+    spec_cfg = DSparkDecodingConfig(
+        max_draft_len=5,
+        speculative_model="/tmp/dummy_model",
+        confidence_mode="dynamic_budget",
+        confidence_verifier_token_budget_tiers={4: [16, 8, 8]},
+        confidence_sps_cost_table_path="/tmp/sps.json",
+        confidence_sts_path="/tmp/sts.json",
+    )
+
+    assert spec_cfg.is_dynamic_budget_confidence_enabled
+    assert spec_cfg.is_confidence_budget_enabled
+    assert not spec_cfg.is_fixed_budget_confidence_enabled
+    assert spec_cfg.resolve_confidence_verifier_token_budget_candidates(4) == (
+        8, 16, 24)
+    assert spec_cfg.resolve_confidence_verifier_token_budget(4) is None
+    assert spec_cfg.resolve_confidence_verifier_token_budget(4,
+                                                             [1, 1, 1, 1]) == 8
+    assert spec_cfg.resolve_confidence_verifier_token_budget(
+        4, [2, 2, 2, 2]) is None
+
+    spec_cfg.set_confidence_capture_verifier_token_budget(16)
+    assert spec_cfg.resolve_confidence_verifier_token_budget(4) == 16
+    spec_cfg.set_confidence_capture_verifier_token_budget(None)
+    assert spec_cfg.resolve_confidence_verifier_token_budget(4) is None
 
 
 @pytest.mark.cpu_only

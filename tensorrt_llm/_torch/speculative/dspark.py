@@ -33,9 +33,11 @@ from ..distributed import AllReduce, AllReduceStrategy
 from ..pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
 from .dspark_confidence import (
     load_sts_temperatures,
+    plan_dynamic_verifier_budget,
     plan_fixed_verifier_budget,
     verify_packed_greedy,
 )
+from .dspark_planner import load_sps_cost_table
 from .dspark_trace import ConfidenceTraceRing, confidence_trace_path_from_env
 from .interface import SpecMetadata, SpecWorkerBase
 
@@ -240,7 +242,7 @@ class DSparkWorker(SpecWorkerBase):
                 dtype=torch.float32,
             )
             if (
-                getattr(spec_config, "is_fixed_budget_confidence_enabled", False)
+                getattr(spec_config, "is_confidence_budget_enabled", False)
                 and mapping.tp_size > 1
                 and not mapping.enable_attention_dp
             )
@@ -248,6 +250,7 @@ class DSparkWorker(SpecWorkerBase):
         )
         self._confidence_recorder: Optional[ConfidenceTraceRing] = None
         self._confidence_sts_temperatures: Optional[torch.Tensor] = None
+        self._confidence_dynamic_tables: dict[int, tuple[torch.Tensor, torch.Tensor, float]] = {}
 
         # Per-slot rolling captured-context KV windows, built lazily on the
         # first forward (fixed-size for slot-indexed reads/writes).
@@ -285,6 +288,11 @@ class DSparkWorker(SpecWorkerBase):
     def max_draft_len(self) -> int:
         return self.spec_config.max_draft_len
 
+    def reset_confidence_trace(self) -> None:
+        """Start trace collection after model warmup and CUDA-graph capture."""
+        if self._confidence_recorder is not None:
+            self._confidence_recorder.reset()
+
     def _lazy_init(self, draft_model, spec_metadata) -> None:
         block_size = int(draft_model.block_size)
         if block_size != self.max_draft_len:
@@ -302,6 +310,30 @@ class DSparkWorker(SpecWorkerBase):
                 device="cuda"
             )
             logger.info(f"DSpark: loaded per-position STS calibration from {sts_path}")
+        if getattr(self.spec_config, "is_dynamic_budget_confidence_enabled", False):
+            cost_path = self.spec_config.confidence_sps_cost_table_path
+            cost_table, _ = load_sps_cost_table(cost_path)
+            tiers = self.spec_config.confidence_verifier_token_budget_tiers or {}
+            for graph_batch_size, candidate_budgets in tiers.items():
+                budgets = torch.tensor(candidate_budgets, dtype=torch.int64, device="cuda")
+                step_times = torch.tensor(
+                    [
+                        cost_table.step_time(verifier_tokens, graph_batch_size)
+                        for verifier_tokens in candidate_budgets
+                    ],
+                    dtype=torch.float32,
+                    device="cuda",
+                )
+                self._confidence_dynamic_tables[int(graph_batch_size)] = (
+                    budgets,
+                    step_times,
+                    float(cost_table.minimum_predicted_gain),
+                )
+            logger.info(
+                "DSpark: loaded dynamic verifier tiers and measured SPS costs "
+                f"from {cost_path}: "
+                f"{self.spec_config.confidence_verifier_token_budget_tiers}"
+            )
         max_batch = spec_metadata.max_num_requests
         num_stages = draft_model.num_stages
         self._win = int(draft_model._attn_params["window_size"])
@@ -338,7 +370,15 @@ class DSparkWorker(SpecWorkerBase):
 
         trace_path = confidence_trace_path_from_env()
         if trace_path and self.mapping.tp_rank == 0:
-            schedule = self.spec_config.confidence_verifier_token_budget_schedule or {}
+            if getattr(self.spec_config, "is_dynamic_budget_confidence_enabled", False):
+                schedule = {
+                    graph_batch_size: min(candidate_budgets)
+                    for graph_batch_size, candidate_budgets in (
+                        self.spec_config.confidence_verifier_token_budget_tiers or {}
+                    ).items()
+                }
+            else:
+                schedule = self.spec_config.confidence_verifier_token_budget_schedule or {}
             trimmed = {
                 graph_batch_size: budget
                 for graph_batch_size, budget in schedule.items()
@@ -508,25 +548,25 @@ class DSparkWorker(SpecWorkerBase):
         # Surface the per-position corrected block logits ([num_gens, K, vocab])
         # and let SpecWorkerBase.sample_draft_tokens do the (greedy or rejection)
         # sampling + TP gather + draft_probs scatter, rather than argmaxing here.
-        verifier_token_budget = (
-            self.spec_config.resolve_confidence_verifier_token_budget(num_gens)
+        confidence_budget_active = (
+            bool(self.spec_config.resolve_confidence_verifier_token_budget_candidates(num_gens))
             if (
                 num_contexts == 0
                 and spec_metadata.is_all_greedy_sample
                 and getattr(
                     self.spec_config,
-                    "is_fixed_budget_confidence_enabled",
+                    "is_confidence_budget_enabled",
                     False,
                 )
             )
-            else None
+            else False
         )
         if (
-            verifier_token_budget is not None
+            confidence_budget_active
             and draft_model.dspark_model.mtp_layers[-1].confidence_head is None
         ):
             raise RuntimeError(
-                "DSpark fixed-budget confidence scheduling requires a loaded confidence head"
+                "DSpark confidence budget scheduling requires a loaded confidence head"
             )
         draft_outputs = draft_model.forward_batched(
             main_hidden,
@@ -537,10 +577,10 @@ class DSparkWorker(SpecWorkerBase):
             temperature=0.0,
             confidence_threshold=0.0,
             return_logits=True,
-            return_confidence_logits=verifier_token_budget is not None,
+            return_confidence_logits=confidence_budget_active,
             all_rank_num_tokens=all_rank_num_tokens,
         )
-        if verifier_token_budget is not None:
+        if confidence_budget_active:
             _toks, _num_proposed, block_logits, confidence_logits = draft_outputs
         else:
             _toks, _num_proposed, block_logits = draft_outputs
@@ -783,13 +823,13 @@ class DSparkWorker(SpecWorkerBase):
         if (
             num_contexts == 0
             and confidence_logits is not None
-            and getattr(self.spec_config, "is_fixed_budget_confidence_enabled", False)
+            and getattr(self.spec_config, "is_confidence_budget_enabled", False)
             and spec_metadata.is_all_greedy_sample
         ):
-            verifier_token_budget = self.spec_config.resolve_confidence_verifier_token_budget(
+            candidates = self.spec_config.resolve_confidence_verifier_token_budget_candidates(
                 num_gens
             )
-            if verifier_token_budget is not None:
+            if candidates:
                 if self._confidence_all_reduce is not None:
                     confidence_contribution = (
                         confidence_logits.float()
@@ -808,11 +848,27 @@ class DSparkWorker(SpecWorkerBase):
                         confidence_logits=confidence_logits,
                         num_accepted_tokens=num_accepted_tokens[num_contexts:batch_size],
                     )
-                confidence_plan = plan_fixed_verifier_budget(
-                    confidence_logits,
-                    verifier_token_budget,
-                    temperatures=self._confidence_sts_temperatures,
-                )
+                if getattr(self.spec_config, "is_dynamic_budget_confidence_enabled", False):
+                    dynamic_table = self._confidence_dynamic_tables.get(num_gens)
+                    if dynamic_table is None:
+                        raise RuntimeError(
+                            "DSpark dynamic verifier budget has no measured "
+                            f"cost table for graph batch size {num_gens}"
+                        )
+                    candidate_budgets, candidate_step_times, minimum_gain = dynamic_table
+                    confidence_plan = plan_dynamic_verifier_budget(
+                        confidence_logits,
+                        candidate_budgets,
+                        candidate_step_times,
+                        minimum_predicted_gain=minimum_gain,
+                        temperatures=self._confidence_sts_temperatures,
+                    )
+                else:
+                    confidence_plan = plan_fixed_verifier_budget(
+                        confidence_logits,
+                        candidates[0],
+                        temperatures=self._confidence_sts_temperatures,
+                    )
                 next_draft_lens = confidence_plan.retained_lens
 
         next_new_tokens = self._prepare_next_new_tokens(

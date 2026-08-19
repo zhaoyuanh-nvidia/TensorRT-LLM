@@ -403,7 +403,7 @@ def test_forward_mixed_batch_routes_through_base_entries(monkeypatch):
 
     # The gen-block helper now returns the corrected block logits [num_gens,K,vocab].
     gen_logits = torch.randn(num_gens, K, vocab, device="cuda")
-    monkeypatch.setattr(worker, "_draft_gen_block_batched", lambda *a, **k: gen_logits)
+    monkeypatch.setattr(worker, "_draft_gen_block_batched", lambda *a, **k: (gen_logits, None))
 
     sdt_calls = {}
     # The gen scatter publishes the FULL (post-TP-gather) vocab width, which is
@@ -456,6 +456,57 @@ def test_forward_mixed_batch_routes_through_base_entries(monkeypatch):
     assert torch.equal(out["new_tokens_lens"], num_accepted)
 
 
+def test_forward_full_k_fallback_reports_verified_width(monkeypatch):
+    """An unmatched dynamic G verifies physical K, not the prior compact length."""
+    worker = _make_worker()
+    worker.spec_config.is_confidence_budget_enabled = True
+    worker.guided_decoder = None
+    dm = _fake_draft_model(num_stages=3, window_size=128, head_dim=64)
+
+    K = worker.max_draft_len
+    vocab = 16
+    batch_size = 3
+
+    meta = _make_metadata(max_num_requests=8)
+    meta.request_ids = [20, 21, 22]
+    meta.prepare()
+    # This models a batch size absent from the configured dynamic-V tiers.
+    # model_engine therefore routes it through standard full-K verification.
+    meta.confidence_fixed_budget_active = False
+
+    attn_metadata = types.SimpleNamespace(
+        num_seqs=batch_size,
+        num_contexts=0,
+        num_ctx_tokens=0,
+        num_tokens=batch_size,
+    )
+    accepted = torch.zeros(batch_size, K + 1, dtype=torch.int32, device="cuda")
+    num_accepted = torch.tensor([K + 1, 2, 1], dtype=torch.int32, device="cuda")
+    monkeypatch.setattr(
+        worker,
+        "sample_and_accept_draft_tokens",
+        lambda *a, **k: (accepted, num_accepted),
+    )
+    gen_logits = torch.randn(batch_size, K, vocab, device="cuda")
+    monkeypatch.setattr(worker, "_draft_gen_block_batched", lambda *a, **k: (gen_logits, None))
+
+    def fake_sample_draft_tokens(gl, sm, bs, *, num_contexts):
+        sm.draft_probs_last_dim = vocab
+        return gl.argmax(dim=-1).to(torch.int32)
+
+    monkeypatch.setattr(worker, "sample_draft_tokens", fake_sample_draft_tokens)
+
+    input_ids = torch.zeros(batch_size, dtype=torch.long, device="cuda")
+    position_ids = torch.zeros(batch_size, dtype=torch.long, device="cuda")
+    hidden = torch.zeros(batch_size, HIDDEN, device="cuda", dtype=torch.bfloat16)
+    logits = torch.zeros(batch_size, vocab, device="cuda")
+
+    out = worker.forward(input_ids, position_ids, hidden, logits, attn_metadata, meta, dm)
+
+    assert torch.equal(out["verified_draft_lens"], torch.full_like(num_accepted, K))
+    assert "next_draft_lens" not in out
+
+
 def test_forward_guided_batch_masks_and_advances_matcher_per_step(monkeypatch):
     """Guided mixed (context + gen) batch: ``forward`` must walk the K draft
     positions left-to-right, advancing the grammar matcher
@@ -502,7 +553,7 @@ def test_forward_guided_batch_masks_and_advances_matcher_per_step(monkeypatch):
     monkeypatch.setattr(worker, "_seed_context_windows", lambda *a, **k: None)
 
     gen_logits = torch.randn(num_gens, K, vocab, device="cuda")
-    monkeypatch.setattr(worker, "_draft_gen_block_batched", lambda *a, **k: gen_logits)
+    monkeypatch.setattr(worker, "_draft_gen_block_batched", lambda *a, **k: (gen_logits, None))
 
     class FakeGuidedDecoder:
         def __init__(self):

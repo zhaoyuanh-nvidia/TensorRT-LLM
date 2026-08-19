@@ -141,6 +141,17 @@ class ConfidenceTraceRing:
         self._slot_step_id.index_copy_(0, slots, self._event_counter.expand(num_requests))
         self._event_counter.add_(1)
 
+    @torch.inference_mode()
+    def reset(self) -> None:
+        """Discard warmup/capture state while preserving captured buffer addresses."""
+        if self._flushed:
+            raise RuntimeError("cannot reset a flushed DSpark confidence trace ring")
+        self._slot_valid.zero_()
+        self._valid.zero_()
+        self._counter.zero_()
+        self._event_counter.zero_()
+        logger.warning("DSpark confidence trace: discarded warmup and CUDA-capture rows")
+
     def flush(self) -> None:
         """Write valid paired rows to a CPU shard once."""
         if self._flushed:
