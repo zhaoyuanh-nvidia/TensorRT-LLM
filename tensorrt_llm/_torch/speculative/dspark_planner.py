@@ -20,6 +20,7 @@ confidence-head traces into that schedule.  Planning stays offline so serving
 does not add a device-to-host synchronization or a second CUDA-graph axis.
 """
 
+import hashlib
 import json
 import math
 from dataclasses import dataclass, field
@@ -29,8 +30,10 @@ from typing import Sequence
 import numpy as np
 
 __all__ = [
+    "ExactSpsCostTable",
     "SpsCostTable",
     "derive_fixed_verifier_budget_candidates",
+    "load_engine_fingerprint",
     "load_sps_cost_table",
     "select_fixed_verifier_budget",
     "select_fixed_verifier_budget_from_traces",
@@ -106,7 +109,64 @@ class SpsCostTable:
         return float(self.step_times(np.asarray([num_tokens]), num_requests)[0])
 
 
-def load_sps_cost_table(path: str | Path) -> tuple[SpsCostTable, dict[str, object]]:
+@dataclass(frozen=True)
+class ExactSpsCostTable:
+    """Directly measured whole-step costs keyed by exact ``(G, V)``.
+
+    Unlike :class:`SpsCostTable`, this schema never interpolates across graph
+    batch sizes or verifier-token budgets. Dynamic multi-G serving therefore
+    cannot silently score a CUDA-graph shape that the profiler did not run.
+    """
+
+    tables: dict[int, SpsCostTable]
+    minimum_predicted_gain: float = 0.01
+
+    def __post_init__(self) -> None:
+        normalized = {
+            int(graph_batch_size): table for graph_batch_size, table in self.tables.items()
+        }
+        if not normalized:
+            raise ValueError("ExactSpsCostTable requires at least one graph batch size")
+        if any(graph_batch_size < 1 for graph_batch_size in normalized):
+            raise ValueError("ExactSpsCostTable graph batch sizes must be positive")
+        if not math.isfinite(self.minimum_predicted_gain) or self.minimum_predicted_gain < 0.0:
+            raise ValueError("minimum_predicted_gain must be non-negative and finite")
+        object.__setattr__(self, "tables", normalized)
+
+    def for_graph_batch_size(self, num_requests: int) -> SpsCostTable:
+        """Return the directly measured V curve for one exact G."""
+        try:
+            return self.tables[int(num_requests)]
+        except KeyError as error:
+            raise ValueError(
+                f"SPS cost artifact has no direct measurements for G={num_requests}"
+            ) from error
+
+    def step_times(self, num_tokens: np.ndarray, num_requests: int) -> np.ndarray:
+        """Return direct whole-step measurements without V interpolation."""
+        table = self.for_graph_batch_size(num_requests)
+        measured = {
+            int(token_count): float(step_time)
+            for token_count, step_time in zip(table.token_counts, table.step_time_ms)
+        }
+        requested = np.asarray(num_tokens)
+        missing = sorted({int(value) for value in requested.reshape(-1)} - measured.keys())
+        if missing:
+            raise ValueError(
+                f"SPS cost artifact has no direct measurements for G={num_requests}, V={missing}"
+            )
+        return np.asarray(
+            [measured[int(value)] for value in requested.reshape(-1)], dtype=np.float64
+        ).reshape(requested.shape)
+
+    def step_time(self, num_tokens: int, num_requests: int) -> float:
+        """Return one directly measured ``T(G, V)`` value."""
+        return float(self.step_times(np.asarray([num_tokens]), num_requests)[0])
+
+
+def load_sps_cost_table(
+    path: str | Path,
+) -> tuple[SpsCostTable | ExactSpsCostTable, dict[str, object]]:
     """Load the profiler JSON schema shared with PR #17056 and SGLang.
 
     The returned payload is retained so callers can validate its engine
@@ -114,15 +174,55 @@ def load_sps_cost_table(path: str | Path) -> tuple[SpsCostTable, dict[str, objec
     """
     with Path(path).open(encoding="utf-8") as file:
         payload = json.load(file)
-    table = SpsCostTable(
-        token_counts=tuple(int(value) for value in payload["token_counts"]),
-        step_time_ms=tuple(float(value) for value in payload["step_time_ms"]),
-        fixed_overhead_ms=float(payload.get("fixed_overhead_ms", 0.0)),
-        batch_sizes=tuple(int(value) for value in payload.get("batch_sizes", ())),
-        batch_overhead_ms=tuple(float(value) for value in payload.get("batch_overhead_ms", ())),
-        minimum_predicted_gain=float(payload.get("minimum_predicted_gain", 0.01)),
-    )
+    exact_tables = payload.get("cost_tables")
+    if exact_tables is None:
+        table: SpsCostTable | ExactSpsCostTable = SpsCostTable(
+            token_counts=tuple(int(value) for value in payload["token_counts"]),
+            step_time_ms=tuple(float(value) for value in payload["step_time_ms"]),
+            fixed_overhead_ms=float(payload.get("fixed_overhead_ms", 0.0)),
+            batch_sizes=tuple(int(value) for value in payload.get("batch_sizes", ())),
+            batch_overhead_ms=tuple(float(value) for value in payload.get("batch_overhead_ms", ())),
+            minimum_predicted_gain=float(payload.get("minimum_predicted_gain", 0.01)),
+        )
+    else:
+        if int(payload.get("schema_version", 0)) != 2:
+            raise ValueError("Multi-G SPS cost artifacts require schema_version=2")
+        if not isinstance(exact_tables, dict):
+            raise TypeError("SPS cost_tables must be an object keyed by graph batch size")
+        parsed_tables: dict[int, SpsCostTable] = {}
+        for graph_batch_size, exact_payload in exact_tables.items():
+            if not isinstance(exact_payload, dict):
+                raise TypeError(f"SPS cost table for G={graph_batch_size} must be an object")
+            parsed_tables[int(graph_batch_size)] = SpsCostTable(
+                token_counts=tuple(int(value) for value in exact_payload["token_counts"]),
+                step_time_ms=tuple(float(value) for value in exact_payload["step_time_ms"]),
+            )
+        table = ExactSpsCostTable(
+            tables=parsed_tables,
+            minimum_predicted_gain=float(payload.get("minimum_predicted_gain", 0.01)),
+        )
     return table, payload
+
+
+def _canonical_json_sha256(value: object) -> str:
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def load_engine_fingerprint(path: str | Path) -> dict[str, object]:
+    """Load and authenticate the active engine fingerprint artifact."""
+    with Path(path).open(encoding="utf-8") as file:
+        payload = json.load(file)
+    if not isinstance(payload, dict):
+        raise TypeError("Engine provenance artifact must contain a JSON object")
+    fingerprint = payload.get("engine_fingerprint")
+    if not isinstance(fingerprint, dict):
+        raise TypeError("Engine provenance artifact requires engine_fingerprint")
+    expected = payload.get("engine_fingerprint_sha256")
+    actual = _canonical_json_sha256(fingerprint)
+    if expected != actual:
+        raise ValueError("Engine provenance fingerprint SHA256 does not match payload")
+    return fingerprint
 
 
 def validate_sps_cost_table_payload(
@@ -130,6 +230,7 @@ def validate_sps_cost_table_payload(
     *,
     verifier_token_budget_tiers: dict[int, Sequence[int]],
     max_draft_len: int,
+    active_engine_fingerprint: dict[str, object] | None = None,
 ) -> dict[str, object]:
     """Fail closed when a dynamic cost artifact does not match its runtime.
 
@@ -148,11 +249,16 @@ def validate_sps_cost_table_payload(
         "gpu",
         "gpu_count",
         "max_draft_len",
-        "rank_local_graph_batch_size",
         "runtime_snapshot",
         "source_head",
         "topology",
     }
+    if "cost_tables" in payload:
+        required_fingerprint_keys.add("rank_local_graph_batch_sizes")
+        required_fingerprint_keys.add("source_diff_sha256")
+        required_fingerprint_keys.add("gpu_snapshot_sha256")
+    else:
+        required_fingerprint_keys.add("rank_local_graph_batch_size")
     missing_fingerprint_keys = sorted(required_fingerprint_keys - fingerprint.keys())
     if missing_fingerprint_keys:
         raise ValueError(
@@ -164,6 +270,146 @@ def validate_sps_cost_table_payload(
         int(graph_batch_size): tuple(int(value) for value in values)
         for graph_batch_size, values in verifier_token_budget_tiers.items()
     }
+    exact_tables = payload.get("cost_tables")
+    if exact_tables is not None:
+        if int(payload.get("schema_version", 0)) != 2:
+            raise ValueError("Multi-G SPS cost artifacts require schema_version=2")
+        expected_fingerprint_sha = payload.get("engine_fingerprint_sha256")
+        if expected_fingerprint_sha != _canonical_json_sha256(fingerprint):
+            raise ValueError("SPS engine_fingerprint SHA256 does not match payload")
+        if active_engine_fingerprint is None:
+            raise ValueError(
+                "Multi-G SPS cost artifacts require an active engine fingerprint"
+            )
+        comparable_keys = required_fingerprint_keys | {
+            "global_graph_batch_sizes"
+        }
+        mismatches = sorted(
+            key for key in comparable_keys
+            if fingerprint.get(key) != active_engine_fingerprint.get(key)
+        )
+        if mismatches:
+            raise ValueError(
+                "SPS engine_fingerprint does not match active runtime: "
+                + ", ".join(mismatches)
+            )
+        if not isinstance(exact_tables, dict) or not exact_tables:
+            raise TypeError("SPS cost_tables must be a non-empty object keyed by G")
+        canonical_graph_batch_sizes = [str(int(value)) for value in exact_tables]
+        if len(set(canonical_graph_batch_sizes)) != len(
+                canonical_graph_batch_sizes):
+            raise ValueError("SPS cost_tables contains duplicate canonical G keys")
+        measured_tables = {
+            int(graph_batch_size): value for graph_batch_size, value in exact_tables.items()
+        }
+        configured_graph_batch_sizes = set(normalized_tiers)
+        measured_graph_batch_sizes = set(measured_tables)
+        fingerprint_graph_batch_sizes = {
+            int(value) for value in fingerprint["rank_local_graph_batch_sizes"]
+        }
+        if (
+            configured_graph_batch_sizes != measured_graph_batch_sizes
+            or configured_graph_batch_sizes != fingerprint_graph_batch_sizes
+        ):
+            raise ValueError(
+                "Multi-G SPS graph batch sizes must match exactly across runtime tiers, "
+                "cost_tables, and engine_fingerprint"
+            )
+        if int(fingerprint["max_draft_len"]) != max_draft_len:
+            raise ValueError(
+                f"SPS engine_fingerprint max_draft_len does not match runtime K={max_draft_len}"
+            )
+
+        missing_pairs: list[tuple[int, int]] = []
+        table_cells: dict[tuple[int, int], float] = {}
+        for graph_batch_size, candidate_budgets in normalized_tiers.items():
+            table_payload = measured_tables[graph_batch_size]
+            if not isinstance(table_payload, dict):
+                raise TypeError(f"SPS cost table for G={graph_batch_size} must be an object")
+            token_counts = [
+                int(value) for value in table_payload.get("token_counts", ())
+            ]
+            step_times = [
+                float(value) for value in table_payload.get("step_time_ms", ())
+            ]
+            if (len(token_counts) != len(step_times)
+                    or len(token_counts) != len(set(token_counts))):
+                raise ValueError(
+                    f"SPS cost table for G={graph_batch_size} has invalid cells"
+                )
+            for budget, step_time in zip(token_counts, step_times):
+                table_cells[(graph_batch_size, budget)] = step_time
+            measured_budgets = set(token_counts)
+            missing_pairs.extend(
+                (graph_batch_size, budget)
+                for budget in candidate_budgets
+                if budget not in measured_budgets
+            )
+            full_budget = graph_batch_size * (max_draft_len + 1)
+            if full_budget not in candidate_budgets:
+                raise ValueError(
+                    "Dynamic verifier tiers must include full-K fallback "
+                    f"(G={graph_batch_size}, V={full_budget})"
+                )
+        if missing_pairs:
+            raise ValueError(
+                "Dynamic verifier tiers require direct SPS measurements for every "
+                f"(G, V) pair; missing pairs: {missing_pairs}"
+            )
+
+        measurements = payload.get("measurements")
+        if not isinstance(measurements, list) or not measurements:
+            raise ValueError("SPS cost artifact requires non-empty measurement provenance")
+        measurement_cells: dict[tuple[int, int], float] = {}
+        for item in measurements:
+            if not isinstance(item, dict):
+                raise TypeError("SPS measurement provenance entries must be objects")
+            pair = (
+                int(item["rank_local_graph_batch_size"]),
+                int(item["rank_local_verifier_budget"]),
+            )
+            if pair in measurement_cells:
+                raise ValueError(
+                    f"duplicate SPS measurement provenance for {pair}"
+                )
+            source_sha = item.get("source_result_sha256")
+            if (not isinstance(source_sha, str) or len(source_sha) != 64
+                    or any(char not in "0123456789abcdef"
+                           for char in source_sha)):
+                raise ValueError(f"invalid source result SHA256 for {pair}")
+            measurement_cells[pair] = float(item["step_time_ms"])
+        configured_pairs = {
+            (graph_batch_size, budget)
+            for graph_batch_size, candidate_budgets in normalized_tiers.items()
+            for budget in candidate_budgets
+        }
+        if set(measurement_cells) != configured_pairs:
+            raise ValueError(
+                "SPS measurement provenance must cover each configured (G,V) exactly"
+            )
+        mismatched_cells = sorted(
+            pair for pair in configured_pairs
+            if table_cells.get(pair) != measurement_cells[pair]
+        )
+        if mismatched_cells:
+            raise ValueError(
+                "SPS cost table cells do not match measurement provenance: "
+                f"{mismatched_cells}"
+            )
+
+        gpu_count = int(fingerprint["gpu_count"])
+        if gpu_count < 1:
+            raise ValueError("SPS engine_fingerprint gpu_count must be positive")
+        global_graph_batch_sizes = fingerprint.get("global_graph_batch_sizes")
+        if global_graph_batch_sizes is not None and {
+            int(value) for value in global_graph_batch_sizes
+        } != {graph_batch_size * gpu_count for graph_batch_size in normalized_tiers}:
+            raise ValueError(
+                "SPS engine_fingerprint global_graph_batch_sizes are inconsistent "
+                "with rank-local G values and gpu_count"
+            )
+        return fingerprint
+
     if len(normalized_tiers) != 1:
         raise ValueError(
             "A one-dimensional SPS cost artifact must configure exactly one "

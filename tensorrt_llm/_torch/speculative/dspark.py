@@ -32,12 +32,17 @@ from tensorrt_llm.mapping import Mapping
 from ..distributed import AllReduce, AllReduceStrategy
 from ..pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
 from .dspark_confidence import (
+    build_confidence_device_layout,
     load_sts_temperatures,
     plan_dynamic_verifier_budget,
-    plan_fixed_verifier_budget,
+    plan_masked_fixed_verifier_draft_lens,
     verify_packed_greedy,
 )
-from .dspark_planner import load_sps_cost_table, validate_sps_cost_table_payload
+from .dspark_planner import (
+    load_engine_fingerprint,
+    load_sps_cost_table,
+    validate_sps_cost_table_payload,
+)
 from .dspark_trace import ConfidenceTraceRing, confidence_trace_path_from_env
 from .interface import SpecMetadata, SpecWorkerBase
 
@@ -64,6 +69,19 @@ class DSparkSpecMetadata(SpecMetadata):
     batch_indices_cuda: Optional[torch.Tensor] = None
     confidence_fixed_budget_active: bool = False
     confidence_verifier_token_budget: int = 0
+    # Set only after the final CUDA-graph / attention-DP route gate chooses a
+    # captured compact V>0 key. Input packing must never infer this permission
+    # independently from request-local retained lengths.
+    confidence_compact_route_authorized: bool = False
+    # Host-side ADP readiness decided before padding/keying. Eager fallback
+    # must not generate a new compact plan when any peer cannot use common G.
+    confidence_adp_plan_ready: bool = False
+    # Final host route consumed by the target verifier.  These values are
+    # restored from request metadata before padding/key selection; they are
+    # deliberately separate from the next-step confidence plan.
+    confidence_route_epoch: int = 0
+    confidence_execution_batch_size: int = 0
+    confidence_force_full_k_route: bool = False
 
     # Hidden state capture fields
     layers_to_capture: Optional[List[int]] = None
@@ -81,6 +99,13 @@ class DSparkSpecMetadata(SpecMetadata):
         # Persistent per-request retained lengths for packed target
         # verification. Reusing this allocation is required by CUDA graphs.
         self.draft_lens = torch.empty([self.max_num_requests], dtype=torch.int, device="cuda")
+        # The compact query lengths have the same graph-pointer lifetime
+        # requirement as draft_lens. Live confidence layouts are sampler-owned
+        # and rotate every iteration, so model input preparation must copy their
+        # values here instead of rebinding this field to a transient tensor.
+        self.seq_lens = torch.empty(
+            [self.max_num_requests], dtype=torch.int, device="cuda"
+        )
 
         self.is_spec_dec_tree = False
         self.is_spec_dec_dynamic_tree = False
@@ -140,18 +165,28 @@ class DSparkSpecMetadata(SpecMetadata):
             # ``_seed_context_windows``; the ADP-idle (id 0) and CUDA-graph
             # padding dummies are kept on the scratch row.
             num_contexts = max(0, len(self.request_ids) - self.num_generations)
-            for rid in self.request_ids[num_contexts:]:
-                if (
-                    rid != ATTENTION_DP_DUMMY_REQUEST_ID
-                    and rid < worker._graph_dummy_id_floor
-                    and rid not in worker._req_to_slot
-                ):
+            generation_request_ids = self.request_ids[num_contexts:]
+            real_generation_request_ids = [
+                rid
+                for rid in generation_request_ids
+                if rid != ATTENTION_DP_DUMMY_REQUEST_ID and rid < worker._graph_dummy_id_floor
+            ]
+            for rid in real_generation_request_ids:
+                if rid not in worker._req_to_slot:
                     worker._assign_slot(rid, reset=False)
             # Unknown request IDs (synthetic warmup / CUDA-graph padding, ADP idle
             # requests, or disagg seed forwards without a real id) map to the
             # dedicated throwaway scratch row so they cannot overwrite a live
             # request's rolling window (they previously aliased to slot 0).
             scratch = worker._scratch_slot
+            real_generation_slots = [
+                worker._req_to_slot.get(rid, scratch) for rid in real_generation_request_ids
+            ]
+            if any(slot == scratch for slot in real_generation_slots):
+                raise RuntimeError(
+                    "DSpark real generation requests must never use the shared "
+                    "scratch rolling-window slot"
+                )
             mapping = torch.tensor(
                 [worker._req_to_slot.get(rid, scratch) for rid in self.request_ids],
                 dtype=torch.long,
@@ -339,11 +374,22 @@ class DSparkWorker(SpecWorkerBase):
         if getattr(self.spec_config, "is_dynamic_budget_confidence_enabled", False):
             cost_path = self.spec_config.confidence_sps_cost_table_path
             cost_table, cost_payload = load_sps_cost_table(cost_path)
+            active_fingerprint = None
+            if int(cost_payload.get("schema_version", 0)) == 2:
+                fingerprint_path = getattr(
+                    self.spec_config, "confidence_engine_fingerprint_path", None
+                )
+                if not fingerprint_path:
+                    raise ValueError(
+                        "Multi-G SPS cost artifacts require an active engine fingerprint"
+                    )
+                active_fingerprint = load_engine_fingerprint(fingerprint_path)
             tiers = self.spec_config.confidence_verifier_token_budget_tiers or {}
             fingerprint = validate_sps_cost_table_payload(
                 cost_payload,
                 verifier_token_budget_tiers=tiers,
                 max_draft_len=block_size,
+                active_engine_fingerprint=active_fingerprint,
             )
             for graph_batch_size, candidate_budgets in tiers.items():
                 budgets = torch.tensor(candidate_budgets, dtype=torch.int64, device="cuda")
@@ -854,9 +900,10 @@ class DSparkWorker(SpecWorkerBase):
             next_draft_tokens = gen_draft_tokens
 
         next_draft_lens = None
+        next_confidence_layout = None
         adp_batches_agree = not self.mapping.enable_attention_dp or (
             all_rank_num_gens is not None
-            and len(all_rank_num_gens) == self.mapping.tp_size
+            and len(all_rank_num_gens) > 0
             and all(int(value) == num_gens for value in all_rank_num_gens)
         )
         if (
@@ -865,6 +912,7 @@ class DSparkWorker(SpecWorkerBase):
             and getattr(self.spec_config, "is_confidence_budget_enabled", False)
             and spec_metadata.is_all_greedy_sample
             and adp_batches_agree
+            and getattr(spec_metadata, "confidence_adp_plan_ready", False)
         ):
             candidates = self.spec_config.resolve_confidence_verifier_token_budget_candidates(
                 num_gens
@@ -881,8 +929,9 @@ class DSparkWorker(SpecWorkerBase):
                     )
                     if isinstance(confidence_logits, tuple):
                         confidence_logits = confidence_logits[0]
+                slots = self._batch_to_slot[num_contexts:batch_size]
+                real_request_mask = slots != self._scratch_slot
                 if self._confidence_recorder is not None:
-                    slots = self._batch_to_slot[num_contexts:batch_size]
                     self._confidence_recorder.record_and_update(
                         slots=slots,
                         confidence_logits=confidence_logits,
@@ -907,14 +956,29 @@ class DSparkWorker(SpecWorkerBase):
                             if self._confidence_yield_all_reduce is not None
                             else None
                         ),
+                        real_request_mask=real_request_mask,
                     )
+                    next_draft_lens = confidence_plan.retained_lens
+                    selected_verifier_budget = confidence_plan.verifier_token_budget
+                    packed_capacity = max(candidates)
                 else:
-                    confidence_plan = plan_fixed_verifier_budget(
+                    next_draft_lens = plan_masked_fixed_verifier_draft_lens(
                         confidence_logits,
                         candidates[0],
+                        real_request_mask,
                         temperatures=self._confidence_sts_temperatures,
                     )
-                next_draft_lens = confidence_plan.retained_lens
+                    selected_verifier_budget = candidates[0]
+                    packed_capacity = candidates[0]
+
+                next_confidence_layout = build_confidence_device_layout(
+                    next_draft_lens,
+                    real_request_mask,
+                    spec_metadata.batch_indices_cuda[:batch_size],
+                    selected_verifier_budget,
+                    K,
+                    packed_capacity=packed_capacity,
+                )
 
         next_new_tokens = self._prepare_next_new_tokens(
             accepted_tokens,
@@ -948,4 +1012,5 @@ class DSparkWorker(SpecWorkerBase):
             outputs["verified_draft_lens"] = torch.full_like(num_accepted_tokens, K)
         if next_draft_lens is not None:
             outputs["next_draft_lens"] = next_draft_lens
+            outputs["next_dspark_confidence_layout"] = next_confidence_layout
         return outputs

@@ -253,6 +253,53 @@ def test_optimizer_emits_only_profitable_trimmed_budget(tmp_path: Path) -> None:
     assert result["optimization"]["1"]["runtime_action"] == "confidence_fixed_budget"
 
 
+def test_optimizer_uses_exact_cost_curve_for_each_graph_batch_size(tmp_path: Path) -> None:
+    for graph_batch_size in (1, 2):
+        prefix_mask = torch.zeros((2, graph_batch_size, 2), dtype=torch.bool)
+        torch.save(
+            {
+                "logits": torch.zeros_like(prefix_mask, dtype=torch.float32),
+                "prefix_mask": prefix_mask,
+                "graph_batch_size": graph_batch_size,
+            },
+            tmp_path / f"trace-g{graph_batch_size}.pt",
+        )
+    table = tmp_path / "multi-g-sps.json"
+    table.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "minimum_predicted_gain": 0.01,
+                "cost_tables": {
+                    "1": {
+                        "token_counts": [2, 3],
+                        "step_time_ms": [1.0, 10.0],
+                    },
+                    "2": {
+                        "token_counts": [4, 6],
+                        "step_time_ms": [2.0, 20.0],
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    sts = tmp_path / "sts.json"
+    sts.write_text(json.dumps({"sts_temperatures": [1.0, 1.0]}), encoding="utf-8")
+
+    result = _OPTIMIZER.optimize(
+        trace_glob=str(tmp_path / "trace-g*.pt"),
+        sps_table_path=str(table),
+        sts_path=str(sts),
+        max_candidates=4,
+    )
+
+    assert result["confidence_mode"] == "fixed_budget"
+    assert result["confidence_verifier_token_budget_schedule"] == {"1": 2, "2": 4}
+    assert result["optimization"]["1"]["selected_budget"] == 2
+    assert result["optimization"]["2"]["selected_budget"] == 4
+
+
 def test_sts_fitter_sanitizes_non_finite_logits_before_bce() -> None:
     logits = torch.tensor(
         [

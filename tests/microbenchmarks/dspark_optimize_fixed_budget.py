@@ -24,6 +24,7 @@ import numpy as np
 import torch
 
 from tensorrt_llm._torch.speculative.dspark_planner import (
+    ExactSpsCostTable,
     derive_fixed_verifier_budget_candidates,
     load_sps_cost_table,
     select_fixed_verifier_budget_from_traces,
@@ -138,6 +139,11 @@ def optimize(
     trimmed_schedule: dict[str, int] = {}
     details: dict[str, object] = {}
     for graph_batch_size, trace_steps in sorted(grouped.items()):
+        graph_cost_table = (
+            table.for_graph_batch_size(graph_batch_size)
+            if isinstance(table, ExactSpsCostTable)
+            else table
+        )
         logits = np.stack([step[0] for step in trace_steps])
         prefix_mask = np.stack([step[1] for step in trace_steps])
         max_draft_len = int(logits.shape[-1])
@@ -152,7 +158,7 @@ def optimize(
         conditional = 1.0 / (1.0 + np.exp(-scaled_logits))
         survival = np.cumprod(conditional, axis=2)
         candidates = derive_fixed_verifier_budget_candidates(
-            cost_table=table,
+            cost_table=graph_cost_table,
             num_requests=graph_batch_size,
             max_draft_len=max_draft_len,
             max_candidates=max_candidates,
@@ -160,7 +166,7 @@ def optimize(
         selected, scores = select_fixed_verifier_budget_from_traces(
             survival_steps=survival,
             candidate_budgets=candidates,
-            cost_table=table,
+            cost_table=graph_cost_table,
             prefix_mask_steps=prefix_mask,
         )
         full = graph_batch_size * (max_draft_len + 1)

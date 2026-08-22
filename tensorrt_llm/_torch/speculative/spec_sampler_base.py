@@ -43,6 +43,17 @@ from ..pyexecutor.sampler import (
     int_tensor,
 )
 from ..pyexecutor.scheduler import ScheduledRequests
+from .dspark_confidence import (
+    DSparkConfidenceDeviceLayout,
+    validate_confidence_device_layout_row_map,
+)
+
+
+def _clone_dspark_confidence_layout(
+        layout: DSparkConfidenceDeviceLayout
+) -> DSparkConfidenceDeviceLayout:
+    """Detach graph-owned layout tensors from the next replay's lifetime."""
+    return DSparkConfidenceDeviceLayout(*(tensor.clone() for tensor in layout))
 
 
 @dataclass(kw_only=True)
@@ -53,6 +64,18 @@ class SampleStateTensorsSpec(SampleStateTensors):
     next_draft_tokens: torch.Tensor
     next_draft_lens: Optional[torch.Tensor] = None
     verified_draft_lens: Optional[torch.Tensor] = None
+    dspark_confidence_layout: Optional[DSparkConfidenceDeviceLayout] = None
+    dspark_confidence_execution_batch_size: Optional[int] = None
+    dspark_confidence_verifier_token_budget: Optional[int] = None
+    dspark_confidence_verifier_token_budget_host: Optional[torch.Tensor] = None
+    dspark_confidence_semantics_host: Optional[torch.Tensor] = None
+    dspark_confidence_query_lens_host: Optional[torch.Tensor] = None
+    dspark_confidence_budget_ready_event: Optional[torch.cuda.Event] = None
+    dspark_confidence_route_epoch: Optional[int] = None
+    dspark_confidence_physical_draft_len: Optional[int] = None
+    dspark_confidence_engine_generation: Optional[int] = None
+    dspark_confidence_request_ids: Optional[tuple[int, ...]] = None
+    dspark_confidence_seq_slots: Optional[tuple[int, ...]] = None
 
 
 @dataclass(kw_only=True)
@@ -68,6 +91,11 @@ class SampleStateSpec(SampleState):
     # instead would see the NEXT step's buffer, which update_requests itself
     # installs.
     draft_lens: Optional[list[int]] = None
+    dspark_confidence_execution_batch_size: Optional[int] = None
+    dspark_confidence_route_epoch: Optional[int] = None
+    dspark_confidence_verifier_token_budget: Optional[int] = None
+    dspark_confidence_physical_draft_len: Optional[int] = None
+    dspark_confidence_engine_generation: Optional[int] = None
 
 
 class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
@@ -272,6 +300,10 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         next_draft_lens_list = (
             state.host.next_draft_lens.tolist() if state.host.next_draft_lens is not None else None
         )
+        planned_requests = [
+            request for request in state.requests
+            if request.state != LlmRequestState.GENERATION_COMPLETE
+        ]
         verified_draft_lens_list = (
             state.host.verified_draft_lens.tolist()
             if state.host.verified_draft_lens is not None
@@ -328,6 +360,96 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
                 runtime_draft_len,
             )
 
+        # Publish the route beside the host-visible retained lengths.  A
+        # completion invalidates the exact V allocation, so surviving rows are
+        # restored to the already-generated physical K block before the next
+        # target input is packed.  ADP peers reconcile this ordinary fallback
+        # at the next pre-pack collective.
+        execution_g = state.dspark_confidence_execution_batch_size
+        route_epoch = state.dspark_confidence_route_epoch
+        verifier_budget = state.dspark_confidence_verifier_token_budget
+        if verifier_budget is None:
+            verifier_budget_host = getattr(
+                state.host,
+                "dspark_confidence_verifier_token_budget_host",
+                None,
+            )
+            if verifier_budget_host is not None:
+                verifier_budget = int(verifier_budget_host)
+        semantic_route_valid = True
+        semantics_host = getattr(
+            state.host, "dspark_confidence_semantics_host", None)
+        if semantics_host is not None:
+            semantics = tuple(int(value) for value in semantics_host.tolist())
+            if len(semantics) != 7:
+                semantic_route_valid = False
+            else:
+                (valid, row_map_valid, retained_count, query_count,
+                 cu_query_count, real_count, declared_budget) = semantics
+                semantic_route_valid = bool(
+                    valid == 1 and row_map_valid == 1
+                    and execution_g is not None
+                    and verifier_budget is not None
+                    and int(verifier_budget) == declared_budget
+                    and retained_count == declared_budget - int(execution_g)
+                    and query_count == declared_budget
+                    and cu_query_count == declared_budget
+                    and real_count == len(planned_requests))
+        surviving_requests = [
+            request for request in planned_requests
+            if request.state != LlmRequestState.GENERATION_COMPLETE
+        ]
+        route_complete = (
+            next_draft_lens_list is not None and execution_g is not None
+            and execution_g > 0 and route_epoch is not None
+            and route_epoch > 0 and len(surviving_requests) == len(planned_requests)
+            and semantic_route_valid
+        )
+        if route_complete:
+            computed_verifier_budget = execution_g + sum(
+                int(next_draft_lens_list[request.py_seq_slot])
+                for request in surviving_requests
+            )
+            verifier_budget = (verifier_budget if verifier_budget is not None
+                               else computed_verifier_budget)
+            if int(verifier_budget) != computed_verifier_budget:
+                raise RuntimeError(
+                    "DSpark carried verifier budget does not match retained "
+                    "draft lengths")
+            for request in surviving_requests:
+                previous_epoch = getattr(
+                    request, "py_dspark_confidence_route_epoch", None)
+                if previous_epoch is not None and int(
+                        previous_epoch) > int(route_epoch):
+                    raise RuntimeError(
+                        "DSpark confidence route epoch regressed during delayed "
+                        "sampler publication")
+                previous_route = (
+                    int(getattr(
+                        request,
+                        "py_dspark_confidence_execution_batch_size", 0) or 0),
+                    int(getattr(
+                        request,
+                        "py_dspark_confidence_verifier_token_budget", 0) or 0),
+                )
+                if (previous_epoch is not None
+                        and int(previous_epoch) == int(route_epoch)
+                        and previous_route !=
+                        (int(execution_g), int(verifier_budget))):
+                    raise RuntimeError(
+                        "DSpark confidence route epoch was republished with "
+                        "different G/V provenance")
+                request.py_dspark_confidence_route_epoch = route_epoch
+                request.py_dspark_confidence_execution_batch_size = execution_g
+                request.py_dspark_confidence_verifier_token_budget = verifier_budget
+        elif next_draft_lens_list is not None:
+            for request in surviving_requests:
+                request.py_draft_tokens_effective_len = len(
+                    request.py_draft_tokens)
+                request.py_dspark_confidence_route_epoch = None
+                request.py_dspark_confidence_execution_batch_size = None
+                request.py_dspark_confidence_verifier_token_budget = None
+
     def sample_async(
         self,
         scheduled_requests: ScheduledRequests,
@@ -382,6 +504,7 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         o_next_new_tokens = outputs["next_new_tokens"][num_skip : num_skip + num_sampling_requests]
         runtime_draft_len = o_next_draft_tokens.shape[1]
         o_next_draft_lens = outputs.get("next_draft_lens")
+        o_confidence_layout = outputs.get("next_dspark_confidence_layout")
         o_verified_draft_lens = outputs.get("verified_draft_lens")
         if o_next_draft_lens is not None:
             o_next_draft_lens = o_next_draft_lens[num_skip : num_skip + num_sampling_requests]
@@ -390,6 +513,54 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             o_verified_draft_lens = o_verified_draft_lens[
                 num_skip : num_skip + num_sampling_requests
             ].to(dtype=self.store.verified_draft_lens.dtype)
+
+        confidence_layout = None
+        confidence_budget_host = None
+        confidence_semantics_host = None
+        confidence_query_lens_host = None
+        confidence_budget_event = None
+        if o_confidence_layout is not None:
+            # CUDA-graph output dictionaries and their tensors are persistent.
+            # Clone every layout tensor into sampler-owned lifetime before the
+            # next replay can overwrite it, and replace row indices with the
+            # exact slot-indexed source used by the overlap buffers.
+            confidence_layout = _clone_dspark_confidence_layout(
+                o_confidence_layout)
+            confidence_layout.source_batch_indices.zero_()
+            confidence_layout.source_batch_indices[:num_sampling_requests].copy_(
+                slots, non_blocking=True)
+            confidence_layout.row_map_valid.copy_(
+                validate_confidence_device_layout_row_map(
+                    confidence_layout,
+                    runtime_draft_len,
+                    expected_source_slots=slots,
+                ).to(torch.int32))
+            confidence_semantics_host = torch.empty(
+                7, dtype=torch.int32, device="cpu", pin_memory=True)
+            confidence_semantics_host.copy_(torch.stack((
+                confidence_layout.semantic_valid,
+                confidence_layout.row_map_valid,
+                confidence_layout.retained_token_count,
+                confidence_layout.query_token_count,
+                confidence_layout.cu_query_token_count,
+                confidence_layout.real_request_count,
+                confidence_layout.declared_verifier_token_budget,
+            )), non_blocking=True)
+            confidence_query_lens_host = torch.empty(
+                confidence_layout.query_lens.shape[0],
+                dtype=torch.int32,
+                device="cpu",
+                pin_memory=True)
+            confidence_query_lens_host.copy_(
+                confidence_layout.query_lens, non_blocking=True)
+            if outputs.get("dspark_confidence_verifier_token_budget") is None:
+                confidence_budget_host = torch.empty(
+                    (), dtype=torch.int32, device="cpu", pin_memory=True)
+                confidence_budget_host.copy_(
+                    confidence_layout.verifier_token_budget,
+                    non_blocking=True)
+            confidence_budget_event = torch.cuda.Event()
+            confidence_budget_event.record()
 
         # Pad or truncate to match fixed-size store buffers for index_copy_.
         # The worker output width tracks runtime_draft_len, which dynamic draft
@@ -435,6 +606,24 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             verified_draft_lens=(
                 self.store.verified_draft_lens if o_verified_draft_lens is not None else None
             ),
+            dspark_confidence_layout=confidence_layout,
+            dspark_confidence_execution_batch_size=outputs.get(
+                "dspark_confidence_execution_batch_size"),
+            dspark_confidence_verifier_token_budget=outputs.get(
+                "dspark_confidence_verifier_token_budget"),
+            dspark_confidence_verifier_token_budget_host=confidence_budget_host,
+            dspark_confidence_semantics_host=confidence_semantics_host,
+            dspark_confidence_query_lens_host=confidence_query_lens_host,
+            dspark_confidence_budget_ready_event=confidence_budget_event,
+            dspark_confidence_route_epoch=outputs.get(
+                "dspark_confidence_route_epoch"),
+            dspark_confidence_physical_draft_len=runtime_draft_len,
+            dspark_confidence_engine_generation=outputs.get(
+                "dspark_confidence_engine_generation"),
+            dspark_confidence_request_ids=tuple(
+                request.py_request_id for request in sampling_requests),
+            dspark_confidence_seq_slots=tuple(
+                request.py_seq_slot for request in sampling_requests),
         )
 
         host_tensors = SampleStateTensorsSpec(
@@ -451,6 +640,24 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
                 if o_verified_draft_lens is not None
                 else None
             ),
+            dspark_confidence_layout=confidence_layout,
+            dspark_confidence_execution_batch_size=outputs.get(
+                "dspark_confidence_execution_batch_size"),
+            dspark_confidence_verifier_token_budget=outputs.get(
+                "dspark_confidence_verifier_token_budget"),
+            dspark_confidence_verifier_token_budget_host=confidence_budget_host,
+            dspark_confidence_semantics_host=confidence_semantics_host,
+            dspark_confidence_query_lens_host=confidence_query_lens_host,
+            dspark_confidence_budget_ready_event=confidence_budget_event,
+            dspark_confidence_route_epoch=outputs.get(
+                "dspark_confidence_route_epoch"),
+            dspark_confidence_physical_draft_len=runtime_draft_len,
+            dspark_confidence_engine_generation=outputs.get(
+                "dspark_confidence_engine_generation"),
+            dspark_confidence_request_ids=tuple(
+                request.py_request_id for request in sampling_requests),
+            dspark_confidence_seq_slots=tuple(
+                request.py_seq_slot for request in sampling_requests),
         )
         sampler_event = self._record_sampler_event()
 
@@ -465,4 +672,13 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             sampler_event=sampler_event,
             runtime_draft_len=runtime_draft_len,
             draft_lens=draft_lens,
+            dspark_confidence_execution_batch_size=outputs.get(
+                "dspark_confidence_execution_batch_size"),
+            dspark_confidence_route_epoch=outputs.get(
+                "dspark_confidence_route_epoch"),
+            dspark_confidence_verifier_token_budget=outputs.get(
+                "dspark_confidence_verifier_token_budget"),
+            dspark_confidence_physical_draft_len=runtime_draft_len,
+            dspark_confidence_engine_generation=outputs.get(
+                "dspark_confidence_engine_generation"),
         )

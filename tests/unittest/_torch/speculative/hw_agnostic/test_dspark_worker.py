@@ -26,7 +26,13 @@ import types
 import pytest
 import torch
 
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
+from tensorrt_llm._torch.pyexecutor.sampler import TorchSampler
 from tensorrt_llm._torch.speculative.dspark import DSparkSpecMetadata, DSparkWorker
+from tensorrt_llm._torch.speculative.spec_sampler_base import (
+    SampleStateSpec,
+    SpecSampler,
+)
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
 
 pytestmark = pytest.mark.skipif(
@@ -326,6 +332,26 @@ def test_prepare_assigns_slots_to_disagg_generation_requests():
     assert worker._batch_to_slot[:2].tolist() == [s0, s1]
 
 
+def test_prepare_rejects_real_generation_request_on_scratch_row(monkeypatch):
+    """Only ADP/graph dummies may use the shared rolling-window scratch row."""
+    worker = _make_worker()
+    meta = _make_metadata(max_num_requests=4)
+    worker._lazy_init(_fake_draft_model(), meta)
+    meta._dspark_worker = worker
+
+    # Simulate a broken slot allocator that fails to register a real request.
+    monkeypatch.setattr(
+        worker,
+        "_assign_slot",
+        lambda _request_id, reset: worker._scratch_slot,
+    )
+    meta.request_ids = [1000]
+    meta.num_generations = 1
+
+    with pytest.raises(RuntimeError, match="must never use.*scratch"):
+        meta.prepare()
+
+
 def test_prepare_keeps_dummy_generation_requests_on_scratch_row():
     """ADP-idle (id 0) and CUDA-graph padding dummies never consume a real slot."""
     from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
@@ -505,6 +531,105 @@ def test_forward_full_k_fallback_reports_verified_width(monkeypatch):
 
     assert torch.equal(out["verified_draft_lens"], torch.full_like(num_accepted, K))
     assert "next_draft_lens" not in out
+
+
+def test_compact_executed_width_drives_acceptance_and_kv_rewind(monkeypatch):
+    """The executed compact V, not stale request state, drives rewind."""
+    worker = _make_worker()
+    worker.spec_config.is_confidence_budget_enabled = True
+    worker.guided_decoder = None
+    draft_model = _fake_draft_model(num_stages=3, window_size=128, head_dim=64)
+    batch_size = 3
+    vocab = 16
+
+    metadata = _make_metadata(max_num_requests=8)
+    metadata.request_ids = [20, 21, 22]
+    metadata.prepare()
+    metadata.confidence_fixed_budget_active = True
+    executed_lens = torch.tensor([4, 2, 1], dtype=torch.int32, device="cuda")
+    metadata.draft_lens[:batch_size].copy_(executed_lens)
+
+    accepted = torch.zeros(
+        (batch_size, worker.max_draft_len + 1), dtype=torch.int32, device="cuda"
+    )
+    num_accepted = torch.tensor([3, 2, 1], dtype=torch.int32, device="cuda")
+    monkeypatch.setattr(
+        worker,
+        "_sample_and_accept_fixed_budget",
+        lambda *args, **kwargs: (accepted, num_accepted),
+    )
+    gen_logits = torch.randn(
+        batch_size, worker.max_draft_len, vocab, device="cuda"
+    )
+    monkeypatch.setattr(
+        worker, "_draft_gen_block_batched", lambda *args, **kwargs: (gen_logits, None)
+    )
+
+    def fake_sample_draft_tokens(logits, spec_metadata, batch, *, num_contexts):
+        spec_metadata.draft_probs_last_dim = vocab
+        return logits.argmax(dim=-1).to(torch.int32)
+
+    monkeypatch.setattr(worker, "sample_draft_tokens", fake_sample_draft_tokens)
+    attn_metadata = types.SimpleNamespace(
+        num_seqs=batch_size,
+        num_contexts=0,
+        num_ctx_tokens=0,
+        num_tokens=batch_size,
+    )
+    out = worker.forward(
+        torch.zeros(batch_size, dtype=torch.long, device="cuda"),
+        torch.zeros(batch_size, dtype=torch.long, device="cuda"),
+        torch.zeros(batch_size, HIDDEN, dtype=torch.bfloat16, device="cuda"),
+        torch.zeros(batch_size, vocab, device="cuda"),
+        attn_metadata,
+        metadata,
+        draft_model,
+    )
+    assert torch.equal(out["verified_draft_lens"], executed_lens)
+
+    requests = []
+    for slot in range(batch_size):
+        requests.append(
+            types.SimpleNamespace(
+                state=LlmRequestState.GENERATION_IN_PROGRESS,
+                py_seq_slot=slot,
+                py_request_id=20 + slot,
+                py_return_context_logits=False,
+                py_return_generation_logits=False,
+                py_return_log_probs=False,
+                py_draft_tokens=[],
+                py_draft_tokens_effective_len=5,
+                py_decoding_iter=0,
+            )
+        )
+    state = object.__new__(SampleStateSpec)
+    state.sampler_event = types.SimpleNamespace(synchronize=lambda: None)
+    state.requests = requests
+    state.draft_lens = [5, 5, 5]  # Deliberately stale; executed widths must win.
+    state.runtime_draft_len = worker.max_draft_len
+    state.host = types.SimpleNamespace(
+        new_tokens=out["new_tokens"].cpu(),
+        new_tokens_lens=out["new_tokens_lens"].cpu(),
+        next_draft_tokens=out["next_draft_tokens"].cpu(),
+        next_draft_lens=None,
+        verified_draft_lens=out["verified_draft_lens"].cpu(),
+    )
+    sampler = object.__new__(SpecSampler)
+    sampler.max_accepted_path_len = worker.max_draft_len + 1
+    sampler.max_seq_len = 4096
+    sampler.draft_len = worker.max_draft_len
+    sampler._trace_dspark_budget = False
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.speculative.spec_sampler_base.add_token",
+        lambda *args, **kwargs: 1,
+    )
+    monkeypatch.setattr(TorchSampler, "_handle_stop_criteria", lambda *args, **kwargs: False)
+
+    SpecSampler.update_requests(sampler, state)
+    assert [request.py_num_draft_tokens_verified for request in requests] == [4, 2, 1]
+    assert [request.py_num_accepted_draft_tokens for request in requests] == [2, 1, 0]
+    assert [request.py_rewind_len for request in requests] == [2, 1, 1]
+    assert [request.py_draft_tokens_effective_len for request in requests] == [5, 5, 5]
 
 
 def test_forward_guided_batch_masks_and_advances_matcher_per_step(monkeypatch):

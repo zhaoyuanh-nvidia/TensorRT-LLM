@@ -781,6 +781,13 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # count (e.g. one-model flow, which tracks lengths in its sample
         # state instead).
         self.py_draft_tokens_effective_len = None
+        # DSpark confidence routes are planned one iteration before target
+        # verification.  Keep the agreed ADP execution shape on the request so
+        # roster-local padding cannot recompute a different G/V for the packed
+        # draft tensors that are already in flight.
+        self.py_dspark_confidence_route_epoch = None
+        self.py_dspark_confidence_execution_batch_size = None
+        self.py_dspark_confidence_verifier_token_budget = None
         self.py_decoding_iter = 0
         self.is_attention_dp_dummy = False
         self.is_cuda_graph_dummy = False

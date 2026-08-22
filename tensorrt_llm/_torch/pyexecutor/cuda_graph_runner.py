@@ -2,16 +2,17 @@ import bisect
 import contextlib
 import os
 from dataclasses import dataclass
-from typing import (Any, Callable, Dict, Iterator, List, NamedTuple, Optional,
-                    Tuple, TypeAlias)
+from typing import Any, Callable, Dict, Iterator, List, NamedTuple, Optional, Tuple, TypeAlias
 
 import torch
 
 from tensorrt_llm._utils import prefer_pinned
-from tensorrt_llm.llmapi.llm_args import (BaseSparseAttentionConfig,
-                                          DecodingBaseConfig,
-                                          DSparkDecodingConfig,
-                                          SeqLenAwareSparseAttentionConfig)
+from tensorrt_llm.llmapi.llm_args import (
+    BaseSparseAttentionConfig,
+    DecodingBaseConfig,
+    DSparkDecodingConfig,
+    SeqLenAwareSparseAttentionConfig,
+)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -26,8 +27,7 @@ from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.utils import get_draft_kv_cache_manager
 from ..utils import make_weak_ref, piecewise_cuda_graph
 from .llm_request import LlmRequest, get_draft_token_length
-from .resource_manager import (BaseResourceManager, ResourceManager,
-                               ResourceManagerType)
+from .resource_manager import BaseResourceManager, ResourceManager, ResourceManagerType
 from .sampler import SampleStateTensors
 from .scheduler import ScheduledRequests
 
@@ -166,6 +166,16 @@ class CUDAGraphRunner:
         # so later captures cannot recycle addresses held by an earlier graph.
         self._confidence_memory_pools: Dict[Tuple[int, int, int], Any] = {}
         self.padding_dummy_requests: Dict[int, LlmRequest] = {}
+        self.confidence_adp_plan_ready = False
+        self.confidence_adp_execution_batch_size = 0
+        self.confidence_adp_verifier_token_budget = 0
+        self.confidence_adp_route_epoch = 0
+        self.confidence_force_full_k_route = False
+        self.confidence_device_layout = None
+        self.confidence_query_lens_host = None
+        self.confidence_device_layout_row_map_valid = False
+        self.confidence_discarded_device_layout = False
+        self.confidence_engine_generation = 0
         self.dynamic_draft_len_mapping = config.dynamic_draft_len_mapping
 
         self.shared_static_tensors: Dict[str, torch.Tensor] = {}
@@ -396,8 +406,16 @@ class CUDAGraphRunner:
                     and isinstance(self.spec_config, DSparkDecodingConfig)
                     and self.spec_config.is_confidence_budget_enabled
                     and is_all_greedy_sample):
-                configured_budget = self.spec_config.resolve_confidence_verifier_token_budget(
-                    batch_size)
+                force_full_k_route = bool(
+                    getattr(spec_metadata, "confidence_force_full_k_route",
+                            False))
+                carried_budget = int(
+                    getattr(spec_metadata,
+                            "confidence_verifier_token_budget", 0) or 0)
+                configured_budget = (
+                    None if force_full_k_route else
+                    (carried_budget if carried_budget > 0 else self.spec_config.
+                     resolve_confidence_verifier_token_budget(batch_size)))
                 is_synthetic_capture = (
                     self._capture_allowed and num_contexts == 0
                     and bool(batch.generation_requests) and all(
@@ -424,6 +442,13 @@ class CUDAGraphRunner:
                                                       synthetic_effective_lens):
                         request.py_draft_tokens_effective_len = effective_len
 
+                carried_layout = getattr(self, "confidence_device_layout", None)
+                carried_layout_route = bool(
+                    not is_synthetic_capture and carried_layout is not None
+                    and configured_budget is not None)
+                carried_compact_route = bool(
+                    carried_layout_route
+                    and configured_budget < batch_size * (draft_len + 1))
                 effective_draft_lens = []
                 for request in batch.generation_requests:
                     effective_len = getattr(request,
@@ -442,16 +467,27 @@ class CUDAGraphRunner:
                         physical_lens=draft_len_list)
                     return None
 
-                is_compact_step = any(effective_len != physical_len
-                                      for effective_len, physical_len in zip(
-                                          effective_draft_lens, draft_len_list))
-                confidence_shape_active = (
-                    configured_budget is not None or bool(
-                        getattr(spec_metadata, "confidence_fixed_budget_active",
-                                False)))
+                is_compact_step = (
+                    carried_compact_route if carried_layout_route else any(
+                        effective_len != physical_len
+                        for effective_len, physical_len in zip(
+                            effective_draft_lens, draft_len_list)))
                 has_live_dummy = (not is_synthetic_capture and any(
                     getattr(request, "is_dummy", False)
                     for request in batch.generation_requests))
+                anchor_only_live_padding = (
+                    has_live_dummy and
+                    (carried_layout_route or all(
+                        (not getattr(request, "is_dummy", False)) or
+                        (getattr(request, "is_cuda_graph_dummy", False)
+                         and effective_len == 0)
+                        for request, effective_len in zip(
+                            batch.generation_requests,
+                            effective_draft_lens))))
+                confidence_shape_active = (not force_full_k_route and (
+                    configured_budget is not None or bool(
+                        getattr(spec_metadata, "confidence_fixed_budget_active",
+                                False)) or anchor_only_live_padding))
                 if num_contexts and (is_compact_step
                                      or confidence_shape_active):
                     self._trace_dspark_graph_reject(
@@ -460,16 +496,14 @@ class CUDAGraphRunner:
                         num_contexts=num_contexts)
                     return None
 
-                # Padding requests do not have a live confidence allocation or
-                # packed-row map.  Replaying an exact-V graph in that state can
-                # reuse stale compact metadata.  The ordinary full-K graph is
-                # already captured for this (batch_size, draft_len), and the
-                # model engine realigns every request to its physical draft
-                # length before preparing its inputs.  Returning its V=0 key
-                # also lets the attention-DP shape agreement gate make every
-                # rank take the same safe graph when only one rank has padding.
-                compact_shape_ready = not has_live_dummy
-                if has_live_dummy:
+                # Live compact padding is executable only in the anchor-only
+                # layout: every padding row is the runner-owned CUDA-graph
+                # dummy, has effective draft length zero, and therefore needs
+                # no previous overlap row. Synthetic all-dummy capture remains
+                # a separate trusted path above and can use nonzero lengths.
+                compact_shape_ready = (not has_live_dummy
+                                       or anchor_only_live_padding)
+                if has_live_dummy and not anchor_only_live_padding:
                     self._trace_dspark_graph_reject(
                         "confidence_live_dummy_fallback_full_k",
                         batch_size=batch_size)
@@ -482,15 +516,19 @@ class CUDAGraphRunner:
                     # Keying a compact graph in that state would replay the
                     # previous compact step's row maps and KV extents.
                     compact_inputs_ready = (
-                        new_tensors_device is not None and all(
-                            getattr(request, "py_draft_tokens_effective_len",
-                                    None) is not None and
-                            getattr(request, "py_batch_idx", None) is not None
-                            for request in batch.generation_requests))
+                        carried_compact_route or
+                        (new_tensors_device is not None and all(
+                            (getattr(request, "is_dummy", False)
+                             and anchor_only_live_padding) or
+                            (getattr(request, "py_draft_tokens_effective_len",
+                                     None) is not None and getattr(
+                                         request, "py_batch_idx", None)
+                             is not None)
+                            for request in batch.generation_requests)))
                     compact_shape_ready = (compact_shape_ready
                                            and (is_synthetic_capture
                                                 or compact_inputs_ready))
-                    if not compact_shape_ready and not has_live_dummy:
+                    if not compact_shape_ready:
                         self._trace_dspark_graph_reject(
                             "compact_inputs_fallback_full_k",
                             batch_size=batch_size,
@@ -505,9 +543,10 @@ class CUDAGraphRunner:
                     # generic model-memory warmup also presents full-K dummy
                     # requests but prepares the ordinary (non-confidence)
                     # metadata path.
-                    actual_budget = sum(
-                        1 + effective_len
-                        for effective_len in effective_draft_lens)
+                    actual_budget = (
+                        configured_budget if carried_layout_route else sum(
+                            1 + effective_len
+                            for effective_len in effective_draft_lens))
                     if configured_budget is None:
                         configured_budget = self.spec_config.resolve_confidence_verifier_token_budget(
                             batch_size, effective_draft_lens)
@@ -625,18 +664,30 @@ class CUDAGraphRunner:
             batch, new_tensors_device, spec_resource_manager, spec_metadata,
             promoted_context_request_ids, peft_cache_data_type)
                if self.enabled and can_run_cuda_graph else None)
-        if self.enabled and self.config.enable_attention_dp and self.config.mapping.tp_size > 1:
+        if self.enabled and self.config.enable_attention_dp:
             # A compact verifier graph has a second static shape axis: V.  ADP
             # peers must therefore agree on both G and V (and on physical K),
             # not merely on graph eligibility and batch size.  In particular,
             # a rank whose overlap tensors are not ready returns key=None above;
             # all peers then fall back together instead of mixing a compact
             # replay with a full-K path across one TP/EP collective group.
+            live_compact_inputs = (
+                not getattr(self.config, "is_draft_model", False)
+                and not self._capture_allowed
+                and new_tensors_device is not None
+                and (getattr(self, "confidence_device_layout", None)
+                     is not None or any(
+                         getattr(request, "py_draft_tokens_effective_len", None)
+                         is not None
+                         and int(request.py_draft_tokens_effective_len)
+                         != len(request.py_draft_tokens)
+                         for request in batch.generation_requests)))
             graph_batch_info = self.config.dist.tp_allgather([
                 can_run_cuda_graph,
                 batch_size,
                 -1 if key is None else int(key.verifier_num_tokens),
                 -1 if key is None else int(key.draft_len),
+                live_compact_inputs,
             ])
             all_can_run_cuda_graph = all(rank_info[0]
                                          for rank_info in graph_batch_info)
@@ -648,6 +699,15 @@ class CUDAGraphRunner:
             all_draft_lens_equal = all(rank_info[3] == graph_batch_info[0][3]
                                        for rank_info in graph_batch_info)
 
+            unsafe_late_compact_fallback = any(
+                rank_info[4]
+                and (rank_info[2] <= 0 or not rank_info[0])
+                for rank_info in graph_batch_info)
+            if unsafe_late_compact_fallback:
+                raise RuntimeError(
+                    "DSpark attention-DP compact inputs cannot be converted "
+                    "to full-K after draft tensors were generated; the common "
+                    f"graph route was unavailable: {graph_batch_info}")
             if (not all_can_run_cuda_graph or not all_batch_sizes_equal
                     or not all_draft_lens_equal or key is None):
                 self._trace_dspark_graph_reject(
@@ -657,10 +717,12 @@ class CUDAGraphRunner:
                 return None, None, None
             if not all_verifier_shapes_equal:
                 self._trace_dspark_graph_reject(
-                    "attention_dp_verifier_fallback_full_k",
+                    "attention_dp_verifier_shape_mismatch",
                     local_key=key,
                     graph_batch_info=graph_batch_info)
-                key = key._replace(verifier_num_tokens=0)
+                raise RuntimeError(
+                    "DSpark attention-DP peers selected different verifier "
+                    f"shapes after draft generation: {graph_batch_info}")
 
         if not self.enabled or not can_run_cuda_graph:
             self._trace_dspark_graph_reject(
@@ -713,6 +775,14 @@ class CUDAGraphRunner:
         graph_attn_metadata = attn_metadata.create_cuda_graph_metadata(
             num_sequences_in_batch, False, key.draft_len,
             self.cuda_graph_meta_buffers)
+        if key.verifier_num_tokens:
+            # create_cuda_graph_metadata initializes every generation row to
+            # K+1, but a confidence capture packs exactly V tokens.  Seed the
+            # graph-resident metadata with that same V before the first model
+            # warmup; later live replays overwrite the per-row lengths in
+            # ModelEngine._prepare_inputs while retaining this total extent.
+            self._initialize_generation_graph_metadata_extent(
+                graph_attn_metadata, key, self.max_beam_width)
         if is_mixed_encoder_decoder:
             generation_query_len = key.draft_len + 1
             graph_attn_metadata.seq_lens = torch.tensor(
@@ -807,7 +877,83 @@ class CUDAGraphRunner:
         token_per_generation = key.draft_len + 1
         return (key.num_contexts * key.context_query_len +
                 (key.batch_size * self.max_beam_width - key.num_contexts) *
-                token_per_generation)
+                 token_per_generation)
+
+    @staticmethod
+    def _get_generation_seq_lens_for_key(
+            key: KeyType, max_beam_width: int) -> List[int]:
+        """Return a deterministic query layout with the exact graph extent."""
+        num_sequences = key.batch_size * max_beam_width
+        if not key.verifier_num_tokens:
+            return [key.draft_len + 1] * num_sequences
+        if key.num_contexts != 0 or max_beam_width != 1:
+            raise ValueError(
+                "Compact verifier graphs require generation-only beam-one "
+                "batches")
+        retained_tokens = key.verifier_num_tokens - num_sequences
+        max_retained_tokens = num_sequences * key.draft_len
+        if retained_tokens < 0 or retained_tokens > max_retained_tokens:
+            raise ValueError(
+                "Compact verifier token budget is outside the physical "
+                f"[G, G*(K+1)] extent: G={num_sequences}, "
+                f"K={key.draft_len}, V={key.verifier_num_tokens}")
+        base, extra = divmod(retained_tokens, num_sequences)
+        return [base + 1 + (index < extra)
+                for index in range(num_sequences)]
+
+    @classmethod
+    def _initialize_generation_graph_metadata_extent(
+            cls, graph_attn_metadata: Any, key: KeyType,
+            max_beam_width: int) -> None:
+        """Bind every capture-time metadata consumer to the graph's exact V."""
+        seq_lens = cls._get_generation_seq_lens_for_key(
+            key, max_beam_width)
+        graph_attn_metadata.seq_lens = torch.tensor(seq_lens, dtype=torch.int)
+        expected_num_tokens = (key.verifier_num_tokens
+                               or len(seq_lens) * (key.draft_len + 1))
+        if graph_attn_metadata.num_tokens != expected_num_tokens:
+            raise RuntimeError(
+                "CUDA graph attention metadata token extent does not match "
+                f"its graph key: metadata={graph_attn_metadata.num_tokens}, "
+                f"key={expected_num_tokens}")
+
+    @staticmethod
+    def _assert_generation_model_token_extent(
+            key: KeyType, model_inputs: Dict[str, Any]) -> None:
+        """Keep embedding/residual rows and attention rows on one graph extent."""
+        if key.num_contexts != 0:
+            return
+        expected = (key.verifier_num_tokens
+                    or key.batch_size * (key.draft_len + 1))
+        actual = {
+            "input_ids": int(model_inputs["input_ids"].shape[0]),
+            "position_ids": int(model_inputs["position_ids"].shape[-1]),
+            "attention_metadata": int(model_inputs["attn_metadata"].num_tokens),
+        }
+        if any(extent != expected for extent in actual.values()):
+            raise RuntimeError(
+                "CUDA graph model-facing token extents disagree before forward: "
+                f"key={expected}, extents={actual}")
+
+    def _get_capture_static_model_inputs(
+            self, key: KeyType,
+            initial_inputs: Dict[str, Any]) -> Dict[str, torch.Tensor]:
+        """Return graph-static model inputs sliced to the finalized key extent."""
+        num_tokens = self._get_num_tokens_for_key(key)
+        static_inputs = {
+            "input_ids": self.shared_static_tensors["input_ids"][:num_tokens],
+            "position_ids": self.shared_static_tensors["position_ids"][:,
+                                                                        :num_tokens],
+        }
+        if self.config.use_mrope:
+            static_inputs["position_ids"] = self.shared_static_tensors[
+                "position_ids"][:, :, :num_tokens]
+            if "mrope_delta_read_seq_slots" in initial_inputs:
+                static_inputs[
+                    "mrope_delta_read_seq_slots"] = self.shared_static_tensors[
+                        "mrope_delta_read_seq_slots"][:key.batch_size *
+                                                      self.max_beam_width]
+        return static_inputs
 
     def capture(self,
                 key: KeyType,
@@ -823,26 +969,14 @@ class CUDAGraphRunner:
         # [CUDA graph spec decode padding]
         # We pad input IDs/position IDs to the maximum draft length (token per request).
         # We're forced to do this because we cannot reallocate inputs over many graph runs.
-        num_tokens_for_capture = self._get_num_tokens_for_key(key)
-
-        sliced_static_tensors = {
-            "input_ids":
-            self.shared_static_tensors["input_ids"][:num_tokens_for_capture],
-            "position_ids":
-            self.shared_static_tensors["position_ids"]
-            [:, :num_tokens_for_capture],
-        }
-        if self.config.use_mrope:
-            sliced_static_tensors["position_ids"] = self.shared_static_tensors[
-                "position_ids"][:, :, :num_tokens_for_capture]
-            if "mrope_delta_read_seq_slots" in initial_inputs:
-                sliced_static_tensors[
-                    "mrope_delta_read_seq_slots"] = self.shared_static_tensors[
-                        "mrope_delta_read_seq_slots"][:batch_size *
-                                                      self.max_beam_width]
+        sliced_static_tensors = self._get_capture_static_model_inputs(
+            key, initial_inputs)
 
         capture_inputs = initial_inputs.copy()
         capture_inputs.update(sliced_static_tensors)
+        if (isinstance(self.spec_config, DSparkDecodingConfig)
+                and self.spec_config.is_confidence_budget_enabled):
+            self._assert_generation_model_token_extent(key, capture_inputs)
         num_encoder_tokens = key.num_encoder_tokens
         if num_encoder_tokens:
             encoder_hidden_states = initial_inputs.get("encoder_hidden_states")
@@ -981,14 +1115,413 @@ class CUDAGraphRunner:
 
         return output_ref
 
-    def _get_padded_batch(self, batch: ScheduledRequests,
-                          resource_manager: ResourceManager,
-                          runtime_draft_len: int) -> int:
+    def _get_confidence_adp_common_batch_size(
+            self, batch: ScheduledRequests,
+            new_tensors_device: Optional[SampleStateTensors]) -> Optional[int]:
+        """Restore or choose one confidence bucket for the actual ADP group.
+
+        ``None`` means this is not the DSpark confidence/ADP path. ``0`` means
+        every peer must use eager full-K and skip confidence planning this
+        iteration. A positive value is the exact execution G all peers pad to.
+        A compact route is restored only from the matching iteration-owned
+        device layout; ordinary full-K input chooses a new common G for the
+        next plan. The exchange precedes request padding and graph keying.
+        """
+        self.confidence_adp_execution_batch_size = 0
+        self.confidence_adp_verifier_token_budget = 0
+        self.confidence_adp_route_epoch = 0
+        self.confidence_force_full_k_route = False
+        self.confidence_device_layout = None
+        self.confidence_query_lens_host = None
+        self.confidence_device_layout_row_map_valid = False
+        self.confidence_discarded_device_layout = False
+        if (not self.enabled or not self.padding_enabled
+                or not self.config.enable_attention_dp
+                or not isinstance(self.spec_config, DSparkDecodingConfig)
+                or not self.spec_config.is_confidence_budget_enabled):
+            return None
+
+        generation_requests = batch.generation_requests
+        all_dummy_generation = (
+            batch.num_context_requests == 0 and bool(generation_requests)
+            and all(request.is_dummy for request in generation_requests))
+        if self._capture_allowed:
+            capture_budget_active, capture_budget = (
+                self.spec_config.get_confidence_capture_verifier_token_budget())
+            physical_draft_lens = [
+                len(request.py_draft_tokens) for request in generation_requests
+            ]
+            capture_k = (physical_draft_lens[0]
+                         if len(set(physical_draft_lens)) == 1 else -1)
+            local_capture = bool(all_dummy_generation and capture_budget_active)
+            local_capture_info = [
+                local_capture,
+                len(generation_requests),
+                capture_k,
+                capture_budget is not None,
+                0 if capture_budget is None else int(capture_budget),
+            ]
+            rank_capture_info = list(
+                self.config.dist.tp_allgather(local_capture_info))
+            if not rank_capture_info:
+                raise RuntimeError(
+                    "DSpark synthetic capture group exchange returned no peers")
+            if any(
+                    not isinstance(info, (list, tuple)) or len(info) != 5
+                    for info in rank_capture_info):
+                self.confidence_force_full_k_route = True
+                raise RuntimeError(
+                    "DSpark synthetic capture group exchange returned malformed "
+                    f"peer payloads: {rank_capture_info}")
+            if any(tuple(info) != tuple(local_capture_info)
+                   for info in rank_capture_info):
+                self.confidence_force_full_k_route = True
+                raise RuntimeError(
+                    "DSpark attention-DP peers selected different synthetic "
+                    f"capture shapes: {rank_capture_info}")
+            if not local_capture:
+                self.confidence_force_full_k_route = True
+                raise RuntimeError(
+                    "DSpark synthetic capture requires an all-dummy generation "
+                    "batch and an explicit capture-owned verifier budget: "
+                    f"{rank_capture_info}")
+
+            capture_g = len(generation_requests)
+            if (capture_k < 0 or capture_g != batch.batch_size
+                    or capture_g > self.max_supported_batch_size
+                    or capture_g > self.config.batch_size):
+                raise RuntimeError(
+                    "DSpark synthetic capture shape exceeds runtime capacity: "
+                    f"G={capture_g}, K={capture_k}")
+            if capture_budget is not None:
+                capture_budget = int(capture_budget)
+                candidates = self.spec_config.resolve_confidence_verifier_token_budget_candidates(
+                    capture_g)
+                if (capture_budget not in candidates
+                        or capture_budget < capture_g
+                        or capture_budget > capture_g * (capture_k + 1)):
+                    raise RuntimeError(
+                        "DSpark synthetic capture budget is not a configured "
+                        f"physical shape: G={capture_g}, K={capture_k}, "
+                        f"V={capture_budget}, candidates={candidates}")
+            else:
+                self.confidence_force_full_k_route = True
+            self.confidence_adp_execution_batch_size = capture_g
+            return capture_g
+
+        carried_layout = getattr(new_tensors_device,
+                                 "dspark_confidence_layout", None)
+        carried_epoch = getattr(new_tensors_device,
+                                "dspark_confidence_route_epoch", None)
+        if carried_layout is not None or carried_epoch is not None:
+            carried_g = int(
+                getattr(new_tensors_device,
+                        "dspark_confidence_execution_batch_size", 0) or 0)
+            carried_k = int(
+                getattr(new_tensors_device,
+                        "dspark_confidence_physical_draft_len", 0) or 0)
+            carried_epoch = int(carried_epoch or 0)
+            carried_engine_generation = int(
+                getattr(new_tensors_device,
+                        "dspark_confidence_engine_generation", 0) or 0)
+            carried_v = getattr(
+                new_tensors_device,
+                "dspark_confidence_verifier_token_budget", None)
+            budget_event = getattr(
+                new_tensors_device,
+                "dspark_confidence_budget_ready_event", None)
+            budget_host = getattr(
+                new_tensors_device,
+                "dspark_confidence_verifier_token_budget_host", None)
+            semantics_host = getattr(
+                new_tensors_device,
+                "dspark_confidence_semantics_host", None)
+            query_lens_host = getattr(
+                new_tensors_device,
+                "dspark_confidence_query_lens_host", None)
+            if (budget_event is not None
+                    and (budget_host is not None
+                         or semantics_host is not None
+                         or query_lens_host is not None)):
+                # The device-selected V, semantic scalars, and query lengths
+                # are copied into sampler-owned pinned storage beside the
+                # layout. Their small
+                # D2H overlaps scheduling/input preparation; wait only here,
+                # immediately before Python graph keying.
+                budget_event.synchronize()
+            if carried_v is None and budget_host is not None:
+                carried_v = int(budget_host)
+            carried_v = int(carried_v or 0)
+            semantic_values = (0, 0, 0, 0, 0, 0, 0)
+            semantic_payload_ready = False
+            if semantics_host is not None:
+                flattened_semantics = tuple(
+                    int(value) for value in semantics_host.reshape(-1).tolist())
+                if len(flattened_semantics) == 7:
+                    semantic_values = flattened_semantics
+                    semantic_payload_ready = True
+            (semantic_valid, row_map_valid, retained_count, query_count,
+             cu_query_count, semantic_real_count, declared_v) = semantic_values
+            current_ids = tuple(request.py_request_id
+                                for request in generation_requests
+                                if not request.is_dummy)
+            current_slots = tuple(request.py_seq_slot
+                                  for request in generation_requests
+                                  if not request.is_dummy)
+            planned_ids = tuple(
+                getattr(new_tensors_device,
+                        "dspark_confidence_request_ids", ()) or ())
+            planned_slots = tuple(
+                getattr(new_tensors_device,
+                        "dspark_confidence_seq_slots", ()) or ())
+            real_count = len(current_ids)
+            host_query_lens_exact = False
+            if (isinstance(query_lens_host, torch.Tensor)
+                    and query_lens_host.device.type == "cpu"
+                    and query_lens_host.dtype == torch.int32
+                    and query_lens_host.numel() == carried_g
+                    and carried_g >= real_count):
+                flattened_query_lens = query_lens_host.reshape(-1)
+                real_query_lens = flattened_query_lens[:real_count]
+                dummy_query_lens = flattened_query_lens[real_count:]
+                host_query_lens_exact = bool(
+                    torch.all(real_query_lens >= 1)
+                    and torch.all(real_query_lens <= carried_k + 1)
+                    and (dummy_query_lens.numel() == 0
+                         or torch.all(dummy_query_lens == 1))
+                    and int(flattened_query_lens.sum()) == declared_v)
+            roster_matches = (current_ids == planned_ids
+                              and current_slots == planned_slots)
+            physical_lens = [
+                len(request.py_draft_tokens) for request in generation_requests
+                if not request.is_dummy
+            ]
+            configured_budgets = (
+                self.spec_config.
+                resolve_confidence_verifier_token_budget_candidates(carried_g)
+                if carried_g > 0 else ())
+            base_layout_ready = bool(
+                batch.num_context_requests == 0 and carried_layout is not None
+                and carried_g >= real_count and real_count > 0
+                and declared_v >= carried_g and carried_k > 0
+                and declared_v <= carried_g * (carried_k + 1)
+                and declared_v in configured_budgets
+                and carried_g <= self.max_supported_batch_size
+                and carried_g <= self.config.batch_size
+                and carried_epoch > int(
+                    getattr(self, "_confidence_last_route_epoch", 0))
+                and carried_engine_generation == self.confidence_engine_generation
+                and roster_matches
+                and len(set(planned_ids)) == real_count
+                and len(set(planned_slots)) == real_count
+                and all(slot is not None for slot in planned_slots)
+                and physical_lens
+                and all(length == carried_k for length in physical_lens)
+                and carried_layout.retained_lens.shape == (carried_g, )
+                and carried_layout.query_lens.shape == (carried_g, )
+                and carried_layout.cu_query_lens.shape == (carried_g + 1, )
+                and carried_layout.real_request_mask.shape == (carried_g, )
+                and carried_layout.source_batch_indices.shape == (carried_g, )
+                and carried_layout.row_map_valid.shape == ()
+                and carried_layout.packed_to_dense.shape[0] >= declared_v
+                and carried_layout.packed_draft_indices.shape[0] >=
+                declared_v - carried_g)
+            semantic_exact = bool(
+                semantic_payload_ready and semantic_valid == 1
+                and row_map_valid == 1
+                and host_query_lens_exact
+                and carried_v == declared_v
+                and retained_count == declared_v - carried_g
+                and query_count == declared_v
+                and cu_query_count == declared_v
+                and semantic_real_count == real_count)
+            layout_shapes_ready = base_layout_ready and semantic_exact
+            local_route = [
+                layout_shapes_ready, base_layout_ready, semantic_exact,
+                carried_g, carried_v, carried_k, carried_epoch, real_count,
+                semantic_valid, row_map_valid, retained_count, query_count,
+                cu_query_count, semantic_real_count, declared_v
+            ]
+            rank_routes = list(self.config.dist.tp_allgather(local_route))
+            if any(
+                    not isinstance(route, (list, tuple)) or len(route) != 15
+                    for route in rank_routes):
+                self.confidence_force_full_k_route = True
+                raise RuntimeError(
+                    "DSpark confidence semantic exchange returned malformed "
+                    f"peer payloads: {rank_routes}")
+            unanimous = bool(
+                rank_routes and all(bool(route[0]) for route in rank_routes)
+                and all(tuple(route[3:]) == tuple(rank_routes[0][3:])
+                        for route in rank_routes))
+            if not unanimous:
+                common_semantic_provenance = bool(
+                    rank_routes and all(bool(route[1]) for route in rank_routes)
+                    and all((route[3], route[5], route[6], route[7], route[14])
+                            == (rank_routes[0][3], rank_routes[0][5],
+                                rank_routes[0][6], rank_routes[0][7],
+                                rank_routes[0][14])
+                            for route in rank_routes))
+                semantic_tuples_agree = bool(
+                    rank_routes and all(
+                        (route[4], *route[8:15]) ==
+                        (rank_routes[0][4], *rank_routes[0][8:15])
+                        for route in rank_routes))
+                if (common_semantic_provenance
+                        and (not all(bool(route[2]) for route in rank_routes)
+                             or not semantic_tuples_agree)):
+                    # The same physical-K proposal block is still available.
+                    # Reject the compact payload uniformly before padding or
+                    # index_select, and let this iteration run ordinary V0.
+                    self.confidence_discarded_device_layout = True
+                    self.confidence_force_full_k_route = True
+                    for request in generation_requests:
+                        if not request.is_dummy:
+                            request.py_draft_tokens_effective_len = len(
+                                request.py_draft_tokens)
+                            request.py_dspark_confidence_route_epoch = None
+                            request.py_dspark_confidence_execution_batch_size = None
+                            request.py_dspark_confidence_verifier_token_budget = None
+                    return 0
+                compact_payload = any(
+                    int(route[14]) > 0 and int(route[14]) <
+                    int(route[3]) * (int(route[5]) + 1)
+                    for route in rank_routes) if rank_routes else declared_v > 0
+                if compact_payload:
+                    # A completed/reordered roster may safely discard the old
+                    # compact plan because the carrier still owns a physical-K
+                    # proposal block. Stale or asymmetric provenance for the
+                    # same roster is still an unrecoverable late-route error.
+                    common_carried_shape = bool(
+                        rank_routes and all(
+                            (route[3], route[5], route[6], route[14]) ==
+                            (rank_routes[0][3], rank_routes[0][5],
+                             rank_routes[0][6], rank_routes[0][14])
+                            for route in rank_routes))
+                    peer_roster_transition = bool(
+                        common_carried_shape and
+                        (len({int(route[7]) for route in rank_routes}) > 1
+                         or any(bool(route[1]) != bool(rank_routes[0][1])
+                                 for route in rank_routes)))
+                    local_discardable = bool(
+                        (not roster_matches or peer_roster_transition)
+                        and batch.num_context_requests == 0
+                        and carried_engine_generation ==
+                        self.confidence_engine_generation
+                        and carried_epoch > int(
+                            getattr(self, "_confidence_last_route_epoch", 0))
+                        and physical_lens
+                        and all(length == carried_k for length in physical_lens))
+                    discard_info = list(
+                        self.config.dist.tp_allgather(
+                            [local_discardable, real_count]))
+                    if (common_carried_shape and discard_info
+                            and all(bool(info[0]) for info in discard_info)):
+                        self.confidence_discarded_device_layout = True
+                        for request in generation_requests:
+                            if not request.is_dummy:
+                                request.py_draft_tokens_effective_len = len(
+                                    request.py_draft_tokens)
+                                request.py_dspark_confidence_route_epoch = None
+                                request.py_dspark_confidence_execution_batch_size = None
+                                request.py_dspark_confidence_verifier_token_budget = None
+                    else:
+                        self.confidence_force_full_k_route = True
+                        raise RuntimeError(
+                            "DSpark compact device layout provenance is missing, "
+                            "stale, or asymmetric across ADP peers: "
+                            f"{rank_routes}")
+                else:
+                    self.confidence_force_full_k_route = True
+                    return 0
+            else:
+                self.confidence_device_layout = carried_layout
+                self.confidence_query_lens_host = query_lens_host
+                self.confidence_device_layout_row_map_valid = True
+                self.confidence_adp_execution_batch_size = carried_g
+                self.confidence_adp_verifier_token_budget = carried_v
+                self.confidence_adp_route_epoch = carried_epoch
+                self._confidence_last_route_epoch = carried_epoch
+                return carried_g
+
+        real_requests = [
+            request for request in batch.generation_requests
+            if not request.is_dummy
+        ]
+        local_compact_request_state = any(
+            getattr(request, "py_draft_tokens_effective_len", None)
+            is not None
+            and int(request.py_draft_tokens_effective_len)
+            != len(request.py_draft_tokens) for request in real_requests)
+        incomplete_device_plan = bool(
+            new_tensors_device is not None
+            and getattr(new_tensors_device, "next_draft_lens", None) is not None
+            and not self.confidence_discarded_device_layout)
+        local_ready = (
+            batch.num_context_requests == 0 and bool(real_requests)
+            and all(len(request.py_draft_tokens) ==
+                    self.spec_config.max_draft_len
+                    for request in real_requests)
+            and not local_compact_request_state
+            and not incomplete_device_plan)
+        rank_info = list(
+            self.config.dist.tp_allgather(
+                [local_ready, len(real_requests),
+                 local_compact_request_state or incomplete_device_plan]))
+        if not rank_info:
+            raise RuntimeError(
+                "DSpark attention-DP group exchange returned no peers")
+
+        if any(bool(info[2]) for info in rank_info):
+            self.confidence_force_full_k_route = True
+            raise RuntimeError(
+                "DSpark compact draft lengths arrived without their exact "
+                f"iteration-owned device layout provenance: {rank_info}")
+
+        if not all(bool(info[0]) for info in rank_info):
+            self.confidence_force_full_k_route = True
+            return 0
+
+        max_real_requests = max(int(info[1]) for info in rank_info)
+        configured_batches = sorted(
+            graph_batch_size for graph_batch_size in self.supported_batch_sizes
+            if self.spec_config.
+            resolve_confidence_verifier_token_budget_candidates(
+                graph_batch_size))
+        common_batch = next(
+            (graph_batch_size for graph_batch_size in configured_batches
+             if graph_batch_size >= max_real_requests), 0)
+        if (common_batch <= 0
+                or common_batch > self.max_supported_batch_size
+                or common_batch > self.config.batch_size
+                or batch.batch_size > common_batch):
+            return 0
+        self.confidence_adp_execution_batch_size = common_batch
+        self.confidence_force_full_k_route = True
+        return common_batch
+
+    def _get_padded_batch(
+            self, batch: ScheduledRequests, resource_manager: ResourceManager,
+            runtime_draft_len: int,
+            new_tensors_device: Optional[SampleStateTensors] = None) -> int:
         can_run_cuda_graph = self._can_run_cuda_graph_batch(batch)
         batch_size = batch.batch_size
         new_batch_size = batch_size
+        common_confidence_batch = (
+            CUDAGraphRunner._get_confidence_adp_common_batch_size(
+                self, batch, new_tensors_device))
+        self.confidence_adp_plan_ready = common_confidence_batch != 0
 
-        if self.enabled and self.config.enable_attention_dp and self.config.mapping.tp_size > 1:
+        if common_confidence_batch is not None:
+            if common_confidence_batch == 0:
+                return 0
+            # A generation-only DSpark confidence batch can be ineligible only
+            # because its real N is not itself a captured graph size. The
+            # readiness exchange above proves every peer can instead use the
+            # same captured G before any confidence plan/draft is made.
+            can_run_cuda_graph = True
+            new_batch_size = common_confidence_batch
+        elif self.enabled and self.config.enable_attention_dp:
             graph_batch_info = self.config.dist.tp_allgather(
                 [can_run_cuda_graph, batch_size])
             all_can_run_cuda_graph = all(rank_info[0]
@@ -1008,6 +1541,12 @@ class CUDAGraphRunner:
         # otherwise this reduces to plain batch-size rounding.
         padded_batch_size = self._round_up_batch_size_with_draft_len(
             new_batch_size, runtime_draft_len)
+        if (common_confidence_batch is not None
+                and padded_batch_size != common_confidence_batch):
+            raise RuntimeError(
+                "DSpark common ADP batch did not resolve to the same captured "
+                f"batch: agreed={common_confidence_batch}, "
+                f"resolved={padded_batch_size}")
 
         if batch_size == padded_batch_size:
             return 0
@@ -1031,6 +1570,18 @@ class CUDAGraphRunner:
                 "falling back to eager mode for padded batches.",
                 key=f"cuda_graph_padding_dummy_fallback_{runtime_draft_len}")
             return 0
+
+        if (not self.config.is_draft_model
+                and isinstance(self.spec_config, DSparkDecodingConfig)
+                and self.spec_config.is_confidence_budget_enabled):
+            # Runtime padding contributes one mandatory verifier anchor but no
+            # draft tokens. Reset on every use because the shared dummy object
+            # is realigned to physical K whenever the final route falls back to
+            # V=0/eager. Synthetic capture does not use this padding path and
+            # retains its separately generated nonzero compact lengths.
+            padding_dummy_request.py_draft_tokens_effective_len = (
+                len(padding_dummy_request.py_draft_tokens)
+                if self.confidence_force_full_k_route else 0)
 
         batch.generation_requests.extend([padding_dummy_request] * padding_size)
         return padding_size
@@ -1283,14 +1834,14 @@ class CUDAGraphRunner:
         return 0
 
     @contextlib.contextmanager
-    def pad_batch(self,
-                  scheduled_requests: ScheduledRequests,
-                  resource_manager: ResourceManager,
-                  runtime_draft_len: int = 0):
+    def pad_batch(
+            self, scheduled_requests: ScheduledRequests,
+            resource_manager: ResourceManager, runtime_draft_len: int = 0,
+            new_tensors_device: Optional[SampleStateTensors] = None):
         """Context manager to pad a batch to a graph-compatible size."""
-        padding_size = self._get_padded_batch(scheduled_requests,
-                                              resource_manager,
-                                              runtime_draft_len)
+        padding_size = self._get_padded_batch(
+            scheduled_requests, resource_manager, runtime_draft_len,
+            new_tensors_device)
         try:
             yield scheduled_requests
         finally:

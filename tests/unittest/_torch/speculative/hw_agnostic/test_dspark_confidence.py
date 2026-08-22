@@ -14,6 +14,7 @@
 # limitations under the License.
 """Tests for fixed- and dynamic-budget DSpark confidence planning."""
 
+import hashlib
 import json
 from dataclasses import dataclass
 
@@ -23,14 +24,19 @@ import torch
 
 from tensorrt_llm._torch.speculative.dspark_confidence import (
     apply_sts,
+    build_confidence_device_layout,
     load_sts_temperatures,
     plan_dynamic_verifier_budget,
     plan_fixed_verifier_budget,
+    plan_masked_fixed_verifier_draft_lens,
     verify_packed_greedy,
 )
 from tensorrt_llm._torch.speculative.dspark_planner import (
+    ExactSpsCostTable,
     SpsCostTable,
     derive_fixed_verifier_budget_candidates,
+    load_engine_fingerprint,
+    load_sps_cost_table,
     select_fixed_verifier_budget,
     select_fixed_verifier_budget_from_traces,
     validate_sps_cost_table_payload,
@@ -224,6 +230,90 @@ def test_dynamic_budget_reducer_must_preserve_candidate_shape() -> None:
         )
 
 
+def test_dynamic_budget_mask_excludes_padding_rows_from_allocation() -> None:
+    logits = torch.full((4, 2), 20.0, dtype=torch.float32)
+    budgets = torch.tensor([4, 6, 12], dtype=torch.int64)
+    step_times = torch.tensor([1.5, 1.2, 10.0], dtype=torch.float32)
+    real_request_mask = torch.tensor([True, True, False, False])
+
+    plan = plan_dynamic_verifier_budget(
+        logits,
+        budgets,
+        step_times,
+        real_request_mask=real_request_mask,
+    )
+
+    assert int(plan.verifier_token_budget) == 6
+    assert plan.retained_lens.tolist() == [1, 1, 0, 0]
+
+
+def test_dynamic_budget_mask_invalidates_tier_before_yield_reduction() -> None:
+    logits = torch.full((4, 2), 20.0, dtype=torch.float32)
+    budgets = torch.tensor([8, 12], dtype=torch.int64)
+    step_times = torch.tensor([0.1, 100.0], dtype=torch.float32)
+    real_request_mask = torch.tensor([True, False, False, False])
+    observed: list[torch.Tensor] = []
+
+    def capture(values: torch.Tensor) -> torch.Tensor:
+        observed.append(values.clone())
+        return values
+
+    plan = plan_dynamic_verifier_budget(
+        logits,
+        budgets,
+        step_times,
+        candidate_yield_reducer=capture,
+        real_request_mask=real_request_mask,
+    )
+
+    assert torch.isneginf(observed[0][0])
+    assert torch.isfinite(observed[0][1])
+    assert int(plan.verifier_token_budget) == 12
+    assert plan.retained_lens.tolist() == [2, 0, 0, 0]
+
+
+def test_dynamic_budget_peer_ineligibility_forces_shared_full_k() -> None:
+    logits = torch.full((4, 2), 20.0, dtype=torch.float32)
+    budgets = torch.tensor([8, 12], dtype=torch.int64)
+    step_times = torch.tensor([1.0, 100.0], dtype=torch.float32)
+
+    def peer_reducer(values: torch.Tensor) -> torch.Tensor:
+        reduced = values.clone()
+        reduced[0] = float("-inf")
+        return reduced
+
+    plan = plan_dynamic_verifier_budget(
+        logits,
+        budgets,
+        step_times,
+        candidate_yield_reducer=peer_reducer,
+        real_request_mask=torch.ones(4, dtype=torch.bool),
+    )
+
+    assert int(plan.verifier_token_budget) == 12
+    assert plan.retained_lens.tolist() == [2, 2, 2, 2]
+
+
+@pytest.mark.parametrize(
+    "real_request_mask",
+    [
+        torch.ones(4),
+        torch.ones(4, dtype=torch.bool).reshape(2, 2),
+        torch.ones(3, dtype=torch.bool),
+    ],
+)
+def test_dynamic_budget_real_request_mask_must_match_requests(
+    real_request_mask: torch.Tensor,
+) -> None:
+    with pytest.raises(ValueError, match="real_request_mask"):
+        plan_dynamic_verifier_budget(
+            torch.zeros((4, 2)),
+            torch.tensor([8, 12]),
+            torch.tensor([1.0, 2.0]),
+            real_request_mask=real_request_mask,
+        )
+
+
 @pytest.mark.parametrize("verifier_token_budget", [4, 5, 11, 24])
 def test_plan_matches_cpu_reference_and_exact_budget(
     verifier_token_budget: int,
@@ -241,6 +331,89 @@ def test_plan_matches_cpu_reference_and_exact_budget(
     plan = plan_fixed_verifier_budget(confidence_logits, verifier_token_budget)
     for retained_len in plan.retained_lens.tolist():
         assert 0 <= retained_len <= confidence_logits.shape[1]
+
+
+def test_masked_fixed_lens_exclude_padding_rows_and_keep_exact_budget():
+    logits = torch.tensor(
+        [
+            [4.0, 3.0, 2.0, 1.0, 0.0],
+            [3.5, 2.5, 1.5, 0.5, -0.5],
+            [100.0, 100.0, 100.0, 100.0, 100.0],
+            [100.0, 100.0, 100.0, 100.0, 100.0],
+        ]
+    )
+    real_mask = torch.tensor([True, True, False, False])
+
+    retained = plan_masked_fixed_verifier_draft_lens(
+        logits,
+        verifier_token_budget=7,
+        real_request_mask=real_mask,
+    )
+
+    assert retained[2:].tolist() == [0, 0]
+    assert int(retained.sum()) == 3
+    assert int(retained.max()) <= 5
+
+
+def test_masked_fixed_lens_fall_back_to_real_full_k_when_infeasible():
+    logits = torch.zeros(4, 5)
+    real_mask = torch.tensor([True, True, False, False])
+
+    retained = plan_masked_fixed_verifier_draft_lens(
+        logits,
+        verifier_token_budget=16,
+        real_request_mask=real_mask,
+    )
+
+    assert retained.tolist() == [5, 5, 0, 0]
+
+
+def test_g128_v256_undercounted_mask_publishes_v0_semantics():
+    logits = torch.zeros(128, 5)
+    real_mask = torch.zeros(128, dtype=torch.bool)
+    real_mask[:17] = True
+    retained = plan_masked_fixed_verifier_draft_lens(
+        logits,
+        verifier_token_budget=256,
+        real_request_mask=real_mask,
+    )
+
+    layout = build_confidence_device_layout(
+        retained,
+        real_mask,
+        torch.arange(128),
+        verifier_token_budget=256,
+        physical_draft_len=5,
+    )
+
+    assert retained.tolist() == [5] * 17 + [0] * 111
+    assert int(layout.retained_token_count) == 85
+    assert int(layout.query_token_count) == 213
+    assert int(layout.cu_query_token_count) == 213
+    assert int(layout.real_request_count) == 17
+    assert int(layout.declared_verifier_token_budget) == 256
+    assert int(layout.semantic_valid) == 0
+    assert int(layout.verifier_token_budget) == 0
+
+
+def test_masked_fixed_lens_match_original_when_every_row_is_real():
+    logits = torch.tensor(
+        [
+            [2.0, 1.0, 0.0],
+            [1.5, 0.5, -0.5],
+            [1.0, 0.0, -1.0],
+        ]
+    )
+    budget = 8
+    expected = plan_fixed_verifier_budget(logits, budget).retained_lens
+
+    actual = plan_masked_fixed_verifier_draft_lens(
+        logits,
+        verifier_token_budget=budget,
+        real_request_mask=torch.ones(3, dtype=torch.bool),
+    )
+
+    assert torch.equal(actual, expected)
 
 
 def test_randomized_plans_match_cpu_reference_and_preserve_invariants() -> None:
@@ -512,6 +685,53 @@ def _sps_payload() -> dict[str, object]:
     }
 
 
+def _multi_g_sps_payload() -> dict[str, object]:
+    fingerprint = {
+        "gpu": "B300",
+        "gpu_count": 8,
+        "gpu_snapshot_sha256": "c" * 64,
+        "global_graph_batch_sizes": [32, 64],
+        "max_draft_len": 5,
+        "rank_local_graph_batch_sizes": [4, 8],
+        "runtime_snapshot": "runtime-v2",
+        "source_head": "abc123",
+        "source_diff_sha256": "a" * 64,
+        "topology": "TP8_EP8_attention_DP8",
+    }
+    payload = {
+        "schema_version": 2,
+        "minimum_predicted_gain": 0.02,
+        "cost_tables": {
+            "4": {
+                "token_counts": [8, 16, 24],
+                "step_time_ms": [1.0, 1.2, 1.5],
+            },
+            "8": {
+                "token_counts": [16, 32, 48],
+                "step_time_ms": [1.5, 1.9, 2.4],
+            },
+        },
+        "engine_fingerprint": fingerprint,
+        "measurements": [
+            {
+                "rank_local_graph_batch_size": graph_batch_size,
+                "rank_local_verifier_budget": verifier_token_budget,
+                "step_time_ms": step_time,
+                "source_result_sha256": "b" * 64,
+            }
+            for graph_batch_size, verifier_token_budgets, step_times in (
+                (4, (8, 16, 24), (1.0, 1.2, 1.5)),
+                (8, (16, 32, 48), (1.5, 1.9, 2.4)),
+            )
+            for verifier_token_budget, step_time in zip(verifier_token_budgets, step_times)
+        ],
+    }
+    payload["engine_fingerprint_sha256"] = hashlib.sha256(
+        json.dumps(fingerprint, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return payload
+
+
 def test_sps_artifact_validation_accepts_exact_measured_tiers() -> None:
     fingerprint = validate_sps_cost_table_payload(
         _sps_payload(),
@@ -520,6 +740,132 @@ def test_sps_artifact_validation_accepts_exact_measured_tiers() -> None:
     )
 
     assert fingerprint["topology"] == "TP8_EP8_attention_DP8"
+
+
+def test_multi_g_sps_artifact_requires_direct_exact_cells(tmp_path) -> None:
+    path = tmp_path / "multi-g-costs.json"
+    path.write_text(json.dumps(_multi_g_sps_payload()))
+
+    table, payload = load_sps_cost_table(path)
+    fingerprint = validate_sps_cost_table_payload(
+        payload,
+        verifier_token_budget_tiers={
+            4: [8, 16, 24],
+            8: [16, 32, 48],
+        },
+        max_draft_len=5,
+        active_engine_fingerprint=payload["engine_fingerprint"],
+    )
+
+    assert isinstance(table, ExactSpsCostTable)
+    assert table.minimum_predicted_gain == pytest.approx(0.02)
+    assert table.step_time(16, 4) == pytest.approx(1.2)
+    assert table.step_time(32, 8) == pytest.approx(1.9)
+    assert fingerprint["rank_local_graph_batch_sizes"] == [4, 8]
+    with pytest.raises(ValueError, match="no direct measurements for G=4, V=\\[12\\]"):
+        table.step_time(12, 4)
+    with pytest.raises(ValueError, match="no direct measurements for G=16"):
+        table.step_time(32, 16)
+
+
+def test_active_engine_fingerprint_artifact_is_authenticated(tmp_path) -> None:
+    payload = _multi_g_sps_payload()
+    path = tmp_path / "engine-provenance.json"
+    path.write_text(
+        json.dumps(
+            {
+                "engine_fingerprint": payload["engine_fingerprint"],
+                "engine_fingerprint_sha256": payload["engine_fingerprint_sha256"],
+            }
+        )
+    )
+    assert load_engine_fingerprint(path) == payload["engine_fingerprint"]
+    tampered = json.loads(path.read_text())
+    tampered["engine_fingerprint"]["runtime_snapshot"] = "different"
+    path.write_text(json.dumps(tampered))
+    with pytest.raises(ValueError, match="fingerprint SHA256"):
+        load_engine_fingerprint(path)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (
+            lambda payload: payload["cost_tables"]["8"].update(
+                {"token_counts": [16, 48], "step_time_ms": [1.5, 2.4]}
+            ),
+            "missing pairs",
+        ),
+        (
+            lambda payload: payload["engine_fingerprint"].update(
+                {"rank_local_graph_batch_sizes": [4]}
+            ),
+            "must match exactly",
+        ),
+        (
+            lambda payload: payload.update({"measurements": payload["measurements"][:-1]}),
+            "provenance",
+        ),
+    ],
+)
+def test_multi_g_sps_artifact_rejects_incomplete_exact_coverage(
+    mutation,
+    message: str,
+) -> None:
+    payload = _multi_g_sps_payload()
+    mutation(payload)
+    payload["engine_fingerprint_sha256"] = hashlib.sha256(
+        json.dumps(
+            payload["engine_fingerprint"],
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+
+    with pytest.raises(ValueError, match=message):
+        validate_sps_cost_table_payload(
+            payload,
+            verifier_token_budget_tiers={
+                4: [8, 16, 24],
+                8: [16, 32, 48],
+            },
+            max_draft_len=5,
+            active_engine_fingerprint=payload["engine_fingerprint"],
+        )
+
+
+@pytest.mark.parametrize(
+    "field", ["source_diff_sha256", "runtime_snapshot", "gpu", "topology"]
+)
+def test_multi_g_sps_artifact_rejects_active_engine_mismatch(field: str) -> None:
+    payload = _multi_g_sps_payload()
+    active = dict(payload["engine_fingerprint"])
+    active[field] = "different"
+    with pytest.raises(ValueError, match="does not match active runtime"):
+        validate_sps_cost_table_payload(
+            payload,
+            verifier_token_budget_tiers={
+                4: [8, 16, 24],
+                8: [16, 32, 48],
+            },
+            max_draft_len=5,
+            active_engine_fingerprint=active,
+        )
+
+
+def test_multi_g_sps_artifact_rejects_cell_provenance_mismatch() -> None:
+    payload = _multi_g_sps_payload()
+    payload["measurements"][0]["step_time_ms"] += 0.1
+    with pytest.raises(ValueError, match="do not match measurement"):
+        validate_sps_cost_table_payload(
+            payload,
+            verifier_token_budget_tiers={
+                4: [8, 16, 24],
+                8: [16, 32, 48],
+            },
+            max_draft_len=5,
+            active_engine_fingerprint=payload["engine_fingerprint"],
+        )
 
 
 @pytest.mark.parametrize(
@@ -708,6 +1054,44 @@ def test_cuda_graph_capture_and_replay() -> None:
     assert captured_plan.retained_lens.cpu().tolist() == expected.retained_lens
     assert captured_plan.packed_to_dense.cpu().tolist() == expected.packed_to_dense
     assert not torch.equal(first_retained_lens, captured_plan.retained_lens)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+@pytest.mark.parametrize(
+    ("num_requests", "verifier_token_budget"),
+    [
+        (16, 32),
+        (16, 64),
+        (16, 96),
+        (32, 64),
+        (32, 128),
+        (32, 192),
+        (64, 128),
+        (64, 256),
+        (64, 384),
+        (128, 256),
+        (128, 512),
+        (128, 768),
+    ],
+)
+def test_smaller_g_profile_cells_capture_exact_compact_v(
+    num_requests: int, verifier_token_budget: int
+) -> None:
+    """Every staged T(G,V) cell can be planned inside a CUDA graph."""
+    logits = torch.zeros((num_requests, 5), device="cuda", dtype=torch.float32)
+    for _ in range(2):
+        plan_fixed_verifier_budget(logits, verifier_token_budget)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        plan = plan_fixed_verifier_budget(logits, verifier_token_budget)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert tuple(plan.query_lens.shape) == (num_requests,)
+    assert plan.cu_query_lens.numel() == num_requests + 1
+    assert int(plan.query_lens.sum()) == verifier_token_budget
+    assert int(plan.cu_query_lens[-1]) == verifier_token_budget
+    assert int(plan.retained_lens.sum()) == verifier_token_budget - num_requests
+    assert plan.packed_to_dense.numel() == verifier_token_budget
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")

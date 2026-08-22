@@ -16,19 +16,331 @@
 
 import json
 from pathlib import Path
-from typing import Callable, NamedTuple
+from typing import Callable, NamedTuple, Optional
 
 import torch
 
 __all__ = [
+    "DSparkConfidenceDeviceLayout",
     "DynamicBudgetPlan",
     "FixedBudgetPlan",
     "apply_sts",
+    "build_confidence_device_layout",
+    "validate_confidence_device_layout_row_map",
     "load_sts_temperatures",
     "plan_dynamic_verifier_budget",
     "plan_fixed_verifier_budget",
     "verify_packed_greedy",
 ]
+
+
+class DSparkConfidenceDeviceLayout(NamedTuple):
+    """Iteration-owned packed verifier layout kept entirely on device.
+
+    Every tensor has a graph-static shape derived from ``(G, V, K)``.  The
+    layout is produced beside ``next_draft_lens`` and consumed with the matching
+    next-token buffers, so overlap scheduling never has to consult the delayed
+    request-local retained lengths.
+    """
+
+    retained_lens: torch.Tensor
+    query_lens: torch.Tensor
+    cu_query_lens: torch.Tensor
+    real_request_mask: torch.Tensor
+    packed_to_dense: torch.Tensor
+    packed_draft_indices: torch.Tensor
+    packed_request_ids: torch.Tensor
+    packed_local_positions: torch.Tensor
+    source_batch_indices: torch.Tensor
+    retained_token_count: torch.Tensor
+    query_token_count: torch.Tensor
+    cu_query_token_count: torch.Tensor
+    real_request_count: torch.Tensor
+    row_map_valid: torch.Tensor
+    semantic_valid: torch.Tensor
+    declared_verifier_token_budget: torch.Tensor
+    real_token_count: torch.Tensor
+    verifier_token_budget: torch.Tensor
+
+
+def validate_confidence_device_layout_row_map(
+    layout: DSparkConfidenceDeviceLayout,
+    physical_draft_len: int,
+    expected_source_slots: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Return one device scalar proving every model-facing row map is safe.
+
+    The check is deliberately tensor-only: it runs before the sampler records
+    the existing layout-ready event, so final Python keying can consume the
+    result without an earlier device synchronization.  Passing
+    ``expected_source_slots`` additionally binds sampler-owned source rows to
+    the exact current roster; the producer call omits it and validates the
+    structural layout only.
+    """
+    retained_lens = layout.retained_lens
+    graph_batch_size = retained_lens.shape[0]
+    max_draft_len = int(physical_draft_len)
+    if graph_batch_size == 0 or max_draft_len <= 0:
+        return torch.zeros((), dtype=torch.bool, device=retained_lens.device)
+
+    device = retained_lens.device
+    declared_v = layout.declared_verifier_token_budget.to(torch.int64)
+    row_ids = torch.arange(graph_batch_size, device=device, dtype=torch.int64)
+    if expected_source_slots is None:
+        expected_real_count = layout.real_request_count.to(torch.int64)
+        source_rows_valid = torch.all(layout.source_batch_indices >= 0)
+    else:
+        expected_source_slots = expected_source_slots.to(device=device,
+                                                         dtype=torch.long)
+        expected_real_count = torch.full((),
+                                         expected_source_slots.shape[0],
+                                         device=device,
+                                         dtype=torch.int64)
+        expected_sources = torch.zeros_like(layout.source_batch_indices)
+        expected_sources[:expected_source_slots.shape[0]].copy_(
+            expected_source_slots)
+        source_rows_valid = torch.all(layout.source_batch_indices ==
+                                      expected_sources)
+
+    expected_real_mask = row_ids < expected_real_count
+    real_mask_exact = torch.all(layout.real_request_mask == expected_real_mask)
+    retained_in_bounds = torch.all((retained_lens >= 0)
+                                   & (retained_lens <= max_draft_len))
+    dummy_rows_empty = torch.all(
+        torch.where(expected_real_mask, torch.ones_like(expected_real_mask),
+                    retained_lens == 0))
+    query_lens_exact = torch.all(layout.query_lens == retained_lens + 1)
+    expected_cu_query_lens = torch.cat((
+        torch.zeros(1, dtype=torch.int32, device=device),
+        torch.cumsum(retained_lens + 1, dim=0, dtype=torch.int32),
+    ))
+    cu_query_lens_exact = torch.all(layout.cu_query_lens ==
+                                    expected_cu_query_lens)
+
+    dense_width = max_draft_len + 1
+    dense_capacity = graph_batch_size * dense_width
+    packed_positions = torch.arange(layout.packed_to_dense.shape[0],
+                                    device=device,
+                                    dtype=torch.int64)
+    budget_in_bounds = ((declared_v >= graph_batch_size)
+                        & (declared_v <= layout.packed_to_dense.shape[0]))
+    packed_active = packed_positions < declared_v
+    packed_bounds = ((layout.packed_to_dense >= 0)
+                     & (layout.packed_to_dense < dense_capacity))
+    safe_packed = layout.packed_to_dense.clamp(0, dense_capacity - 1)
+    dense_local_positions = torch.arange(dense_width,
+                                         device=device,
+                                         dtype=torch.int32)
+    dense_keep = (dense_local_positions.unsqueeze(0) <
+                  (retained_lens + 1).unsqueeze(1)).reshape(-1)
+    packed_selects_valid = torch.all(
+        ~packed_active | (packed_bounds & dense_keep[safe_packed]))
+    previous_packed = torch.cat((
+        torch.zeros(1, dtype=layout.packed_to_dense.dtype, device=device),
+        layout.packed_to_dense[:-1],
+    ))
+    packed_strict_order = torch.all(
+        ~packed_active | (packed_positions == 0)
+        | (layout.packed_to_dense > previous_packed))
+    packed_tail_zero = torch.all(
+        packed_active | ((layout.packed_to_dense == 0)
+                         & (layout.packed_request_ids == 0)
+                         & (layout.packed_local_positions == 0)))
+    packed_coordinates_exact = torch.all(
+        ~packed_active
+        | ((layout.packed_request_ids == safe_packed // dense_width)
+           & (layout.packed_local_positions == safe_packed % dense_width)))
+
+    computed_real_tokens = torch.sum(
+        (retained_lens + 1) * expected_real_mask.to(torch.int32),
+        dtype=torch.int32)
+    real_token_count_exact = (layout.real_token_count == computed_real_tokens)
+    real_token_prefix = packed_positions < computed_real_tokens.to(torch.int64)
+    packed_real_prefix_exact = torch.all(
+        ~real_token_prefix | (layout.packed_request_ids < expected_real_count))
+    packed_dummy_suffix_exact = torch.all(
+        ~(packed_active & ~real_token_prefix)
+        | ((layout.packed_request_ids >= expected_real_count)
+           & (layout.packed_local_positions == 0)))
+
+    draft_capacity = graph_batch_size * max_draft_len
+    draft_positions = torch.arange(layout.packed_draft_indices.shape[0],
+                                   device=device,
+                                   dtype=torch.int64)
+    active_draft_count = declared_v - graph_batch_size
+    draft_active = draft_positions < active_draft_count
+    draft_bounds = ((layout.packed_draft_indices >= 0)
+                    & (layout.packed_draft_indices < draft_capacity))
+    safe_drafts = layout.packed_draft_indices.clamp(0, draft_capacity - 1)
+    dense_draft_positions = torch.arange(max_draft_len,
+                                         device=device,
+                                         dtype=torch.int32)
+    draft_keep = (dense_draft_positions.unsqueeze(0) <
+                  retained_lens.unsqueeze(1)).reshape(-1)
+    draft_selects_valid = torch.all(
+        ~draft_active | (draft_bounds & draft_keep[safe_drafts]))
+    previous_draft = torch.cat((
+        torch.zeros(1,
+                    dtype=layout.packed_draft_indices.dtype,
+                    device=device),
+        layout.packed_draft_indices[:-1],
+    ))
+    draft_strict_order = torch.all(
+        ~draft_active | (draft_positions == 0)
+        | (layout.packed_draft_indices > previous_draft))
+    draft_tail_zero = torch.all(draft_active
+                                | (layout.packed_draft_indices == 0))
+
+    return (budget_in_bounds & (expected_real_count > 0)
+            & (expected_real_count <= graph_batch_size) & real_mask_exact
+            & retained_in_bounds & dummy_rows_empty
+            & query_lens_exact & cu_query_lens_exact & source_rows_valid
+            & (layout.real_request_count == expected_real_count)
+            & (layout.retained_token_count == active_draft_count)
+            & (layout.query_token_count == declared_v)
+            & (layout.cu_query_token_count == declared_v)
+            & packed_selects_valid & packed_strict_order & packed_tail_zero
+            & packed_coordinates_exact & real_token_count_exact
+            & packed_real_prefix_exact & packed_dummy_suffix_exact
+            & draft_selects_valid & draft_strict_order & draft_tail_zero)
+
+
+def build_confidence_device_layout(
+    retained_lens: torch.Tensor,
+    real_request_mask: torch.Tensor,
+    source_batch_indices: torch.Tensor,
+    verifier_token_budget: int | torch.Tensor,
+    physical_draft_len: int,
+    packed_capacity: Optional[int] = None,
+) -> DSparkConfidenceDeviceLayout:
+    """Build the exact fixed-shape next-iteration verifier layout on device."""
+    if retained_lens.ndim != 1:
+        raise ValueError("retained_lens must be one-dimensional")
+    graph_batch_size = retained_lens.shape[0]
+    if graph_batch_size == 0:
+        raise ValueError("retained_lens must be non-empty")
+    if real_request_mask.shape != retained_lens.shape or real_request_mask.dtype != torch.bool:
+        raise ValueError("real_request_mask must be a matching boolean vector")
+    if source_batch_indices.shape != retained_lens.shape:
+        raise ValueError("source_batch_indices must match retained_lens")
+    if (real_request_mask.device != retained_lens.device
+            or source_batch_indices.device != retained_lens.device):
+        raise ValueError("layout inputs must reside on the same device")
+
+    retained_lens = retained_lens.to(dtype=torch.int32)
+    source_batch_indices = source_batch_indices.to(dtype=torch.long)
+    max_draft_len = int(physical_draft_len)
+    if max_draft_len <= 0:
+        raise ValueError("retained_lens must carry positive DSpark physical K")
+    if isinstance(verifier_token_budget, torch.Tensor):
+        selected_budget = verifier_token_budget.to(
+            device=retained_lens.device, dtype=torch.int32)
+        if selected_budget.ndim != 0:
+            raise ValueError("verifier_token_budget tensor must be scalar")
+    else:
+        selected_budget = torch.full(
+            (), int(verifier_token_budget), dtype=torch.int32,
+            device=retained_lens.device)
+    if packed_capacity is None:
+        if isinstance(verifier_token_budget, torch.Tensor):
+            raise ValueError(
+                "packed_capacity is required for a device-selected budget")
+        packed_capacity = int(verifier_token_budget)
+    else:
+        packed_capacity = int(packed_capacity)
+    if packed_capacity < graph_batch_size:
+        raise ValueError("verifier_token_budget must include one anchor per row")
+
+    query_lens = retained_lens + 1
+    cu_query_lens = torch.cat((
+        torch.zeros(1, dtype=torch.int32, device=retained_lens.device),
+        torch.cumsum(query_lens, dim=0, dtype=torch.int32),
+    ))
+    dense_width = max_draft_len + 1
+    dense_capacity = graph_batch_size * dense_width
+    local_positions = torch.arange(
+        dense_width, dtype=torch.int32, device=retained_lens.device)
+    dense_keep = local_positions.unsqueeze(0) < query_lens.unsqueeze(1)
+    dense_indices = torch.arange(
+        dense_capacity, dtype=torch.long, device=retained_lens.device)
+    sort_keys = torch.where(dense_keep.reshape(-1), dense_indices,
+                            dense_indices + dense_capacity)
+    packed_to_dense = torch.argsort(sort_keys)[:packed_capacity]
+    packed_positions = torch.arange(packed_capacity,
+                                    dtype=torch.int32,
+                                    device=retained_lens.device)
+    packed_to_dense = torch.where(packed_positions < selected_budget,
+                                  packed_to_dense,
+                                  torch.zeros_like(packed_to_dense))
+    packed_request_ids = torch.div(
+        packed_to_dense, dense_width, rounding_mode="floor")
+    packed_local_positions = torch.remainder(packed_to_dense, dense_width)
+
+    draft_capacity = graph_batch_size * max_draft_len
+    draft_positions = torch.arange(
+        max_draft_len, dtype=torch.int32, device=retained_lens.device)
+    draft_keep = draft_positions.unsqueeze(0) < retained_lens.unsqueeze(1)
+    draft_indices = torch.arange(
+        draft_capacity, dtype=torch.long, device=retained_lens.device)
+    draft_sort_keys = torch.where(draft_keep.reshape(-1), draft_indices,
+                                  draft_indices + draft_capacity)
+    packed_draft_indices = torch.argsort(
+        draft_sort_keys)[:packed_capacity - graph_batch_size]
+    draft_packed_positions = torch.arange(packed_capacity - graph_batch_size,
+                                          dtype=torch.int32,
+                                          device=retained_lens.device)
+    packed_draft_indices = torch.where(
+        draft_packed_positions < selected_budget - graph_batch_size,
+        packed_draft_indices, torch.zeros_like(packed_draft_indices))
+    retained_token_count = torch.sum(retained_lens, dtype=torch.int32)
+    query_token_count = torch.sum(query_lens, dtype=torch.int32)
+    cu_query_token_count = cu_query_lens[-1]
+    real_request_count = torch.sum(real_request_mask, dtype=torch.int32)
+    retained_in_bounds = torch.all((retained_lens >= 0)
+                                   & (retained_lens <= max_draft_len))
+    padding_is_empty = torch.all(
+        torch.where(real_request_mask, torch.ones_like(real_request_mask),
+                    retained_lens == 0))
+    semantic_valid = (
+        retained_in_bounds & padding_is_empty & (real_request_count > 0)
+        & (selected_budget >= graph_batch_size)
+        & (selected_budget <= graph_batch_size * (max_draft_len + 1))
+        & (retained_token_count == selected_budget - graph_batch_size)
+        & (query_token_count == selected_budget)
+        & (cu_query_token_count == selected_budget)
+        & (selected_budget - graph_batch_size <=
+           real_request_count * max_draft_len))
+    published_budget = torch.where(semantic_valid, selected_budget,
+                                   torch.zeros_like(selected_budget))
+    real_token_count = torch.sum(
+        (retained_lens + 1) * real_request_mask.to(torch.int32),
+        dtype=torch.int32)
+    row_map_valid = torch.ones((),
+                               dtype=torch.bool,
+                               device=retained_lens.device)
+    layout = DSparkConfidenceDeviceLayout(
+        retained_lens=retained_lens,
+        query_lens=query_lens,
+        cu_query_lens=cu_query_lens,
+        real_request_mask=real_request_mask,
+        packed_to_dense=packed_to_dense,
+        packed_draft_indices=packed_draft_indices,
+        packed_request_ids=packed_request_ids,
+        packed_local_positions=packed_local_positions,
+        source_batch_indices=source_batch_indices,
+        retained_token_count=retained_token_count,
+        query_token_count=query_token_count,
+        cu_query_token_count=cu_query_token_count,
+        real_request_count=real_request_count,
+        row_map_valid=row_map_valid.to(torch.int32),
+        semantic_valid=semantic_valid.to(torch.int32),
+        declared_verifier_token_budget=selected_budget,
+        real_token_count=real_token_count,
+        verifier_token_budget=published_budget,
+    )
+    layout.row_map_valid.copy_(validate_confidence_device_layout_row_map(
+        layout, max_draft_len).to(torch.int32))
+    return layout
 
 
 class DynamicBudgetPlan(NamedTuple):
@@ -118,6 +430,7 @@ def plan_dynamic_verifier_budget(
     minimum_predicted_gain: float = 0.01,
     temperatures: torch.Tensor | None = None,
     candidate_yield_reducer: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    real_request_mask: torch.Tensor | None = None,
 ) -> DynamicBudgetPlan:
     """Select and allocate one captured verifier-token budget on device.
 
@@ -140,6 +453,13 @@ def plan_dynamic_verifier_budget(
     rank-local, exact-size ragged allocation. A one-tier ladder skips the
     reducer because the selected graph tier is configuration-invariant; this
     avoids a redundant captured collective without changing the allocation.
+
+    real_request_mask excludes CUDA-graph padding rows from confidence
+    ranking and expected yield. A compact candidate whose V-G drafts exceed
+    the real-row capacity is assigned negative-infinite yield before the
+    optional cross-rank reduction, so one ineligible attention-DP rank forces
+    the shared planner to choose another tier. The final full-K tier remains
+    valid and gives K drafts to real rows and zero to padding rows.
     """
     if confidence_logits.ndim != 2:
         raise ValueError("confidence_logits must have shape [num_requests, max_draft_len]")
@@ -154,6 +474,20 @@ def plan_dynamic_verifier_budget(
         raise ValueError("candidate budgets and step times must have the same non-zero length")
     if minimum_predicted_gain < 0.0:
         raise ValueError("minimum_predicted_gain must be non-negative")
+    if real_request_mask is None:
+        real_request_mask = torch.ones(
+            num_requests,
+            dtype=torch.bool,
+            device=confidence_logits.device,
+        )
+    elif (
+        real_request_mask.ndim != 1
+        or real_request_mask.shape[0] != num_requests
+        or real_request_mask.dtype != torch.bool
+    ):
+        raise ValueError("real_request_mask must be a boolean vector matching num_requests")
+    elif real_request_mask.device != confidence_logits.device:
+        raise ValueError("real_request_mask must be on the confidence-logit device")
 
     dense_capacity = num_requests * (max_draft_len + 1)
     if candidate_budgets.device != confidence_logits.device:
@@ -168,8 +502,21 @@ def plan_dynamic_verifier_budget(
 
     conditional = apply_sts(confidence_logits, temperatures)
     survival = torch.cumprod(conditional, dim=1)
-    position_major = survival.transpose(0, 1).contiguous().view(-1)
-    selection_order = torch.argsort(position_major, descending=True, stable=True)
+    masked_survival = torch.where(
+        real_request_mask.unsqueeze(1),
+        survival,
+        torch.zeros((), dtype=survival.dtype, device=survival.device),
+    )
+    position_major = masked_survival.transpose(0, 1).contiguous().view(-1)
+    position_major_mask = (
+        real_request_mask.unsqueeze(0).expand(max_draft_len, -1).contiguous().view(-1)
+    )
+    ranking_scores = torch.where(
+        position_major_mask,
+        position_major,
+        torch.full((), -1.0, dtype=position_major.dtype, device=position_major.device),
+    )
+    selection_order = torch.argsort(ranking_scores, descending=True, stable=True)
     ordered_survival = position_major[selection_order]
     cumulative_yield = torch.cat(
         (
@@ -179,7 +526,30 @@ def plan_dynamic_verifier_budget(
     )
 
     retained_candidates = candidate_budgets.to(torch.long) - num_requests
-    expected_yield = float(num_requests) + torch.gather(cumulative_yield, 0, retained_candidates)
+    real_request_count = real_request_mask.sum(dtype=torch.long)
+    real_draft_capacity = real_request_count * max_draft_len
+    candidate_indices = torch.arange(candidate_budgets.numel(), device=confidence_logits.device)
+    full_candidate_index = torch.full(
+        (),
+        candidate_budgets.numel() - 1,
+        dtype=torch.long,
+        device=confidence_logits.device,
+    )
+    candidate_is_full = candidate_indices == full_candidate_index
+    candidate_is_executable = (retained_candidates <= real_draft_capacity) | candidate_is_full
+    expected_yield = real_request_count.to(torch.float32) + torch.gather(
+        cumulative_yield, 0, retained_candidates
+    )
+    expected_yield = torch.where(
+        candidate_is_executable,
+        expected_yield,
+        torch.full(
+            (),
+            float("-inf"),
+            dtype=expected_yield.dtype,
+            device=expected_yield.device,
+        ),
+    )
     # Cross-rank yield is only needed to choose among multiple graph tiers.
     # A one-tier ladder has a configuration-invariant selection, so bypassing
     # the reducer avoids a redundant captured collective without changing the
@@ -212,14 +582,92 @@ def plan_dynamic_verifier_budget(
         selection_order,
         torch.arange(selection_order.numel(), device=confidence_logits.device),
     )
-    selected_position_major = selection_ranks < selected_retained
+    selected_position_major = (selection_ranks < selected_retained) & position_major_mask
     selected_drafts = selected_position_major.view(max_draft_len, num_requests).transpose(0, 1)
-    retained_lens = selected_drafts.sum(dim=1, dtype=torch.int32)
+    compact_retained_lens = selected_drafts.sum(dim=1, dtype=torch.int32)
+    full_retained_lens = real_request_mask.to(torch.int32) * max_draft_len
+    retained_lens = torch.where(
+        selected_index == full_index,
+        full_retained_lens,
+        compact_retained_lens,
+    )
     return DynamicBudgetPlan(
         retained_lens=retained_lens,
         verifier_token_budget=torch.gather(candidate_budgets, 0, selected_index.reshape(1)).squeeze(
             0
         ),
+    )
+
+
+def plan_masked_fixed_verifier_draft_lens(
+    confidence_logits: torch.Tensor,
+    verifier_token_budget: int,
+    real_request_mask: torch.Tensor,
+    temperatures: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Allocate a fixed tier across real rows of a padded execution bucket.
+
+    The returned shape is always ``[G]``. Padding rows receive zero drafts and
+    rank below every real draft. If ``V-G`` exceeds the rank-local real-draft
+    capacity, return physical K for real rows and zero for padding. The next
+    target graph gate resolves that layout as V=0/full-K across ADP ranks.
+    """
+    if confidence_logits.ndim != 2:
+        raise ValueError("confidence_logits must have shape [num_requests, max_draft_len]")
+    num_requests, max_draft_len = confidence_logits.shape
+    if num_requests == 0 or max_draft_len == 0:
+        raise ValueError("confidence_logits must have non-zero dimensions")
+    if (
+        real_request_mask.ndim != 1
+        or real_request_mask.shape[0] != num_requests
+        or real_request_mask.dtype != torch.bool
+    ):
+        raise ValueError("real_request_mask must be a boolean vector matching num_requests")
+    if real_request_mask.device != confidence_logits.device:
+        raise ValueError("real_request_mask must be on the confidence-logit device")
+
+    dense_capacity = num_requests * (max_draft_len + 1)
+    if not num_requests <= verifier_token_budget <= dense_capacity:
+        raise ValueError(
+            "verifier_token_budget must be between num_requests and "
+            "num_requests * (max_draft_len + 1), inclusive"
+        )
+    num_retained = verifier_token_budget - num_requests
+
+    conditional_probabilities = apply_sts(confidence_logits, temperatures)
+    prefix_scores = torch.cumprod(conditional_probabilities, dim=1)
+    position_major_mask = (
+        real_request_mask.unsqueeze(0).expand(max_draft_len, -1).contiguous().view(-1)
+    )
+    position_major_scores = prefix_scores.transpose(0, 1).contiguous().view(-1)
+    ranking_scores = torch.where(
+        position_major_mask,
+        position_major_scores,
+        torch.full(
+            (),
+            -1.0,
+            dtype=position_major_scores.dtype,
+            device=position_major_scores.device,
+        ),
+    )
+    selection_order = torch.argsort(ranking_scores, descending=True, stable=True)
+    selection_ranks = torch.empty_like(selection_order)
+    selection_ranks.scatter_(
+        0,
+        selection_order,
+        torch.arange(selection_order.numel(), device=confidence_logits.device),
+    )
+    selected_position_major = (selection_ranks < num_retained) & position_major_mask
+    selected_drafts = selected_position_major.view(max_draft_len, num_requests).transpose(0, 1)
+    compact_retained_lens = selected_drafts.sum(dim=1, dtype=torch.int32)
+
+    real_request_count = real_request_mask.sum(dtype=torch.long)
+    compact_is_executable = num_retained <= real_request_count * max_draft_len
+    full_retained_lens = real_request_mask.to(torch.int32) * max_draft_len
+    return torch.where(
+        compact_is_executable,
+        compact_retained_lens,
+        full_retained_lens,
     )
 
 

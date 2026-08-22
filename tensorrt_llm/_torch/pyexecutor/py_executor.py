@@ -13,8 +13,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from enum import IntEnum
 from queue import Queue
-from typing import (TYPE_CHECKING, Callable, Dict, Iterable, List, Optional,
-                    Tuple, Union)
+from typing import TYPE_CHECKING, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 from strenum import StrEnum
@@ -26,19 +25,30 @@ try:
 except ImportError:
     from cuda import cudart
 
-from tensorrt_llm._utils import (CUASSERT, customized_gc_thresholds,
-                                 get_steady_clock_now_in_seconds,
-                                 is_trace_enabled, mpi_comm, mpi_disabled,
-                                 nvtx_range, set_thread_local_mpi_comm,
-                                 trace_func)
-from tensorrt_llm.bindings.executor import (DisServingRequestStats,
-                                            FinishReason, InflightBatchingStats,
-                                            IterationStats, KvCacheStats,
-                                            RequestStage, RequestStats,
-                                            RequestType, SpecDecodingStats,
-                                            StaticBatchingStats)
-from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
-                                                          ReqIdsSet)
+from tensorrt_llm._utils import (
+    CUASSERT,
+    customized_gc_thresholds,
+    get_steady_clock_now_in_seconds,
+    is_trace_enabled,
+    mpi_comm,
+    mpi_disabled,
+    nvtx_range,
+    set_thread_local_mpi_comm,
+    trace_func,
+)
+from tensorrt_llm.bindings.executor import (
+    DisServingRequestStats,
+    FinishReason,
+    InflightBatchingStats,
+    IterationStats,
+    KvCacheStats,
+    RequestStage,
+    RequestStats,
+    RequestType,
+    SpecDecodingStats,
+    StaticBatchingStats,
+)
+from tensorrt_llm.bindings.internal.batch_manager import LlmRequestType, ReqIdsSet
 from tensorrt_llm.executor.request import TruncateKVCacheRequest
 from tensorrt_llm.inputs.multimodal import strip_mm_data_for_generation
 from tensorrt_llm.llmapi.llm_args import PeftCacheConfig, WaitingQueuePolicy
@@ -47,13 +57,14 @@ from tensorrt_llm.mapping import CpType
 from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import (
-    get_global_profiler, host_profiler_context)
+    get_global_profiler,
+    host_profiler_context,
+)
 
 from ..distributed import Distributed
 from ..distributed.communicator import ReduceOp
 from ..expert_statistic import ExpertStatistic
-from ..models.modeling_multimodal_mixin import \
-    maybe_prefetch_mm_encoder_for_next_iter
+from ..models.modeling_multimodal_mixin import maybe_prefetch_mm_encoder_for_next_iter
 from ..models.modeling_utils import DecoderModelForCausalLM
 from ..modules.decoder_layer import DecoderLayer
 from ..speculative.drafter import Drafter
@@ -67,30 +78,55 @@ from .executor_request_queue import ExecutorRequestQueue, RequestQueueItem
 from .guided_decoder import GuidedDecoder
 from .handle_additional_outputs import HandleAdditionalOutputs
 from .handle_logits import HandleLogits
-from .hang_detector import (HangDetector, hard_kill_on_rank_crash,
-                            propagate_hard_kill, start_rank_crash_kill_watchdog)
+from .hang_detector import (
+    HangDetector,
+    hard_kill_on_rank_crash,
+    propagate_hard_kill,
+    start_rank_crash_kill_watchdog,
+)
 from .kv_cache_manager_v2 import KVCacheManagerV2
 from .kv_cache_stats import append_kv_cache_iteration_stats
-from .kv_cache_transceiver import (KvCacheTransceiver,
-                                   is_disagg_inflight_cancel_enabled)
-from .llm_request import (ATTENTION_DP_DUMMY_REQUEST_ID,
-                          MAX_SPEC_DECODE_POSITIONS, ExecutorRequest,
-                          LlmRequest, LlmRequestState, LlmResponse,
-                          get_draft_token_length)
-from .mamba_cache_manager import (BaseMambaCacheManager,
-                                  MixedMambaHybridCacheManager)
+from .kv_cache_transceiver import KvCacheTransceiver, is_disagg_inflight_cancel_enabled
+from .llm_request import (
+    ATTENTION_DP_DUMMY_REQUEST_ID,
+    MAX_SPEC_DECODE_POSITIONS,
+    ExecutorRequest,
+    LlmRequest,
+    LlmRequestState,
+    LlmResponse,
+    get_draft_token_length,
+)
+from .mamba_cache_manager import BaseMambaCacheManager, MixedMambaHybridCacheManager
 from .model_engine import ModelEngine
 from .perf_metrics_manager import PerfMetricsManager
-from .request_utils import (RequestBroadcaster, attach_py_objects_to_requests,
-                            derive_attention_dp_per_rank_request_cap,
-                            get_from_waiting_queue, merge_requests)
-from .resource_manager import (NoFreeSlotsError, ResourceManager,
-                               ResourceManagerType, request_context)
-from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
-                      SampleStateTensors, TRTLLMSampler)
-from .scheduler import (RequestScheduler, ScheduledRequests,
-                        SerializableSchedulerOutput, WaitingQueue,
-                        create_waiting_queue)
+from .request_utils import (
+    RequestBroadcaster,
+    attach_py_objects_to_requests,
+    derive_attention_dp_per_rank_request_cap,
+    get_from_waiting_queue,
+    merge_requests,
+)
+from .resource_manager import (
+    NoFreeSlotsError,
+    ResourceManager,
+    ResourceManagerType,
+    request_context,
+)
+from .sampler import (
+    AsyncWorkerMixin,
+    Sampler,
+    SamplerEvent,
+    SampleState,
+    SampleStateTensors,
+    TRTLLMSampler,
+)
+from .scheduler import (
+    RequestScheduler,
+    ScheduledRequests,
+    SerializableSchedulerOutput,
+    WaitingQueue,
+    create_waiting_queue,
+)
 from .scheduler.adp_router import ADPRouter
 
 if TYPE_CHECKING:
@@ -3096,8 +3132,7 @@ class PyExecutor:
         import gc
         import sys
 
-        from tensorrt_llm._torch.virtual_memory import (materialize_with_tag,
-                                                        release_with_tag)
+        from tensorrt_llm._torch.virtual_memory import materialize_with_tag, release_with_tag
         from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
 
         torch.cuda.set_device(self.device_id)
@@ -3392,8 +3427,7 @@ class PyExecutor:
                 and self.model_engine.spec_config.draft_len_schedule is not None
                 and self.model_engine.spec_config.spec_dec_mode.
                 support_dynamic_draft_len()):
-            from tensorrt_llm._torch.speculative.utils import \
-                get_draft_len_for_batch_size
+            from tensorrt_llm._torch.speculative.utils import get_draft_len_for_batch_size
 
             spec_dec_mode = self.model_engine.spec_config.spec_dec_mode
 
@@ -5114,6 +5148,25 @@ class PyExecutor:
             log_probs=target_outputs.log_probs,
             new_tokens_lens=None,
             next_draft_tokens=None)
+
+        if isinstance(target_inputs, SampleStateTensorsSpec):
+            # DSpark compact-layout provenance belongs to the same speculative
+            # step as these accepted inputs.  Preserve it across the fresh
+            # carrier created by the optional overlap drafter path.
+            for name in (
+                    "next_draft_lens", "dspark_confidence_layout",
+                    "dspark_confidence_execution_batch_size",
+                    "dspark_confidence_verifier_token_budget",
+                    "dspark_confidence_verifier_token_budget_host",
+                    "dspark_confidence_semantics_host",
+                    "dspark_confidence_query_lens_host",
+                    "dspark_confidence_budget_ready_event",
+                    "dspark_confidence_route_epoch",
+                    "dspark_confidence_physical_draft_len",
+                    "dspark_confidence_engine_generation",
+                    "dspark_confidence_request_ids",
+                    "dspark_confidence_seq_slots"):
+                setattr(result_tensors, name, getattr(target_inputs, name, None))
 
         # Copy logits if available
         if hasattr(target_outputs, 'logits'):

@@ -2888,6 +2888,15 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         "table is evaluated once at initialization for every configured (G,V) "
         "tier; serving performs no interpolation or file access.")
 
+    confidence_engine_fingerprint_path: Optional[str] = Field(
+        default=None,
+        description=
+        "Sealed active-engine provenance JSON used to bind a schema-v2 exact "
+        "T(G,V) artifact to the source diff, native runtime, GPU snapshot, and "
+        "topology executing it. Required at worker initialization for multi-G "
+        "dynamic confidence artifacts; legacy one-G artifacts remain "
+        "backward-compatible.")
+
     confidence_sts_path: Optional[str] = Field(
         default=None,
         description=
@@ -2916,6 +2925,10 @@ class DSparkDecodingConfig(DecodingBaseConfig):
                 raise ValueError(
                     "DSpark confidence_sps_cost_table_path requires "
                     "confidence_mode='dynamic_budget'")
+            if self.confidence_engine_fingerprint_path is not None:
+                raise ValueError(
+                    "DSpark confidence_engine_fingerprint_path requires "
+                    "confidence_mode='dynamic_budget'")
             if self.confidence_sts_path is not None:
                 raise ValueError(
                     "DSpark confidence_sts_path requires a confidence budget mode"
@@ -2931,7 +2944,9 @@ class DSparkDecodingConfig(DecodingBaseConfig):
                 raise ValueError(
                     "DSpark confidence_mode='fixed_budget' requires a non-empty "
                     "confidence_verifier_token_budget_schedule")
-            if tiers is not None or self.confidence_sps_cost_table_path is not None:
+            if (tiers is not None
+                    or self.confidence_sps_cost_table_path is not None
+                    or self.confidence_engine_fingerprint_path is not None):
                 raise ValueError(
                     "DSpark dynamic confidence tiers/cost table require "
                     "confidence_mode='dynamic_budget'")
@@ -2992,6 +3007,8 @@ class DSparkDecodingConfig(DecodingBaseConfig):
 
     _confidence_capture_verifier_token_budget: Optional[int] = PrivateAttr(
         default=None)
+    _confidence_capture_verifier_token_budget_active: bool = PrivateAttr(
+        default=False)
 
     @property
     def is_fixed_budget_confidence_enabled(self) -> bool:
@@ -3025,10 +3042,22 @@ class DSparkDecodingConfig(DecodingBaseConfig):
 
     def set_confidence_capture_verifier_token_budget(
             self, verifier_token_budget: Optional[int]) -> None:
-        """Set the startup-only V whose synthetic graph is being captured."""
+        """Set an explicit startup-only V, including ordinary full-K ``None``."""
         if verifier_token_budget is not None:
             verifier_token_budget = int(verifier_token_budget)
         self._confidence_capture_verifier_token_budget = verifier_token_budget
+        self._confidence_capture_verifier_token_budget_active = True
+
+    def clear_confidence_capture_verifier_token_budget(self) -> None:
+        """Return budget resolution to live fixed/dynamic serving semantics."""
+        self._confidence_capture_verifier_token_budget = None
+        self._confidence_capture_verifier_token_budget_active = False
+
+    def get_confidence_capture_verifier_token_budget(
+            self) -> tuple[bool, Optional[int]]:
+        """Return whether startup capture owns V and its exact value."""
+        return (self._confidence_capture_verifier_token_budget_active,
+                self._confidence_capture_verifier_token_budget)
 
     def resolve_confidence_verifier_token_budget(
         self,
@@ -3038,7 +3067,7 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         """Resolve V for capture, fixed mode, or host-visible dynamic lengths."""
         if not self.is_confidence_budget_enabled:
             return None
-        if self._confidence_capture_verifier_token_budget is not None:
+        if self._confidence_capture_verifier_token_budget_active:
             return self._confidence_capture_verifier_token_budget
         candidates = self.resolve_confidence_verifier_token_budget_candidates(
             graph_batch_size)
