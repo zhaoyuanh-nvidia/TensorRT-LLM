@@ -1296,6 +1296,13 @@ class CUDAGraphRunner:
                 len(request.py_draft_tokens) for request in generation_requests
                 if not request.is_dummy
             ]
+            physical_block_recoverable = bool(
+                real_count == 0
+                or (
+                    physical_lens
+                    and all(length == carried_k for length in physical_lens)
+                )
+            )
             configured_budgets = (
                 self.spec_config.
                 resolve_confidence_verifier_token_budget_candidates(carried_g)
@@ -1410,8 +1417,7 @@ class CUDAGraphRunner:
                         self.confidence_engine_generation
                         and carried_epoch > int(
                             getattr(self, "_confidence_last_route_epoch", 0))
-                        and physical_lens
-                        and all(length == carried_k for length in physical_lens))
+                        and physical_block_recoverable)
                     discard_info = list(
                         self.config.dist.tp_allgather(
                             [local_discardable, real_count]))

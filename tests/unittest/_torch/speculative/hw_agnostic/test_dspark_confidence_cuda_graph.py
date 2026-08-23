@@ -2481,6 +2481,59 @@ def test_g128_v256_undercounted_device_mask_discards_to_v0_before_packing():
                for request in requests)
 
 
+def test_empty_adp_peer_discards_infeasible_compact_carrier_to_shared_full_k():
+    config = DSparkDecodingConfig(
+        max_draft_len=5,
+        speculative_model="/tmp/dummy_model",
+        confidence_mode="fixed_budget",
+        confidence_verifier_token_budget_schedule={16: 32},
+    )
+    carrier = _layout_carrier(
+        [],
+        [0] * 16,
+        execution_g=16,
+        verifier_budget=32,
+        route_epoch=1,
+    )
+    batch = ScheduledRequests()
+    batch.generation_requests = []
+    runner = _iteration_route_runner(config)
+
+    peer_route = _adp_semantic_route(
+        16,
+        0,
+        5,
+        1,
+        3,
+        layout_shapes_ready=False,
+        base_layout_ready=True,
+        semantic_exact=False,
+        semantic_valid=0,
+        row_map_valid=0,
+        retained_count=15,
+        query_count=28,
+        cu_query_count=28,
+        declared_v=32,
+    )
+
+    def asymmetric_tail(payload):
+        if len(payload) == len(_ADP_SEMANTIC_ROUTE_FIELDS):
+            return [payload, peer_route]
+        if len(payload) == 2:
+            return [payload, [True, 3]]
+        assert len(payload) == 3
+        return [payload, [True, 3, False]]
+
+    runner.config.dist.tp_allgather.side_effect = asymmetric_tail
+
+    assert CUDAGraphRunner._get_confidence_adp_common_batch_size(
+        runner, batch, carrier
+    ) == 0
+    assert runner.confidence_force_full_k_route
+    assert runner.confidence_discarded_device_layout
+    assert runner.confidence_device_layout is None
+
+
 def test_semantic_tuple_asymmetry_discards_to_shared_full_k():
     config = DSparkDecodingConfig(
         max_draft_len=5,
