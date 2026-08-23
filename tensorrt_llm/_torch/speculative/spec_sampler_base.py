@@ -76,6 +76,11 @@ class SampleStateTensorsSpec(SampleStateTensors):
     dspark_confidence_engine_generation: Optional[int] = None
     dspark_confidence_request_ids: Optional[tuple[int, ...]] = None
     dspark_confidence_seq_slots: Optional[tuple[int, ...]] = None
+    dspark_confidence_native_uniform: bool = False
+    dspark_confidence_native_uniform_draft_len_host: Optional[
+        torch.Tensor] = None
+    dspark_confidence_native_uniform_ready_event: Optional[
+        torch.cuda.Event] = None
 
 
 @dataclass(kw_only=True)
@@ -96,6 +101,7 @@ class SampleStateSpec(SampleState):
     dspark_confidence_verifier_token_budget: Optional[int] = None
     dspark_confidence_physical_draft_len: Optional[int] = None
     dspark_confidence_engine_generation: Optional[int] = None
+    dspark_confidence_native_uniform: bool = False
 
 
 class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
@@ -519,6 +525,24 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         confidence_semantics_host = None
         confidence_query_lens_host = None
         confidence_budget_event = None
+        native_uniform = bool(
+            outputs.get("dspark_confidence_native_uniform", False))
+        native_uniform_draft_len_host = None
+        native_uniform_ready_event = None
+        if native_uniform:
+            native_uniform_draft_len = outputs.get(
+                "dspark_confidence_native_uniform_draft_len")
+            if (not isinstance(native_uniform_draft_len, torch.Tensor)
+                    or native_uniform_draft_len.shape != ()):
+                raise RuntimeError(
+                    "DSpark native-uniform route requires one device scalar "
+                    "draft length")
+            native_uniform_draft_len_host = torch.empty(
+                (), dtype=torch.int32, device="cpu", pin_memory=True)
+            native_uniform_draft_len_host.copy_(
+                native_uniform_draft_len, non_blocking=True)
+            native_uniform_ready_event = torch.cuda.Event()
+            native_uniform_ready_event.record()
         if o_confidence_layout is not None:
             # CUDA-graph output dictionaries and their tensors are persistent.
             # Clone every layout tensor into sampler-owned lifetime before the
@@ -624,6 +648,11 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
                 request.py_request_id for request in sampling_requests),
             dspark_confidence_seq_slots=tuple(
                 request.py_seq_slot for request in sampling_requests),
+            dspark_confidence_native_uniform=native_uniform,
+            dspark_confidence_native_uniform_draft_len_host=(
+                native_uniform_draft_len_host),
+            dspark_confidence_native_uniform_ready_event=(
+                native_uniform_ready_event),
         )
 
         host_tensors = SampleStateTensorsSpec(
@@ -658,6 +687,11 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
                 request.py_request_id for request in sampling_requests),
             dspark_confidence_seq_slots=tuple(
                 request.py_seq_slot for request in sampling_requests),
+            dspark_confidence_native_uniform=native_uniform,
+            dspark_confidence_native_uniform_draft_len_host=(
+                native_uniform_draft_len_host),
+            dspark_confidence_native_uniform_ready_event=(
+                native_uniform_ready_event),
         )
         sampler_event = self._record_sampler_event()
 
@@ -681,4 +715,5 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             dspark_confidence_physical_draft_len=runtime_draft_len,
             dspark_confidence_engine_generation=outputs.get(
                 "dspark_confidence_engine_generation"),
+            dspark_confidence_native_uniform=native_uniform,
         )

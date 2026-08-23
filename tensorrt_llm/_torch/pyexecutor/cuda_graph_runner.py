@@ -405,6 +405,8 @@ class CUDAGraphRunner:
             if (not self.config.is_draft_model
                     and isinstance(self.spec_config, DSparkDecodingConfig)
                     and self.spec_config.is_confidence_budget_enabled
+                    and not self.spec_config.
+                    is_native_uniform_confidence_enabled
                     and is_all_greedy_sample):
                 force_full_k_route = bool(
                     getattr(spec_metadata, "confidence_force_full_k_route",
@@ -1209,11 +1211,15 @@ class CUDAGraphRunner:
             self.confidence_adp_execution_batch_size = capture_g
             return capture_g
 
+        native_uniform_route = bool(
+            getattr(new_tensors_device,
+                    "dspark_confidence_native_uniform", False))
         carried_layout = getattr(new_tensors_device,
                                  "dspark_confidence_layout", None)
         carried_epoch = getattr(new_tensors_device,
                                 "dspark_confidence_route_epoch", None)
-        if carried_layout is not None or carried_epoch is not None:
+        if (not native_uniform_route
+                and (carried_layout is not None or carried_epoch is not None)):
             carried_g = int(
                 getattr(new_tensors_device,
                         "dspark_confidence_execution_batch_size", 0) or 0)
@@ -1462,12 +1468,23 @@ class CUDAGraphRunner:
         incomplete_device_plan = bool(
             new_tensors_device is not None
             and getattr(new_tensors_device, "next_draft_lens", None) is not None
+            and not native_uniform_route
             and not self.confidence_discarded_device_layout)
+        native_uniform_physical_ready = bool(
+            self.spec_config.is_native_uniform_confidence_enabled
+            and real_requests
+            and len({len(request.py_draft_tokens)
+                     for request in real_requests}) == 1
+            and 0 < len(real_requests[0].py_draft_tokens) <=
+            self.spec_config.max_draft_len
+            and all(request.py_draft_tokens_effective_len ==
+                    len(request.py_draft_tokens)
+                    for request in real_requests))
         local_ready = (
             batch.num_context_requests == 0 and bool(real_requests)
-            and all(len(request.py_draft_tokens) ==
-                    self.spec_config.max_draft_len
-                    for request in real_requests)
+            and (native_uniform_physical_ready or all(
+                len(request.py_draft_tokens) == self.spec_config.max_draft_len
+                for request in real_requests))
             and not local_compact_request_state
             and not incomplete_device_plan)
         rank_info = list(

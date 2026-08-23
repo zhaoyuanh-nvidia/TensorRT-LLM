@@ -190,6 +190,15 @@ def _expand_generation_graph_capture_shapes(
                           and spec_config.is_confidence_budget_enabled)
     expanded_graphs = []
     for batch_size, draft_len in graphs_to_capture:
+        native_draft_lens = (
+            spec_config.
+            resolve_confidence_native_uniform_draft_len_candidates(batch_size)
+            if confidence_capture and draft_len > 0
+            and spec_config.is_native_uniform_confidence_enabled else ())
+        if native_draft_lens:
+            expanded_graphs.extend((batch_size, native_draft_len, None)
+                                   for native_draft_len in native_draft_lens)
+            continue
         budgets = (
             spec_config.resolve_confidence_verifier_token_budget_candidates(
                 batch_size) if confidence_capture and draft_len > 0 else ())
@@ -8031,7 +8040,16 @@ class PyTorchModelEngine(ModelEngine):
                             ]
                             budget = spec_config.resolve_confidence_verifier_token_budget(
                                 len(gen_requests), retained_lens)
-                    if budget is not None and gen_requests:
+                    native_uniform_dense = bool(
+                        spec_config.is_native_uniform_confidence_enabled
+                        and gen_requests and all(
+                            get_draft_token_length(request) ==
+                            self.runtime_draft_len
+                            and request.py_draft_tokens_effective_len ==
+                            self.runtime_draft_len
+                            for request in gen_requests))
+                    if (budget is not None and gen_requests
+                            and not native_uniform_dense):
                         if retained_lens is None:
                             retained_budget = budget - len(gen_requests)
                             base, extra = divmod(retained_budget,

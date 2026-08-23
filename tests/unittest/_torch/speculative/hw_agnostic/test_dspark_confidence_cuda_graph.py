@@ -31,7 +31,10 @@ from tensorrt_llm._torch.pyexecutor.model_engine import (
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.sampler import TorchSampler
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
-from tensorrt_llm._torch.speculative.dspark import DSparkSpecMetadata
+from tensorrt_llm._torch.speculative.dspark import (
+    DSparkSpecMetadata,
+    _publish_dspark_confidence_route_outputs,
+)
 from tensorrt_llm._torch.speculative.dspark_confidence import (
     build_confidence_device_layout,
     validate_confidence_device_layout_row_map,
@@ -271,6 +274,196 @@ def test_fixed_capture_inventory_has_compact_and_ordinary_key_per_g():
     config.clear_confidence_capture_verifier_token_budget()
     assert config.resolve_confidence_verifier_token_budget(2) == 9
     assert config.resolve_confidence_verifier_token_budget(4) == 17
+
+
+def test_native_uniform_inventory_uses_ordinary_dense_k_minus_one_and_k_graphs():
+    config = DSparkDecodingConfig(
+        max_draft_len=5,
+        speculative_model="/tmp/dummy_model",
+        confidence_mode="dynamic_budget",
+        confidence_native_uniform=True,
+        confidence_verifier_token_budget_tiers={2: [10, 12], 4: [20, 24]},
+        confidence_sps_cost_table_path="/tmp/dummy-sps.json",
+    )
+
+    enabled, shapes = _expand_generation_graph_capture_shapes(
+        [(2, 5), (4, 5)], config)
+
+    assert enabled
+    assert set(shapes) == {
+        (2, 4, None),
+        (2, 5, None),
+        (4, 4, None),
+        (4, 5, None),
+    }
+    assert config.resolve_confidence_native_uniform_draft_len_candidates(
+        2) == (4, 5)
+    assert config.resolve_confidence_native_uniform_draft_len_candidates(
+        4) == (4, 5)
+
+
+def test_native_uniform_rejects_non_dense_or_more_than_two_tiers():
+    with pytest.raises(ValueError, match="dense K-1/K verifier tiers"):
+        DSparkDecodingConfig(
+            max_draft_len=5,
+            speculative_model="/tmp/dummy_model",
+            confidence_mode="dynamic_budget",
+            confidence_native_uniform=True,
+            confidence_verifier_token_budget_tiers={2: [9, 10, 12]},
+            confidence_sps_cost_table_path="/tmp/dummy-sps.json",
+        )
+
+
+def test_native_uniform_k4_uses_an_ordinary_dense_graph_key():
+    config = DSparkDecodingConfig(
+        max_draft_len=5,
+        speculative_model="/tmp/dummy_model",
+        confidence_mode="dynamic_budget",
+        confidence_native_uniform=True,
+        confidence_verifier_token_budget_tiers={2: [10, 12]},
+        confidence_sps_cost_table_path="/tmp/dummy-sps.json",
+    )
+    batch = ScheduledRequests()
+    batch.generation_requests = [
+        request_stub(1, 4, 0),
+        request_stub(2, 4, 1),
+    ]
+    for request in batch.generation_requests:
+        request.py_draft_tokens = request.py_draft_tokens[:4]
+
+    key = CUDAGraphRunner.get_graph_key(
+        runner_stub(config),
+        batch,
+        spec_metadata=SimpleNamespace(is_all_greedy_sample=True),
+    )
+
+    assert key.draft_len == 4
+    assert key.verifier_num_tokens == 0
+
+
+def test_native_uniform_output_keeps_full_physical_proposals_until_group_agreement():
+    outputs = {
+        "next_draft_tokens": torch.arange(10, dtype=torch.int32).reshape(2, 5)
+    }
+    row_lens = torch.full((2,), 4, dtype=torch.int32)
+    selected_draft_len = torch.tensor(4, dtype=torch.int32)
+
+    _publish_dspark_confidence_route_outputs(
+        outputs,
+        row_lens,
+        None,
+        selected_draft_len,
+    )
+
+    assert outputs["next_draft_tokens"].shape == (2, 5)
+    assert "next_draft_lens" not in outputs
+    assert "next_dspark_confidence_layout" not in outputs
+    assert outputs["dspark_confidence_native_uniform"] is True
+    assert (
+        outputs["dspark_confidence_native_uniform_draft_len"]
+        is selected_draft_len
+    )
+    assert all(value is not None for value in outputs.values())
+
+
+def test_native_uniform_host_route_truncates_full_proposals_after_group_choice():
+    config = DSparkDecodingConfig(
+        max_draft_len=5,
+        speculative_model="/tmp/dummy_model",
+        confidence_mode="dynamic_budget",
+        confidence_native_uniform=True,
+        confidence_verifier_token_budget_tiers={2: [10, 12]},
+        confidence_sps_cost_table_path="/tmp/dummy-sps.json",
+    )
+    requests = [request_stub(1, 4, 0), request_stub(2, 4, 1)]
+    for request in requests:
+        request.py_dspark_confidence_execution_batch_size = 2
+        request.py_dspark_confidence_route_epoch = 7
+    batch = ScheduledRequests()
+    batch.generation_requests = requests
+    executor = object.__new__(PyExecutor)
+    executor.model_engine = SimpleNamespace(
+        spec_config=config,
+        max_draft_len=5,
+        _dspark_confidence_engine_generation=17,
+    )
+    executor.disable_overlap_scheduler = True
+    executor.enable_attention_dp = False
+
+    selected = PyExecutor._resolve_dspark_native_uniform_draft_len(
+        executor, batch)
+
+    assert selected == 4
+    assert [len(request.py_draft_tokens) for request in requests] == [4, 4]
+    assert [request.py_draft_tokens_effective_len
+            for request in requests] == [4, 4]
+
+
+def test_native_uniform_asymmetric_host_route_falls_back_to_full_k():
+    config = DSparkDecodingConfig(
+        max_draft_len=5,
+        speculative_model="/tmp/dummy_model",
+        confidence_mode="dynamic_budget",
+        confidence_native_uniform=True,
+        confidence_verifier_token_budget_tiers={2: [10, 12]},
+        confidence_sps_cost_table_path="/tmp/dummy-sps.json",
+    )
+    requests = [request_stub(1, 4, 0), request_stub(2, 5, 1)]
+    for request in requests:
+        request.py_dspark_confidence_execution_batch_size = 2
+        request.py_dspark_confidence_route_epoch = 7
+    batch = ScheduledRequests()
+    batch.generation_requests = requests
+    executor = object.__new__(PyExecutor)
+    executor.model_engine = SimpleNamespace(
+        spec_config=config,
+        max_draft_len=5,
+        _dspark_confidence_engine_generation=17,
+    )
+    executor.disable_overlap_scheduler = True
+    executor.enable_attention_dp = False
+
+    selected = PyExecutor._resolve_dspark_native_uniform_draft_len(
+        executor, batch)
+
+    assert selected == 5
+    assert [len(request.py_draft_tokens) for request in requests] == [5, 5]
+    assert all(request.py_dspark_confidence_route_epoch is None
+               for request in requests)
+
+
+def test_native_uniform_overlap_never_reuses_stale_request_route():
+    config = DSparkDecodingConfig(
+        max_draft_len=5,
+        speculative_model="/tmp/dummy_model",
+        confidence_mode="dynamic_budget",
+        confidence_native_uniform=True,
+        confidence_verifier_token_budget_tiers={2: [10, 12]},
+        confidence_sps_cost_table_path="/tmp/dummy-sps.json",
+    )
+    requests = [request_stub(1, 4, 0), request_stub(2, 4, 1)]
+    for request in requests:
+        request.py_dspark_confidence_execution_batch_size = 2
+        request.py_dspark_confidence_route_epoch = 7
+    batch = ScheduledRequests()
+    batch.generation_requests = requests
+    executor = object.__new__(PyExecutor)
+    executor.model_engine = SimpleNamespace(
+        spec_config=config,
+        max_draft_len=5,
+        _dspark_confidence_engine_generation=17,
+    )
+    executor.disable_overlap_scheduler = False
+    executor.enable_attention_dp = False
+    executor.previous_batch = SimpleNamespace(
+        sample_state=SimpleNamespace(
+            device=SimpleNamespace(dspark_confidence_native_uniform=False)))
+
+    selected = PyExecutor._resolve_dspark_native_uniform_draft_len(
+        executor, batch)
+
+    assert selected == 5
+    assert [len(request.py_draft_tokens) for request in requests] == [5, 5]
 
 
 def test_k6_v816_capture_inventory_and_attention_extents():

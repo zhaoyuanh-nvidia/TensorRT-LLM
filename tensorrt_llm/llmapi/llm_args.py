@@ -2863,6 +2863,14 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         "selects one pre-captured verifier-token tier per iteration using the "
         "confidence head and a measured SPS cost table.")
 
+    confidence_native_uniform: bool = Field(
+        default=False,
+        description=
+        "Execute dynamic confidence tiers as ordinary dense graphs with one "
+        "uniform draft length for the complete attention-DP group. This "
+        "experimental path requires a two-tier K-1/K ladder and avoids the "
+        "packed variable-prefix verifier path.")
+
     confidence_verifier_token_budget_schedule: Optional[dict[int, int]] = Field(
         default=None,
         description=
@@ -2913,6 +2921,10 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         schedule = self.confidence_verifier_token_budget_schedule
         tiers = self.confidence_verifier_token_budget_tiers
         if self.confidence_mode == "disabled":
+            if self.confidence_native_uniform:
+                raise ValueError(
+                    "DSpark confidence_native_uniform requires "
+                    "confidence_mode='dynamic_budget'")
             if schedule is not None:
                 raise ValueError(
                     "DSpark confidence_verifier_token_budget_schedule requires "
@@ -2940,6 +2952,10 @@ class DSparkDecodingConfig(DecodingBaseConfig):
                 "DSpark confidence scheduling requires max_draft_len > 0")
 
         if self.confidence_mode == "fixed_budget":
+            if self.confidence_native_uniform:
+                raise ValueError(
+                    "DSpark confidence_native_uniform requires "
+                    "confidence_mode='dynamic_budget'")
             if not schedule:
                 raise ValueError(
                     "DSpark confidence_mode='fixed_budget' requires a non-empty "
@@ -2995,6 +3011,19 @@ class DSparkDecodingConfig(DecodingBaseConfig):
             normalized_tiers[graph_batch_size] = sorted(
                 {*verifier_tokens_values, maximum_tokens})
 
+            if self.confidence_native_uniform:
+                native_budgets = normalized_tiers[graph_batch_size]
+                expected_budgets = [
+                    graph_batch_size * self.max_draft_len,
+                    graph_batch_size * (self.max_draft_len + 1),
+                ]
+                if native_budgets != expected_budgets:
+                    raise ValueError(
+                        "DSpark confidence_native_uniform requires exactly "
+                        "the dense K-1/K verifier tiers for every graph batch "
+                        f"size; got G={graph_batch_size}, "
+                        f"V={native_budgets}, expected={expected_budgets}")
+
         if self.confidence_mode == "fixed_budget":
             self.confidence_verifier_token_budget_schedule = {
                 graph_batch_size: values[0]
@@ -3024,6 +3053,28 @@ class DSparkDecodingConfig(DecodingBaseConfig):
     def is_confidence_budget_enabled(self) -> bool:
         """Whether either compact verifier-budget mode is enabled."""
         return self.confidence_mode in ("fixed_budget", "dynamic_budget")
+
+    @property
+    def is_native_uniform_confidence_enabled(self) -> bool:
+        """Whether confidence selects ordinary dense K-1/K target graphs."""
+        return self.confidence_native_uniform
+
+    def resolve_confidence_native_uniform_draft_len_candidates(
+            self, graph_batch_size: int) -> tuple[int, ...]:
+        """Return the dense draft lengths represented by one native ladder."""
+        if (not self.is_native_uniform_confidence_enabled
+                or graph_batch_size <= 0):
+            return ()
+        budgets = self.resolve_confidence_verifier_token_budget_candidates(
+            graph_batch_size)
+        draft_lens = []
+        for budget in budgets:
+            tokens_per_request, remainder = divmod(int(budget),
+                                                    graph_batch_size)
+            if remainder != 0 or tokens_per_request < 1:
+                return ()
+            draft_lens.append(tokens_per_request - 1)
+        return tuple(draft_lens)
 
     def resolve_confidence_verifier_token_budget_candidates(
             self, graph_batch_size: int) -> tuple[int, ...]:

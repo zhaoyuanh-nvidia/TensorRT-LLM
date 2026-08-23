@@ -57,6 +57,39 @@ if TYPE_CHECKING:
     from ...llmapi.llm_args import DSparkDecodingConfig
 
 
+def _publish_dspark_confidence_route_outputs(
+    outputs: dict,
+    next_draft_lens: Optional[torch.Tensor],
+    next_confidence_layout,
+    next_native_uniform_draft_len: Optional[torch.Tensor],
+) -> None:
+    """Publish exactly one next-iteration confidence route contract.
+
+    Packed confidence owns per-row retained lengths and a device layout. Native
+    uniform confidence owns only a group-uniform K-1/K scalar: the full
+    physical-K proposal tensor must remain untouched until the host/ADP route
+    agreement completes. CUDA-graph outputs also cannot contain ``None``.
+    """
+    if next_native_uniform_draft_len is not None:
+        if next_confidence_layout is not None:
+            raise RuntimeError(
+                "DSpark native-uniform confidence cannot publish a packed layout"
+            )
+        outputs["dspark_confidence_native_uniform"] = True
+        outputs["dspark_confidence_native_uniform_draft_len"] = (
+            next_native_uniform_draft_len
+        )
+        return
+
+    if next_draft_lens is not None:
+        if next_confidence_layout is None:
+            raise RuntimeError(
+                "DSpark packed confidence draft lengths require a device layout"
+            )
+        outputs["next_draft_lens"] = next_draft_lens
+        outputs["next_dspark_confidence_layout"] = next_confidence_layout
+
+
 @dataclass
 class DSparkSpecMetadata(SpecMetadata):
     """Metadata for DSpark speculative decoding.
@@ -630,7 +663,8 @@ class DSparkWorker(SpecWorkerBase):
         """
         num_gens = batch_size - num_contexts
         K = self.max_draft_len
-        Kp1 = K + 1
+        verified_draft_len = int(spec_metadata.runtime_draft_len or K)
+        verified_tokens_per_request = verified_draft_len + 1
         device = accepted_tokens.device
 
         if num_gens == 0:
@@ -660,7 +694,7 @@ class DSparkWorker(SpecWorkerBase):
             query_lens = spec_metadata.draft_lens[num_contexts:batch_size].long() + 1
             base = torch.cumsum(query_lens, dim=0) - query_lens
         else:
-            base = gen_start + arange_g * Kp1  # [G]
+            base = gen_start + arange_g * verified_tokens_per_request  # [G]
         main_hidden = captured[base + gidx]  # [G, ncap*hidden]
 
         # Fixed-size ([G, K]) masked back-fill of the intermediate accepted tokens
@@ -818,6 +852,7 @@ class DSparkWorker(SpecWorkerBase):
         num_gens = batch_size - num_contexts
         raw_logits = logits
         K = self.max_draft_len
+        verified_draft_len = int(spec_metadata.runtime_draft_len or K)
 
         self._lazy_init(draft_model, spec_metadata)
         # Backref so DSparkSpecMetadata.prepare() can maintain the host slot map
@@ -960,6 +995,7 @@ class DSparkWorker(SpecWorkerBase):
 
         next_draft_lens = None
         next_confidence_layout = None
+        next_native_uniform_draft_len = None
         adp_batches_agree = not self.mapping.enable_attention_dp or (
             all_rank_num_gens is not None
             and len(all_rank_num_gens) > 0
@@ -1097,14 +1133,24 @@ class DSparkWorker(SpecWorkerBase):
                     selected_verifier_budget = candidates[0]
                     packed_capacity = candidates[0]
 
-                next_confidence_layout = build_confidence_device_layout(
-                    next_draft_lens,
-                    real_request_mask,
-                    spec_metadata.batch_indices_cuda[:batch_size],
-                    selected_verifier_budget,
-                    K,
-                    packed_capacity=packed_capacity,
-                )
+                if getattr(
+                        self.spec_config,
+                        "is_native_uniform_confidence_enabled",
+                        False):
+                    # The native path selects one ordinary dense K-1/K graph
+                    # for the complete execution group. Keep the full physical
+                    # proposal block available for a safe host-side K fallback;
+                    # only the selected scalar crosses to graph keying.
+                    next_native_uniform_draft_len = next_draft_lens.max()
+                else:
+                    next_confidence_layout = build_confidence_device_layout(
+                        next_draft_lens,
+                        real_request_mask,
+                        spec_metadata.batch_indices_cuda[:batch_size],
+                        selected_verifier_budget,
+                        K,
+                        packed_capacity=packed_capacity,
+                    )
 
         next_new_tokens = self._prepare_next_new_tokens(
             accepted_tokens,
@@ -1136,8 +1182,12 @@ class DSparkWorker(SpecWorkerBase):
             # effective length. Publish the length actually verified by this
             # step so acceptance and KV rewind stay iteration-aligned; omitting
             # it would pair full-K acceptance with the stale compact snapshot.
-            outputs["verified_draft_lens"] = torch.full_like(num_accepted_tokens, K)
-        if next_draft_lens is not None:
-            outputs["next_draft_lens"] = next_draft_lens
-            outputs["next_dspark_confidence_layout"] = next_confidence_layout
+            outputs["verified_draft_lens"] = torch.full_like(
+                num_accepted_tokens, verified_draft_len)
+        _publish_dspark_confidence_route_outputs(
+            outputs,
+            next_draft_lens,
+            next_confidence_layout,
+            next_native_uniform_draft_len,
+        )
         return outputs

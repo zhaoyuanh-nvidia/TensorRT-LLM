@@ -3396,6 +3396,139 @@ class PyExecutor:
             send_handles[microbatch_id].wait()
             send_handles[microbatch_id] = None
 
+    def _resolve_dspark_native_uniform_draft_len(
+            self, scheduled_batch: ScheduledRequests) -> Optional[int]:
+        """Resolve one group-uniform dense DSpark draft length.
+
+        The confidence graph emits a scalar K-1/K choice beside the full-K
+        proposal block. Under overlap scheduling, wait only for that scalar and
+        validate its iteration-owned roster; the full proposal block stays on
+        device for either route. Attention-DP peers then agree on the same
+        scalar before resource preparation or CUDA-graph keying. Any incomplete
+        or asymmetric route falls back to physical full K.
+        """
+        spec_config = getattr(self.model_engine, "spec_config", None)
+        if (spec_config is None or not getattr(
+                spec_config, "is_native_uniform_confidence_enabled", False)):
+            return None
+
+        max_draft_len = int(self.model_engine.max_draft_len)
+        generation_requests = scheduled_batch.generation_requests
+        real_requests = [request for request in generation_requests
+                         if not request.is_dummy]
+        candidate = max_draft_len
+        route_g = 0
+        route_epoch = 0
+        route_valid = False
+
+        previous_state = (
+            self.previous_batch.sample_state
+            if not self.disable_overlap_scheduler
+            and self.previous_batch is not None else None)
+        previous_device = getattr(previous_state, "device", None)
+        if bool(
+                getattr(previous_device,
+                        "dspark_confidence_native_uniform", False)):
+            ready_event = getattr(
+                previous_device,
+                "dspark_confidence_native_uniform_ready_event", None)
+            selected_host = getattr(
+                previous_device,
+                "dspark_confidence_native_uniform_draft_len_host", None)
+            if ready_event is not None and selected_host is not None:
+                ready_event.synchronize()
+                current_ids = tuple(request.py_request_id
+                                    for request in real_requests)
+                current_slots = tuple(request.py_seq_slot
+                                      for request in real_requests)
+                planned_ids = tuple(
+                    getattr(previous_device,
+                            "dspark_confidence_request_ids", ()) or ())
+                planned_slots = tuple(
+                    getattr(previous_device,
+                            "dspark_confidence_seq_slots", ()) or ())
+                route_g = int(
+                    getattr(previous_device,
+                            "dspark_confidence_execution_batch_size", 0) or 0)
+                route_epoch = int(
+                    getattr(previous_device,
+                            "dspark_confidence_route_epoch", 0) or 0)
+                engine_generation = int(
+                    getattr(previous_device,
+                            "dspark_confidence_engine_generation", 0) or 0)
+                candidate = int(selected_host)
+                route_valid = bool(
+                    scheduled_batch.num_context_requests == 0
+                    and real_requests and current_ids == planned_ids
+                    and current_slots == planned_slots and route_g > 0
+                    and route_epoch > 0 and engine_generation == int(
+                        self.model_engine.
+                        _dspark_confidence_engine_generation)
+                    and candidate in spec_config.
+                    resolve_confidence_native_uniform_draft_len_candidates(
+                        route_g))
+        elif (self.disable_overlap_scheduler
+              and scheduled_batch.num_context_requests == 0 and real_requests):
+            effective_lens = {
+                request.py_draft_tokens_effective_len
+                for request in real_requests
+            }
+            route_batches = {
+                request.py_dspark_confidence_execution_batch_size
+                for request in real_requests
+            }
+            route_epochs = {
+                request.py_dspark_confidence_route_epoch
+                for request in real_requests
+            }
+            if (len(effective_lens) == len(route_batches) ==
+                    len(route_epochs) == 1):
+                candidate_value = next(iter(effective_lens))
+                route_g_value = next(iter(route_batches))
+                route_epoch_value = next(iter(route_epochs))
+                if (candidate_value is not None and route_g_value is not None
+                        and route_epoch_value is not None):
+                    candidate = int(candidate_value)
+                    route_g = int(route_g_value)
+                    route_epoch = int(route_epoch_value)
+                    route_valid = bool(
+                        route_g > 0 and route_epoch > 0
+                        and candidate in spec_config.
+                        resolve_confidence_native_uniform_draft_len_candidates(
+                            route_g))
+
+        if self.enable_attention_dp:
+            rank_routes = list(
+                self.dist.tp_allgather(
+                    [route_valid, candidate, route_g, route_epoch]))
+            route_valid = bool(
+                rank_routes and all(
+                    isinstance(route, (list, tuple)) and len(route) == 4
+                    and bool(route[0]) for route in rank_routes)
+                and all(tuple(route[1:]) == tuple(rank_routes[0][1:])
+                        for route in rank_routes))
+
+        runtime_draft_len = candidate if route_valid else max_draft_len
+        DRAFT_BUFFER_PAD = 0
+        rejection_on = getattr(spec_config, "use_rejection_sampling", False)
+        for request in generation_requests:
+            current_num_draft_tokens = len(request.py_draft_tokens)
+            request.py_needs_onehot_draft_probs = (
+                rejection_on and current_num_draft_tokens == 0)
+            if current_num_draft_tokens < runtime_draft_len:
+                request.py_draft_tokens.extend(
+                    [DRAFT_BUFFER_PAD] *
+                    (runtime_draft_len - current_num_draft_tokens))
+            elif current_num_draft_tokens > runtime_draft_len:
+                request.py_draft_tokens = request.py_draft_tokens[
+                    :runtime_draft_len]
+            request.py_draft_tokens_effective_len = runtime_draft_len
+            if not route_valid and not request.is_dummy:
+                request.py_dspark_confidence_route_epoch = None
+                request.py_dspark_confidence_execution_batch_size = None
+                request.py_dspark_confidence_verifier_token_budget = None
+        return runtime_draft_len
+
     def _handle_dynamic_draft_len(self,
                                   scheduled_batch: ScheduledRequests) -> None:
         """Handle dynamic draft length for the current batch.
@@ -3421,6 +3554,12 @@ class PyExecutor:
             for request in scheduled_batch.generation_requests:
                 request.py_draft_tokens = []
             self.model_engine.runtime_draft_len = 0
+            return
+
+        native_uniform_draft_len = (
+            self._resolve_dspark_native_uniform_draft_len(scheduled_batch))
+        if native_uniform_draft_len is not None:
+            self.model_engine.runtime_draft_len = native_uniform_draft_len
             return
 
         if (self.model_engine.spec_config is not None
