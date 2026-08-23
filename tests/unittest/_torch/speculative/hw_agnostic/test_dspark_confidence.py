@@ -29,6 +29,8 @@ from tensorrt_llm._torch.speculative.dspark_confidence import (
     plan_dynamic_verifier_budget,
     plan_fixed_verifier_budget,
     plan_masked_fixed_verifier_draft_lens,
+    plan_uniform_floor_two_tier_verifier_budget,
+    resolve_uniform_floor_two_tier,
     verify_packed_greedy,
 )
 from tensorrt_llm._torch.speculative.dspark_planner import (
@@ -41,7 +43,11 @@ from tensorrt_llm._torch.speculative.dspark_planner import (
     select_fixed_verifier_budget_from_traces,
     validate_sps_cost_table_payload,
 )
-from tensorrt_llm._torch.speculative.dspark_trace import ConfidenceTraceRing
+from tensorrt_llm._torch.speculative.dspark_trace import (
+    DYNAMIC_CONFIDENCE_TRACE_PATH_ENV,
+    ConfidenceTraceRing,
+    dynamic_confidence_trace_path_from_env,
+)
 
 
 @dataclass
@@ -169,51 +175,97 @@ def test_dynamic_single_tier_skips_redundant_yield_reducer() -> None:
     assert int(plan.retained_lens.sum()) == 4
 
 
-def test_dynamic_budget_reducer_selects_global_goodput_not_max_local_tier() -> None:
+def test_dynamic_budget_weak_local_rank_vetoes_favorable_peer_sum() -> None:
     budgets = torch.tensor([2, 4, 6], dtype=torch.int64)
-    step_times = torch.tensor([1.0, 1.6, 2.4], dtype=torch.float32)
-    low_logits = torch.full((2, 2), -20.0, dtype=torch.float32)
-    high_logits = torch.full((2, 2), 20.0, dtype=torch.float32)
+    step_times = torch.tensor([1.0, 1.1, 1.2], dtype=torch.float32)
+    logits = torch.full((2, 2), 20.0, dtype=torch.float32)
+    observed: list[torch.Tensor] = []
 
-    def candidate_yields(logits: torch.Tensor) -> torch.Tensor:
-        observed = []
+    def favorable_peer_sum(local: torch.Tensor) -> torch.Tensor:
+        observed.append(local.clone())
+        return local + torch.tensor([1000.0, 1000.0, 0.0])
 
-        def capture(values: torch.Tensor) -> torch.Tensor:
-            observed.append(values.clone())
-            return values
-
-        plan_dynamic_verifier_budget(
-            logits,
-            budgets,
-            step_times,
-            candidate_yield_reducer=capture,
-        )
-        return observed[0]
-
-    low_local = plan_dynamic_verifier_budget(low_logits, budgets, step_times)
-    high_local = plan_dynamic_verifier_budget(high_logits, budgets, step_times)
-    global_yields = candidate_yields(low_logits) + candidate_yields(high_logits)
-
-    def reducer(_local: torch.Tensor) -> torch.Tensor:
-        return global_yields
-
-    low_global = plan_dynamic_verifier_budget(
-        low_logits,
+    plan = plan_dynamic_verifier_budget(
+        logits,
         budgets,
         step_times,
-        candidate_yield_reducer=reducer,
-    )
-    high_global = plan_dynamic_verifier_budget(
-        high_logits,
-        budgets,
-        step_times,
-        candidate_yield_reducer=reducer,
+        candidate_yield_reducer=favorable_peer_sum,
     )
 
-    assert int(low_local.verifier_token_budget) == 2
-    assert int(high_local.verifier_token_budget) == 6
-    assert int(low_global.verifier_token_budget) == 2
-    assert int(high_global.verifier_token_budget) == 2
+    assert torch.isneginf(observed[0][0])
+    assert torch.isneginf(observed[0][1])
+    assert torch.isfinite(observed[0][2])
+    assert int(plan.verifier_token_budget) == 6
+    assert plan.retained_lens.tolist() == [2, 2]
+
+
+def test_dynamic_budget_all_local_clear_keeps_compact_candidate() -> None:
+    observed: list[torch.Tensor] = []
+
+    def all_rank_sum(local: torch.Tensor) -> torch.Tensor:
+        observed.append(local.clone())
+        return local * 2.0
+
+    plan = plan_dynamic_verifier_budget(
+        torch.full((2, 2), -100.0),
+        torch.tensor([2, 6]),
+        torch.tensor([1.0, 2.0]),
+        candidate_yield_reducer=all_rank_sum,
+    )
+
+    assert torch.isfinite(observed[0]).all()
+    assert int(plan.verifier_token_budget) == 2
+    assert plan.retained_lens.tolist() == [0, 0]
+
+
+def test_dynamic_budget_local_veto_accepts_exact_minimum_gain_threshold() -> None:
+    observed: list[torch.Tensor] = []
+
+    def capture(local: torch.Tensor) -> torch.Tensor:
+        observed.append(local.clone())
+        return local
+
+    plan = plan_dynamic_verifier_budget(
+        torch.full((2, 2), -100.0),
+        torch.tensor([2, 6]),
+        torch.tensor([1.0, 1.03]),
+        minimum_predicted_gain=0.03,
+        candidate_yield_reducer=capture,
+    )
+
+    assert torch.isfinite(observed[0][0])
+    assert int(plan.verifier_token_budget) == 2
+
+
+def test_dynamic_budget_local_veto_never_invalidates_full_candidate() -> None:
+    observed: list[torch.Tensor] = []
+
+    def capture(local: torch.Tensor) -> torch.Tensor:
+        observed.append(local.clone())
+        return local
+
+    plan = plan_dynamic_verifier_budget(
+        torch.full((2, 2), 20.0),
+        torch.tensor([2, 4, 6]),
+        torch.tensor([1.0, 1.1, 1.2]),
+        candidate_yield_reducer=capture,
+    )
+
+    assert torch.isfinite(observed[0][-1])
+    assert int(plan.verifier_token_budget) == 6
+    assert plan.retained_lens.tolist() == [2, 2]
+
+
+def test_dynamic_budget_reducer_none_keeps_existing_local_selection() -> None:
+    plan = plan_dynamic_verifier_budget(
+        torch.full((2, 2), -100.0),
+        torch.tensor([2, 6]),
+        torch.tensor([1.0, 2.0]),
+        candidate_yield_reducer=None,
+    )
+
+    assert int(plan.verifier_token_budget) == 2
+    assert plan.retained_lens.tolist() == [0, 0]
 
 
 def test_dynamic_budget_reducer_must_preserve_candidate_shape() -> None:
@@ -292,6 +344,249 @@ def test_dynamic_budget_peer_ineligibility_forces_shared_full_k() -> None:
 
     assert int(plan.verifier_token_budget) == 12
     assert plan.retained_lens.tolist() == [2, 2, 2, 2]
+
+
+def _g128_floor_logits(flat: bool = False, device: str = "cpu") -> torch.Tensor:
+    logits = torch.full((128, 5), 20.0, dtype=torch.float32, device=device)
+    if not flat:
+        logits[96:, :] = -20.0
+    return logits
+
+
+@pytest.mark.parametrize(
+    ("step_times", "expected_budget", "expected_lens"),
+    [
+        ([1.0, 100.0, 100.0], 512, [3] * 128),
+        ([100.0, 1.0, 100.0], 704, [5] * 96 + [3] * 32),
+        ([100.0, 100.0, 1.0], 768, [5] * 128),
+    ],
+)
+def test_dynamic_common_floor_g128_tiers(
+    step_times: list[float], expected_budget: int, expected_lens: list[int]
+) -> None:
+    plan = plan_dynamic_verifier_budget(
+        _g128_floor_logits(),
+        torch.tensor([512, 704, 768], dtype=torch.int64),
+        torch.tensor(step_times, dtype=torch.float32),
+        minimum_predicted_gain=0.0,
+    )
+
+    assert int(plan.verifier_token_budget) == expected_budget
+    assert plan.retained_lens.tolist() == expected_lens
+
+
+def test_dynamic_common_floor_flat_v704_uses_stable_position_major_tie_order() -> None:
+    plan = plan_dynamic_verifier_budget(
+        _g128_floor_logits(flat=True),
+        torch.tensor([512, 704, 768], dtype=torch.int64),
+        torch.tensor([100.0, 1.0, 100.0], dtype=torch.float32),
+        minimum_predicted_gain=0.0,
+        temperatures=torch.full((5,), 1.0e30, dtype=torch.float32),
+    )
+
+    assert int(plan.verifier_token_budget) == 704
+    assert plan.retained_lens.tolist() == [5] * 64 + [4] * 64
+
+
+def test_dynamic_common_floor_padding_and_adp_ineligibility_preserve_full_fallback() -> None:
+    observed: list[torch.Tensor] = []
+
+    def peer_reducer(values: torch.Tensor) -> torch.Tensor:
+        observed.append(values.clone())
+        reduced = values.clone()
+        reduced[1] = float("-inf")
+        return reduced
+
+    real_request_mask = torch.zeros(128, dtype=torch.bool)
+    real_request_mask[:112] = True
+    plan = plan_dynamic_verifier_budget(
+        _g128_floor_logits(),
+        torch.tensor([512, 704, 768], dtype=torch.int64),
+        torch.tensor([100.0, 1.0, 100.0], dtype=torch.float32),
+        minimum_predicted_gain=0.0,
+        candidate_yield_reducer=peer_reducer,
+        real_request_mask=real_request_mask,
+    )
+
+    assert torch.isneginf(observed[0][1])
+    assert int(plan.verifier_token_budget) == 768
+    assert plan.retained_lens[:112].tolist() == [5] * 112
+    assert plan.retained_lens[112:].tolist() == [0] * 16
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_dynamic_common_floor_cuda_graph_v512_v704_v512_replay() -> None:
+    logits = _g128_floor_logits(device="cuda")
+    budgets = torch.tensor([512, 704, 768], dtype=torch.int64, device="cuda")
+    step_times = torch.tensor([1.0, 100.0, 100.0], dtype=torch.float32, device="cuda")
+
+    warmup_stream = torch.cuda.Stream()
+    warmup_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup_stream):
+        for _ in range(3):
+            plan_dynamic_verifier_budget(
+                logits, budgets, step_times, minimum_predicted_gain=0.0
+            )
+    torch.cuda.current_stream().wait_stream(warmup_stream)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        plan = plan_dynamic_verifier_budget(
+            logits, budgets, step_times, minimum_predicted_gain=0.0
+        )
+
+    graph.replay()
+    torch.cuda.synchronize()
+    assert int(plan.verifier_token_budget) == 512
+    assert plan.retained_lens.tolist() == [3] * 128
+
+    step_times.copy_(torch.tensor([100.0, 1.0, 100.0], device="cuda"))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert int(plan.verifier_token_budget) == 704
+    assert plan.retained_lens.tolist() == [5] * 96 + [3] * 32
+
+    step_times.copy_(torch.tensor([1.0, 100.0, 100.0], device="cuda"))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert int(plan.verifier_token_budget) == 512
+    assert plan.retained_lens.tolist() == [3] * 128
+
+
+def test_resolve_uniform_floor_two_tier_is_fail_closed() -> None:
+    assert resolve_uniform_floor_two_tier(128, 5, [512, 768]) == 3
+    assert resolve_uniform_floor_two_tier(128, 5, [512, 704, 768]) is None
+    assert resolve_uniform_floor_two_tier(128, 5, [513, 768]) is None
+    assert resolve_uniform_floor_two_tier(128, 5, [512, 767]) is None
+    assert resolve_uniform_floor_two_tier(128, 5, [768, 768]) is None
+
+
+def test_uniform_floor_two_tier_fast_path_avoids_global_ranking(monkeypatch) -> None:
+    monkeypatch.setattr(
+        torch,
+        "argsort",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("argsort called")),
+    )
+    plan = plan_uniform_floor_two_tier_verifier_budget(
+        torch.full((4, 2), -20.0),
+        torch.tensor([8, 12]),
+        torch.tensor([1.0, 2.0]),
+        uniform_compact_floor=1,
+    )
+    assert int(plan.verifier_token_budget) == 8
+    assert plan.retained_lens.tolist() == [1, 1, 1, 1]
+
+
+def test_uniform_floor_local_min_progress_vetoes_favorable_rank_sum() -> None:
+    logits = torch.full((4, 2), -20.0)
+    logits[0] = 20.0
+    budgets = torch.tensor([8, 12])
+    times = torch.tensor([1.0, 1.5])
+
+    no_progress = plan_uniform_floor_two_tier_verifier_budget(
+        logits,
+        budgets,
+        times,
+        uniform_compact_floor=1,
+        minimum_predicted_gain=0.03,
+        candidate_yield_reducer=lambda values: values,
+    )
+    protected_laggard = plan_uniform_floor_two_tier_verifier_budget(
+        logits,
+        budgets,
+        times,
+        uniform_compact_floor=1,
+        minimum_predicted_gain=0.03,
+        candidate_yield_reducer=lambda values: values,
+        request_progress=torch.tensor([0, 4, 4, 4]),
+    )
+
+    assert int(no_progress.verifier_token_budget) == 8
+    assert int(protected_laggard.verifier_token_budget) == 12
+    assert protected_laggard.retained_lens.tolist() == [2, 2, 2, 2]
+
+
+def test_uniform_floor_local_min_all_clear_keeps_compact() -> None:
+    plan = plan_uniform_floor_two_tier_verifier_budget(
+        torch.full((4, 2), -20.0),
+        torch.tensor([8, 12]),
+        torch.tensor([1.0, 1.5]),
+        uniform_compact_floor=1,
+        minimum_predicted_gain=0.03,
+        candidate_yield_reducer=lambda values: values * 2.0,
+        request_progress=torch.tensor([0, 4, 4, 4]),
+    )
+    assert int(plan.verifier_token_budget) == 8
+    assert plan.retained_lens.tolist() == [1, 1, 1, 1]
+
+
+def test_uniform_floor_padding_falls_back_to_full() -> None:
+    plan = plan_uniform_floor_two_tier_verifier_budget(
+        torch.full((4, 2), -20.0),
+        torch.tensor([8, 12]),
+        torch.tensor([1.0, 2.0]),
+        uniform_compact_floor=1,
+        real_request_mask=torch.tensor([True, True, True, False]),
+        request_progress=torch.tensor([0, 1, 2, 0]),
+    )
+    assert int(plan.verifier_token_budget) == 12
+    assert plan.retained_lens.tolist() == [2, 2, 2, 0]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_uniform_floor_cuda_graph_weak_strong_weak_progress_replay() -> None:
+    logits = torch.full((4, 2), -20.0, device="cuda")
+    logits[0] = 20.0
+    budgets = torch.tensor([8, 12], device="cuda")
+    times = torch.tensor([1.0, 1.5], device="cuda")
+    progress = torch.tensor([0, 4, 4, 4], device="cuda")
+
+    warmup_stream = torch.cuda.Stream()
+    warmup_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup_stream):
+        for _ in range(3):
+            plan_uniform_floor_two_tier_verifier_budget(
+                logits,
+                budgets,
+                times,
+                1,
+                minimum_predicted_gain=0.03,
+                request_progress=progress,
+            )
+    torch.cuda.current_stream().wait_stream(warmup_stream)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        plan = plan_uniform_floor_two_tier_verifier_budget(
+            logits,
+            budgets,
+            times,
+            1,
+            minimum_predicted_gain=0.03,
+            request_progress=progress,
+        )
+    lens_ptr = plan.retained_lens.data_ptr()
+    budget_ptr = plan.verifier_token_budget.data_ptr()
+
+    graph.replay()
+    torch.cuda.synchronize()
+    assert int(plan.verifier_token_budget) == 12
+    assert plan.retained_lens.tolist() == [2, 2, 2, 2]
+
+    logits[0].fill_(-20.0)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert int(plan.verifier_token_budget) == 8
+    assert plan.retained_lens.tolist() == [1, 1, 1, 1]
+    assert plan.retained_lens.data_ptr() == lens_ptr
+    assert plan.verifier_token_budget.data_ptr() == budget_ptr
+
+    logits[0].fill_(20.0)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert int(plan.verifier_token_budget) == 12
+    assert plan.retained_lens.data_ptr() == lens_ptr
+    assert plan.verifier_token_budget.data_ptr() == budget_ptr
 
 
 @pytest.mark.parametrize(
@@ -1121,6 +1416,147 @@ def test_dynamic_budget_changes_tier_during_cuda_graph_replay() -> None:
     torch.cuda.synchronize()
     assert int(captured_plan.verifier_token_budget) == 24
     assert int(captured_plan.retained_lens.sum()) == 20
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_dynamic_budget_local_veto_cuda_graph_weak_strong_weak_replay() -> None:
+    logits = torch.full((2, 2), 20.0, dtype=torch.float32, device="cuda")
+    budgets = torch.tensor([2, 6], dtype=torch.int64, device="cuda")
+    step_times = torch.tensor([1.0, 1.5], dtype=torch.float32, device="cuda")
+
+    def identity_sum(local: torch.Tensor) -> torch.Tensor:
+        return local
+
+    warmup_stream = torch.cuda.Stream()
+    warmup_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup_stream):
+        for _ in range(3):
+            plan_dynamic_verifier_budget(
+                logits,
+                budgets,
+                step_times,
+                candidate_yield_reducer=identity_sum,
+            )
+    torch.cuda.current_stream().wait_stream(warmup_stream)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        plan = plan_dynamic_verifier_budget(
+            logits,
+            budgets,
+            step_times,
+            candidate_yield_reducer=identity_sum,
+        )
+    retained_ptr = plan.retained_lens.data_ptr()
+    budget_ptr = plan.verifier_token_budget.data_ptr()
+
+    graph.replay()
+    torch.cuda.synchronize()
+    assert int(plan.verifier_token_budget) == 6
+    assert plan.retained_lens.tolist() == [2, 2]
+
+    logits.fill_(-100.0)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert int(plan.verifier_token_budget) == 2
+    assert plan.retained_lens.tolist() == [0, 0]
+
+    logits.fill_(20.0)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert int(plan.verifier_token_budget) == 6
+    assert plan.retained_lens.tolist() == [2, 2]
+    assert plan.retained_lens.data_ptr() == retained_ptr
+    assert plan.verifier_token_budget.data_ptr() == budget_ptr
+
+
+def test_dynamic_confidence_trace_path_is_default_off(monkeypatch) -> None:
+    monkeypatch.delenv(DYNAMIC_CONFIDENCE_TRACE_PATH_ENV, raising=False)
+    assert dynamic_confidence_trace_path_from_env() is None
+
+    monkeypatch.setenv(DYNAMIC_CONFIDENCE_TRACE_PATH_ENV, "  /tmp/dspark-dynamic  ")
+    assert dynamic_confidence_trace_path_from_env() == "/tmp/dspark-dynamic"
+
+
+def test_dynamic_confidence_trace_ring_records_policy_identity_and_progress(
+    tmp_path,
+) -> None:
+    ring = ConfidenceTraceRing(
+        path_stem=str(tmp_path / "dynamic-trace"),
+        rank=3,
+        num_slots=3,
+        max_draft_len=3,
+        scratch_slot=2,
+        capacity=12,
+        dynamic_diagnostic=True,
+        device="cpu",
+    )
+    ring.bind_slot_identity(0, 101)
+    ring.bind_slot_identity(1, 202)
+    ring.bind_slot_identity(2, -1)
+    ring.invalidate_slot(0)
+    ring.bind_slot_identity(0, 101)
+    slots = torch.tensor([0, 1, 2], dtype=torch.long)
+    real_mask = torch.tensor([True, True, False])
+    first_logits = torch.tensor(
+        [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [0.0, 0.0, 0.0]]
+    )
+    ring.record_and_update(
+        slots=slots,
+        confidence_logits=first_logits,
+        num_accepted_tokens=torch.ones(3, dtype=torch.int32),
+    )
+    ring.publish_dynamic_plan(
+        slots=slots,
+        real_request_mask=real_mask,
+        generation_progress=torch.tensor([4, 9, -1], dtype=torch.int64),
+        selected_budget=torch.tensor(6, dtype=torch.int32),
+        compact_budget=torch.tensor(6, dtype=torch.int32),
+        full_budget=torch.tensor(12, dtype=torch.int32),
+        compact_goodput=torch.tensor([1.25, 0.75, 0.0]),
+        full_goodput=torch.tensor([1.0, 1.0, 0.0]),
+    )
+
+    ring.record_and_update(
+        slots=slots,
+        confidence_logits=torch.zeros_like(first_logits),
+        num_accepted_tokens=torch.tensor([3, 2, 1], dtype=torch.int32),
+    )
+    ring.flush()
+
+    payload = torch.load(ring.path, map_location="cpu", weights_only=True)
+    assert payload["diagnostic_schema"] == "dspark_dynamic_policy_trace_v1"
+    assert payload["rank"] == 3
+    assert payload["rows_written"] == 3
+    assert payload["slot_id"].tolist() == [0, 1, 2]
+    assert payload["request_id"].tolist() == [101, 202, -1]
+    assert payload["generation_progress"].tolist() == [4, 9, -1]
+    assert payload["real_mask"].tolist() == [True, True, False]
+    assert payload["accepted_token_count"].tolist() == [3, 2, 0]
+    assert payload["accepted_draft_count"].tolist() == [2, 1, 0]
+    assert payload["selected_budget"].tolist() == [6, 6, 6]
+    assert payload["compact_budget"].tolist() == [6, 6, 6]
+    assert payload["full_budget"].tolist() == [12, 12, 12]
+    torch.testing.assert_close(
+        payload["predicted_compact_minus_full_margin"],
+        torch.tensor([0.25, -0.25, 0.0]),
+    )
+    assert payload["counterfactual_full_k_acceptance_available"] is False
+    assert payload["counterfactual_full_k_acceptance"] is None
+    assert "unavailable" in payload["acceptance_semantics"]
+
+
+def test_dynamic_confidence_trace_capture_methods_have_no_host_reads() -> None:
+    import inspect
+
+    for method in (
+        ConfidenceTraceRing.record_and_update,
+        ConfidenceTraceRing.publish_dynamic_plan,
+    ):
+        source = inspect.getsource(method)
+        assert ".item(" not in source
+        assert ".cpu(" not in source
+        assert "synchronize" not in source
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")

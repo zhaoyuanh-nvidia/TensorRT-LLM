@@ -854,6 +854,47 @@ def test_adp_unready_or_over_capacity_uses_uniform_predraft_full_k(rank_info, ba
     assert decision == 0
 
 
+@pytest.mark.parametrize(
+    ("real_count", "expected_execution_g"),
+    [(1, 16), (17, 32), (33, 64), (65, 128)],
+)
+def test_partial_confidence_coverage_keeps_smaller_batches_on_ordinary_graphs(
+    real_count,
+    expected_execution_g,
+):
+    config = DSparkDecodingConfig(
+        max_draft_len=5,
+        speculative_model="/tmp/dummy_model",
+        confidence_mode="dynamic_budget",
+        confidence_verifier_token_budget_tiers={128: [256, 512, 768]},
+        confidence_sps_cost_table_path="/tmp/dummy-sps.json",
+    )
+    runner = _synthetic_capture_runner(config, capture=False)
+    runner.supported_batch_sizes = [16, 32, 64, 128]
+    runner._confidence_last_route_epoch = 0
+    runner.confidence_engine_generation = 17
+    batch = ScheduledRequests()
+    batch.generation_requests = [
+        request_stub(index, 5, index) for index in range(real_count)
+    ]
+
+    assert CUDAGraphRunner._get_confidence_adp_common_batch_size(
+        runner, batch, None
+    ) == expected_execution_g
+    assert runner.confidence_adp_execution_batch_size == expected_execution_g
+    assert runner.confidence_force_full_k_route
+    if expected_execution_g < 128:
+        assert not config.resolve_confidence_verifier_token_budget_candidates(
+            expected_execution_g
+        )
+    else:
+        assert config.resolve_confidence_verifier_token_budget_candidates(128) == (
+            256,
+            512,
+            768,
+        )
+
+
 @pytest.mark.parametrize("peer_count", [1, 8])
 def test_adp_actual_group_cardinality_preserves_carrier_route_identity(
     peer_count,

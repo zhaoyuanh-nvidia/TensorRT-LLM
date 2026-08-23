@@ -32,10 +32,13 @@ from tensorrt_llm.mapping import Mapping
 from ..distributed import AllReduce, AllReduceStrategy
 from ..pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
 from .dspark_confidence import (
+    apply_sts,
     build_confidence_device_layout,
     load_sts_temperatures,
     plan_dynamic_verifier_budget,
     plan_masked_fixed_verifier_draft_lens,
+    plan_uniform_floor_two_tier_verifier_budget,
+    resolve_uniform_floor_two_tier,
     verify_packed_greedy,
 )
 from .dspark_planner import (
@@ -43,7 +46,11 @@ from .dspark_planner import (
     load_sps_cost_table,
     validate_sps_cost_table_payload,
 )
-from .dspark_trace import ConfidenceTraceRing, confidence_trace_path_from_env
+from .dspark_trace import (
+    ConfidenceTraceRing,
+    confidence_trace_path_from_env,
+    dynamic_confidence_trace_path_from_env,
+)
 from .interface import SpecMetadata, SpecWorkerBase
 
 if TYPE_CHECKING:
@@ -150,6 +157,7 @@ class DSparkSpecMetadata(SpecMetadata):
                 if rid not in current:
                     slot = worker._req_to_slot.pop(rid)
                     worker._ctx_len[slot] = 0
+                    worker._generation_start_len[slot] = 0
                     worker._kv_windows[slot].zero_()
                     worker._free_slots.append(slot)
                     if worker._confidence_recorder is not None:
@@ -302,13 +310,16 @@ class DSparkWorker(SpecWorkerBase):
         )
         self._confidence_recorder: Optional[ConfidenceTraceRing] = None
         self._confidence_sts_temperatures: Optional[torch.Tensor] = None
-        self._confidence_dynamic_tables: dict[int, tuple[torch.Tensor, torch.Tensor, float]] = {}
+        self._confidence_dynamic_tables: dict[
+            int, tuple[torch.Tensor, torch.Tensor, float, Optional[int]]
+        ] = {}
 
         # Per-slot rolling captured-context KV windows, built lazily on the
         # first forward (fixed-size for slot-indexed reads/writes).
         self._win_inited = False
         self._kv_windows: Optional[torch.Tensor] = None  # [max_batch, num_stages, win, hd]
         self._ctx_len: Optional[torch.Tensor] = None  # [max_batch] abs decode position
+        self._generation_start_len: Optional[torch.Tensor] = None  # [max_batch] prompt end
         self._win = 0
 
         # Slot management. ``_req_to_slot`` (python dict) + ``_free_slots`` are the
@@ -401,10 +412,16 @@ class DSparkWorker(SpecWorkerBase):
                     dtype=torch.float32,
                     device="cuda",
                 )
+                uniform_floor = resolve_uniform_floor_two_tier(
+                    int(graph_batch_size),
+                    block_size,
+                    candidate_budgets,
+                )
                 self._confidence_dynamic_tables[int(graph_batch_size)] = (
                     budgets,
                     step_times,
                     float(cost_table.minimum_predicted_gain),
+                    uniform_floor,
                 )
             logger.info(
                 "DSpark: loaded dynamic verifier tiers and measured SPS costs "
@@ -446,11 +463,45 @@ class DSparkWorker(SpecWorkerBase):
             device="cuda",
         )
         self._ctx_len = torch.zeros(num_rows, dtype=torch.long, device="cuda")
+        self._generation_start_len = torch.zeros_like(self._ctx_len)
         self._batch_to_slot = torch.zeros(max_batch, dtype=torch.long, device="cuda")
 
         trace_path = confidence_trace_path_from_env()
+        dynamic_trace_path = dynamic_confidence_trace_path_from_env()
+        if trace_path and dynamic_trace_path:
+            raise ValueError(
+                "Configure either a full-K confidence trace or a dynamic-policy "
+                "diagnostic trace, not both"
+            )
+        if dynamic_trace_path:
+            if not getattr(self.spec_config, "is_dynamic_budget_confidence_enabled", False):
+                raise ValueError(
+                    "Dynamic-policy confidence tracing requires dynamic confidence budgets"
+                )
+            tiers = self.spec_config.confidence_verifier_token_budget_tiers or {}
+            if not tiers:
+                raise ValueError(
+                    "Dynamic-policy confidence tracing requires a non-empty tier map"
+                )
+            unsupported = {
+                int(graph_batch_size): list(candidate_budgets)
+                for graph_batch_size, candidate_budgets in tiers.items()
+                if resolve_uniform_floor_two_tier(
+                    int(graph_batch_size), block_size, candidate_budgets
+                )
+                is None
+            }
+            if unsupported:
+                raise ValueError(
+                    "Dynamic-policy confidence tracing currently requires an exact "
+                    "uniform compact tier plus physical full-K tier; unsupported: "
+                    f"{unsupported}"
+                )
+            trace_path = dynamic_trace_path
         if trace_path and (self.mapping.tp_rank == 0 or self.mapping.enable_attention_dp):
-            if getattr(self.spec_config, "is_dynamic_budget_confidence_enabled", False):
+            if dynamic_trace_path:
+                schedule = {}
+            elif getattr(self.spec_config, "is_dynamic_budget_confidence_enabled", False):
                 schedule = {
                     graph_batch_size: min(candidate_budgets)
                     for graph_batch_size, candidate_budgets in (
@@ -475,6 +526,7 @@ class DSparkWorker(SpecWorkerBase):
                 num_slots=num_rows,
                 max_draft_len=block_size,
                 scratch_slot=self._scratch_slot,
+                dynamic_diagnostic=dynamic_trace_path is not None,
             )
         self._free_slots = deque(range(max_batch))
         self._req_to_slot = {}
@@ -490,6 +542,7 @@ class DSparkWorker(SpecWorkerBase):
         if reset and req_id in self._req_to_slot:
             old = self._req_to_slot.pop(req_id)
             self._ctx_len[old] = 0
+            self._generation_start_len[old] = 0
             self._kv_windows[old].zero_()
             self._free_slots.append(old)
             if self._confidence_recorder is not None:
@@ -503,10 +556,14 @@ class DSparkWorker(SpecWorkerBase):
             slot = self._free_slots.popleft()
             self._req_to_slot[req_id] = slot
             self._ctx_len[slot] = 0
+            self._generation_start_len[slot] = 0
             self._kv_windows[slot].zero_()
             if self._confidence_recorder is not None:
                 self._confidence_recorder.invalidate_slot(slot)
-        return self._req_to_slot[req_id]
+        slot = self._req_to_slot[req_id]
+        if self._confidence_recorder is not None:
+            self._confidence_recorder.bind_slot_identity(slot, req_id)
+        return slot
 
     def _seed_context_windows(
         self,
@@ -536,6 +593,7 @@ class DSparkWorker(SpecWorkerBase):
             first_position = int(chunk_positions[0].item())
             slot = self._assign_slot(req_id, reset=first_position == 0)
             self._ctx_len[slot] = chunk_positions[-1] + 1
+            self._generation_start_len[slot] = self._ctx_len[slot]
 
             if captured is not None:
                 keep = min(self._win, chunk_len)
@@ -796,6 +854,7 @@ class DSparkWorker(SpecWorkerBase):
         )
         if is_warmup:
             saved_ctx_len = self._ctx_len.clone()
+            saved_generation_start_len = self._generation_start_len.clone()
             saved_windows = self._kv_windows.clone()
 
         # Assign / reset window slots for context (prefill) requests and seed each
@@ -944,23 +1003,90 @@ class DSparkWorker(SpecWorkerBase):
                             "DSpark dynamic verifier budget has no measured "
                             f"cost table for graph batch size {num_gens}"
                         )
-                    candidate_budgets, candidate_step_times, minimum_gain = dynamic_table
-                    confidence_plan = plan_dynamic_verifier_budget(
-                        confidence_logits,
+                    (
                         candidate_budgets,
                         candidate_step_times,
+                        minimum_gain,
+                        uniform_floor,
+                    ) = dynamic_table
+                    yield_reducer = (
+                        self._reduce_confidence_candidate_yields
+                        if self._confidence_yield_all_reduce is not None
+                        else None
+                    )
+                    plan_kwargs = dict(
                         minimum_predicted_gain=minimum_gain,
                         temperatures=self._confidence_sts_temperatures,
-                        candidate_yield_reducer=(
-                            self._reduce_confidence_candidate_yields
-                            if self._confidence_yield_all_reduce is not None
-                            else None
-                        ),
+                        candidate_yield_reducer=yield_reducer,
                         real_request_mask=real_request_mask,
                     )
+                    if uniform_floor is None:
+                        confidence_plan = plan_dynamic_verifier_budget(
+                            confidence_logits,
+                            candidate_budgets,
+                            candidate_step_times,
+                            **plan_kwargs,
+                        )
+                    else:
+                        request_progress = (
+                            self._ctx_len[slots] - self._generation_start_len[slots]
+                            if yield_reducer is not None
+                            else None
+                        )
+                        confidence_plan = plan_uniform_floor_two_tier_verifier_budget(
+                            confidence_logits,
+                            candidate_budgets,
+                            candidate_step_times,
+                            uniform_floor,
+                            request_progress=request_progress,
+                            **plan_kwargs,
+                        )
                     next_draft_lens = confidence_plan.retained_lens
                     selected_verifier_budget = confidence_plan.verifier_token_budget
                     packed_capacity = max(candidates)
+                    if (
+                        self._confidence_recorder is not None
+                        and self._confidence_recorder.dynamic_diagnostic
+                    ):
+                        if uniform_floor is None:
+                            raise RuntimeError(
+                                "Dynamic-policy diagnostics require the validated "
+                                "two-tier uniform-floor planner"
+                            )
+                        survival = torch.cumprod(
+                            apply_sts(
+                                confidence_logits,
+                                self._confidence_sts_temperatures,
+                            ),
+                            dim=1,
+                        )
+                        real_float = real_request_mask.to(torch.float32)
+                        compact_yield = real_float * (
+                            1.0
+                            + survival[:, :uniform_floor].sum(
+                                dim=1, dtype=torch.float32
+                            )
+                        )
+                        full_yield = real_float * (
+                            1.0 + survival.sum(dim=1, dtype=torch.float32)
+                        )
+                        generation_progress = (
+                            self._ctx_len[slots] - self._generation_start_len[slots]
+                        )
+                        self._confidence_recorder.publish_dynamic_plan(
+                            slots=slots,
+                            real_request_mask=real_request_mask,
+                            generation_progress=generation_progress,
+                            selected_budget=selected_verifier_budget,
+                            compact_budget=candidate_budgets[0],
+                            full_budget=candidate_budgets[-1],
+                            compact_goodput=(
+                                compact_yield / candidate_step_times[0].to(torch.float32)
+                            ),
+                            full_goodput=(
+                                full_yield / candidate_step_times[-1].to(torch.float32)
+                            ),
+                        )
                 else:
                     next_draft_lens = plan_masked_fixed_verifier_draft_lens(
                         confidence_logits,
@@ -990,6 +1116,7 @@ class DSparkWorker(SpecWorkerBase):
 
         if is_warmup:
             self._ctx_len.copy_(saved_ctx_len)
+            self._generation_start_len.copy_(saved_generation_start_len)
             self._kv_windows.copy_(saved_windows)
 
         outputs = {

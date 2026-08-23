@@ -16,7 +16,7 @@
 
 import json
 from pathlib import Path
-from typing import Callable, NamedTuple, Optional
+from typing import Callable, NamedTuple, Optional, Sequence
 
 import torch
 
@@ -30,6 +30,8 @@ __all__ = [
     "load_sts_temperatures",
     "plan_dynamic_verifier_budget",
     "plan_fixed_verifier_budget",
+    "plan_uniform_floor_two_tier_verifier_budget",
+    "resolve_uniform_floor_two_tier",
     "verify_packed_greedy",
 ]
 
@@ -423,6 +425,158 @@ def apply_sts(
     return torch.sigmoid(logits / temperatures.to(device=logits.device, dtype=torch.float32))
 
 
+def resolve_uniform_floor_two_tier(
+    num_requests: int,
+    max_draft_len: int,
+    candidate_budgets: Sequence[int],
+) -> int | None:
+    """Return a proven uniform compact floor for a specialized two-tier ladder.
+
+    The fast path is host-authorized only when the final tier is physical full
+    K and the sole compact tier retains an equal integer draft count on every
+    execution row. Every other ladder stays on the generic planner.
+    """
+    if num_requests <= 0 or max_draft_len <= 0 or len(candidate_budgets) != 2:
+        return None
+    compact, full = (int(value) for value in candidate_budgets)
+    dense_capacity = num_requests * (max_draft_len + 1)
+    if compact < num_requests or compact >= full or full != dense_capacity:
+        return None
+    retained = compact - num_requests
+    if retained % num_requests != 0:
+        return None
+    floor = retained // num_requests
+    return floor if 0 <= floor < max_draft_len else None
+
+
+def plan_uniform_floor_two_tier_verifier_budget(
+    confidence_logits: torch.Tensor,
+    candidate_budgets: torch.Tensor,
+    candidate_step_times_ms: torch.Tensor,
+    uniform_compact_floor: int,
+    minimum_predicted_gain: float = 0.01,
+    temperatures: torch.Tensor | None = None,
+    candidate_yield_reducer: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    real_request_mask: torch.Tensor | None = None,
+    request_progress: torch.Tensor | None = None,
+) -> DynamicBudgetPlan:
+    """Fast captured planner for one uniform compact tier plus physical full K.
+
+    Unlike the generic planner this path needs no ranking, cumulative yield,
+    scatter, or candidate allocation. It sums the compact prefix and full
+    survival directly per row. ``request_progress`` optionally adds a local
+    minimum-progress veto before the existing ADP reduction, without a new
+    collective or host transfer.
+    """
+    if confidence_logits.ndim != 2:
+        raise ValueError("confidence_logits must have shape [num_requests, max_draft_len]")
+    num_requests, max_draft_len = confidence_logits.shape
+    if num_requests == 0 or max_draft_len == 0:
+        raise ValueError("confidence_logits must have non-zero dimensions")
+    if candidate_budgets.shape != (2,) or candidate_step_times_ms.shape != (2,):
+        raise ValueError("uniform-floor fast path requires exactly two candidate vectors")
+    if candidate_budgets.device != confidence_logits.device:
+        raise ValueError("candidate budgets must be on the confidence-logit device")
+    if candidate_step_times_ms.device != confidence_logits.device:
+        raise ValueError("candidate step times must be on the confidence-logit device")
+    if not 0 <= uniform_compact_floor < max_draft_len:
+        raise ValueError("uniform_compact_floor must be in [0, max_draft_len)")
+    if minimum_predicted_gain < 0.0:
+        raise ValueError("minimum_predicted_gain must be non-negative")
+    if real_request_mask is None:
+        real_request_mask = torch.ones(
+            num_requests, dtype=torch.bool, device=confidence_logits.device
+        )
+    elif (
+        real_request_mask.shape != (num_requests,)
+        or real_request_mask.dtype != torch.bool
+        or real_request_mask.device != confidence_logits.device
+    ):
+        raise ValueError("real_request_mask must be a same-device boolean [num_requests] vector")
+    if request_progress is not None and (
+        request_progress.shape != (num_requests,)
+        or request_progress.device != confidence_logits.device
+        or request_progress.dtype not in (torch.int32, torch.int64)
+    ):
+        raise ValueError("request_progress must be a same-device integer [num_requests] vector")
+
+    survival = torch.cumprod(apply_sts(confidence_logits, temperatures), dim=1)
+    real_float = real_request_mask.to(torch.float32)
+    compact_row_yield = real_float * (
+        1.0 + survival[:, :uniform_compact_floor].sum(dim=1, dtype=torch.float32)
+    )
+    full_row_yield = real_float * (1.0 + survival.sum(dim=1, dtype=torch.float32))
+    expected_yield = torch.stack(
+        (compact_row_yield.sum(dtype=torch.float32), full_row_yield.sum(dtype=torch.float32))
+    )
+
+    real_request_count = real_request_mask.sum(dtype=torch.long)
+    required_compact_retained = candidate_budgets[0].to(torch.long) - num_requests
+    compact_valid = (
+        (real_request_count == num_requests)
+        & (real_request_count * uniform_compact_floor == required_compact_retained)
+    )
+    local_scores = expected_yield / candidate_step_times_ms.to(torch.float32)
+    compact_valid = compact_valid & (
+        local_scores[0] >= local_scores[1] * (1.0 + float(minimum_predicted_gain))
+    )
+
+    if request_progress is not None:
+        progress_nonnegative = torch.all(
+            torch.where(real_request_mask, request_progress >= 0, True)
+        )
+        padding_sentinel = torch.full(
+            (),
+            torch.iinfo(request_progress.dtype).max,
+            dtype=request_progress.dtype,
+            device=request_progress.device,
+        )
+        masked_progress = torch.where(real_request_mask, request_progress, padding_sentinel)
+        local_min = masked_progress.min()
+        protected = real_request_mask & (request_progress == local_min)
+        compact_row_scores = compact_row_yield / candidate_step_times_ms[0].to(torch.float32)
+        full_row_scores = full_row_yield / candidate_step_times_ms[1].to(torch.float32)
+        protected_clear = torch.all(
+            (~protected)
+            | (compact_row_scores >= full_row_scores * (1.0 + float(minimum_predicted_gain)))
+        )
+        compact_valid = compact_valid & progress_nonnegative & protected_clear
+
+    expected_yield = torch.where(
+        torch.stack(
+            (
+                compact_valid,
+                torch.ones((), dtype=torch.bool, device=confidence_logits.device),
+            )
+        ),
+        expected_yield,
+        torch.full((), float("-inf"), dtype=torch.float32, device=confidence_logits.device),
+    )
+    if candidate_yield_reducer is not None:
+        expected_yield = candidate_yield_reducer(expected_yield.contiguous())
+        if expected_yield.shape != candidate_budgets.shape:
+            raise ValueError("candidate_yield_reducer must preserve the candidate shape")
+        if expected_yield.device != confidence_logits.device:
+            raise ValueError("candidate_yield_reducer must preserve the confidence-logit device")
+
+    scores = expected_yield.to(torch.float32) / candidate_step_times_ms.to(torch.float32)
+    compact_clears = scores[0] >= scores[1] * (1.0 + float(minimum_predicted_gain))
+    selected_index = torch.where(
+        compact_clears,
+        torch.zeros((), dtype=torch.long, device=confidence_logits.device),
+        torch.ones((), dtype=torch.long, device=confidence_logits.device),
+    )
+    compact_lens = real_request_mask.to(torch.int32) * uniform_compact_floor
+    full_lens = real_request_mask.to(torch.int32) * max_draft_len
+    retained_lens = torch.where(selected_index == 0, compact_lens, full_lens)
+    return DynamicBudgetPlan(
+        retained_lens=retained_lens,
+        verifier_token_budget=torch.gather(
+            candidate_budgets, 0, selected_index.reshape(1)
+        ).squeeze(0),
+    )
+
+
 def plan_dynamic_verifier_budget(
     confidence_logits: torch.Tensor,
     candidate_budgets: torch.Tensor,
@@ -450,9 +604,20 @@ def plan_dynamic_verifier_budget(
     ``candidate_yield_reducer`` optionally aggregates the fixed-size yield
     vector before scoring. Attention-DP uses it to sum yield across ranks so
     every rank selects one globally optimal graph tier while retaining a
-    rank-local, exact-size ragged allocation. A one-tier ladder skips the
-    reducer because the selected graph tier is configuration-invariant; this
-    avoids a redundant captured collective without changing the allocation.
+    rank-local, exact-size ragged allocation. Before that reduction, each rank
+    vetoes a compact tier unless its local predicted goodput clears the local
+    full-K goodput by ``minimum_predicted_gain``. The existing sum reduction
+    propagates the negative-infinite veto, so aggregate gain cannot hide a
+    rank-local regression. A one-tier ladder skips both the veto and reducer
+    because the selected graph tier is configuration-invariant; this avoids a
+    redundant captured collective without changing the allocation.
+
+    Compact tiers share a fairness floor derived from the smallest configured
+    tier. Every real row keeps that many leading drafts before confidence can
+    allocate any additional drafts. The one stable confidence sort therefore
+    covers only positions above the floor. Candidate yield includes anchors,
+    mandatory-floor survival, and the best eligible extra survival, matching
+    the allocation used when that candidate is selected.
 
     real_request_mask excludes CUDA-graph padding rows from confidence
     ranking and expected yield. A compact candidate whose V-G drafts exceed
@@ -500,6 +665,8 @@ def plan_dynamic_verifier_budget(
     if candidate_budgets.numel() > dense_capacity:
         raise ValueError("candidate ladder cannot exceed dense verifier capacity")
 
+    retained_candidates = candidate_budgets.to(torch.long) - num_requests
+
     conditional = apply_sts(confidence_logits, temperatures)
     survival = torch.cumprod(conditional, dim=1)
     masked_survival = torch.where(
@@ -511,13 +678,32 @@ def plan_dynamic_verifier_budget(
     position_major_mask = (
         real_request_mask.unsqueeze(0).expand(max_draft_len, -1).contiguous().view(-1)
     )
+    draft_positions = (
+        torch.arange(max_draft_len, device=confidence_logits.device)
+        .unsqueeze(1)
+        .expand(-1, num_requests)
+        .contiguous()
+        .view(-1)
+    )
+    compact_floor = torch.clamp(
+        torch.div(retained_candidates[0], num_requests, rounding_mode="floor"),
+        min=0,
+        max=max_draft_len,
+    )
+    mandatory_position_major_mask = position_major_mask & (draft_positions < compact_floor)
+    eligible_position_major_mask = position_major_mask & ~mandatory_position_major_mask
     ranking_scores = torch.where(
-        position_major_mask,
+        eligible_position_major_mask,
         position_major,
         torch.full((), -1.0, dtype=position_major.dtype, device=position_major.device),
     )
     selection_order = torch.argsort(ranking_scores, descending=True, stable=True)
-    ordered_survival = position_major[selection_order]
+    eligible_survival = torch.where(
+        eligible_position_major_mask,
+        position_major,
+        torch.zeros((), dtype=position_major.dtype, device=position_major.device),
+    )
+    ordered_survival = eligible_survival[selection_order]
     cumulative_yield = torch.cat(
         (
             torch.zeros(1, dtype=torch.float32, device=confidence_logits.device),
@@ -525,9 +711,15 @@ def plan_dynamic_verifier_budget(
         )
     )
 
-    retained_candidates = candidate_budgets.to(torch.long) - num_requests
     real_request_count = real_request_mask.sum(dtype=torch.long)
     real_draft_capacity = real_request_count * max_draft_len
+    mandatory_retained = compact_floor * real_request_count
+    extra_retained_candidates = torch.clamp(retained_candidates - mandatory_retained, min=0)
+    mandatory_yield = torch.where(
+        mandatory_position_major_mask,
+        position_major,
+        torch.zeros((), dtype=position_major.dtype, device=position_major.device),
+    ).sum(dtype=torch.float32)
     candidate_indices = torch.arange(candidate_budgets.numel(), device=confidence_logits.device)
     full_candidate_index = torch.full(
         (),
@@ -537,8 +729,8 @@ def plan_dynamic_verifier_budget(
     )
     candidate_is_full = candidate_indices == full_candidate_index
     candidate_is_executable = (retained_candidates <= real_draft_capacity) | candidate_is_full
-    expected_yield = real_request_count.to(torch.float32) + torch.gather(
-        cumulative_yield, 0, retained_candidates
+    expected_yield = real_request_count.to(torch.float32) + mandatory_yield + torch.gather(
+        cumulative_yield, 0, extra_retained_candidates
     )
     expected_yield = torch.where(
         candidate_is_executable,
@@ -550,6 +742,25 @@ def plan_dynamic_verifier_budget(
             device=expected_yield.device,
         ),
     )
+    # Under attention-DP, a favorable aggregate sum must not buy throughput by
+    # slowing one rank: the target step is a group barrier. Reuse the existing
+    # negative-infinite ineligibility contract before the fixed-size SUM so any
+    # rank can veto a compact tier that does not beat its own full-K goodput.
+    # The full tier is always preserved. Reducer-free and one-tier planning keep
+    # their existing behavior.
+    if candidate_yield_reducer is not None and candidate_budgets.numel() > 1:
+        local_scores = expected_yield.to(torch.float32) / candidate_step_times_ms.to(
+            torch.float32
+        )
+        local_clears_guard = local_scores >= local_scores[-1] * (
+            1.0 + float(minimum_predicted_gain)
+        )
+        local_candidate_is_valid = local_clears_guard | candidate_is_full
+        expected_yield = torch.where(
+            local_candidate_is_valid,
+            expected_yield,
+            torch.full((), float("-inf"), dtype=expected_yield.dtype, device=expected_yield.device),
+        )
     # Cross-rank yield is only needed to choose among multiple graph tiers.
     # A one-tier ladder has a configuration-invariant selection, so bypassing
     # the reducer avoids a redundant captured collective without changing the
@@ -571,7 +782,9 @@ def plan_dynamic_verifier_budget(
     full_score = scores[-1]
     clears_guard = best_score >= full_score * (1.0 + float(minimum_predicted_gain))
     selected_index = torch.where(clears_guard, best_index, full_index)
-    selected_retained = torch.gather(retained_candidates, 0, selected_index.reshape(1)).squeeze(0)
+    selected_extra_retained = torch.gather(
+        extra_retained_candidates, 0, selected_index.reshape(1)
+    ).squeeze(0)
 
     # Convert the global stable rank to a prefix-closed per-request length.
     # The comparison against a device scalar has a fixed output shape even
@@ -582,7 +795,10 @@ def plan_dynamic_verifier_budget(
         selection_order,
         torch.arange(selection_order.numel(), device=confidence_logits.device),
     )
-    selected_position_major = (selection_ranks < selected_retained) & position_major_mask
+    selected_extra_position_major = (
+        selection_ranks < selected_extra_retained
+    ) & eligible_position_major_mask
+    selected_position_major = mandatory_position_major_mask | selected_extra_position_major
     selected_drafts = selected_position_major.view(max_draft_len, num_requests).transpose(0, 1)
     compact_retained_lens = selected_drafts.sum(dim=1, dtype=torch.int32)
     full_retained_lens = real_request_mask.to(torch.int32) * max_draft_len

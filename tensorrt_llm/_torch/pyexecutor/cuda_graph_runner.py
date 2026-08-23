@@ -1483,11 +1483,13 @@ class CUDAGraphRunner:
             return 0
 
         max_real_requests = max(int(info[1]) for info in rank_info)
-        configured_batches = sorted(
-            graph_batch_size for graph_batch_size in self.supported_batch_sizes
-            if self.spec_config.
-            resolve_confidence_verifier_token_budget_candidates(
-                graph_batch_size))
+        # Partial confidence coverage must not inflate every smaller ordinary
+        # graph into the next configured confidence bucket.  For example, a
+        # profile that enables compact verification only at G=128 still owns
+        # ordinary full-K graphs at G=16/32/64.  Pick the nearest captured G
+        # first; the sampler will plan a compact successor only when that exact
+        # G has configured verifier-budget candidates.
+        configured_batches = sorted(self.supported_batch_sizes)
         common_batch = next(
             (graph_batch_size for graph_batch_size in configured_batches
              if graph_batch_size >= max_real_requests), 0)

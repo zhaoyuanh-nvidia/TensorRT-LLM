@@ -126,6 +126,8 @@ def test_worker_lazy_init_window_buffers():
     # max_batch (8) request slots + 1 scratch row for padded / unknown IDs.
     assert worker._kv_windows.shape == (9, 3, 128, 64)
     assert worker._ctx_len.shape == (9,)
+    assert worker._generation_start_len.shape == (9,)
+    assert torch.count_nonzero(worker._generation_start_len) == 0
     assert worker._scratch_slot == 8
     # Dummy-id floor separates real request ids from CUDA-graph padding ids.
     assert worker._graph_dummy_id_floor == (1 << 64) - 1 - worker.max_draft_len
@@ -161,9 +163,11 @@ def test_worker_slot_assignment_and_reset():
 
     # mark a position, then reset -> slot freed + window/pos cleared
     worker._ctx_len[s0] = 42
+    worker._generation_start_len[s0] = 17
     worker._kv_windows[s0].fill_(1.0)
     s0b = worker._assign_slot(100, reset=True)
     assert int(worker._ctx_len[s0b]) == 0
+    assert int(worker._generation_start_len[s0b]) == 0
     assert float(worker._kv_windows[s0b].abs().sum()) == 0.0
 
 
@@ -213,6 +217,7 @@ def test_seed_context_windows_preserves_state_across_prefill_chunks():
     )
     slot = worker._req_to_slot[100]
     assert int(worker._ctx_len[slot]) == 3
+    assert int(worker._generation_start_len[slot]) == 3
 
     metadata.get_hidden_states = lambda _num_tokens: torch.zeros(
         2, HIDDEN * NCAP, device="cuda", dtype=torch.bfloat16
@@ -223,6 +228,7 @@ def test_seed_context_windows_preserves_state_across_prefill_chunks():
     )
 
     assert int(worker._ctx_len[slot]) == 5
+    assert int(worker._generation_start_len[slot]) == 5
     assert [positions.tolist() for positions in draft_model.written_positions] == [
         [1, 2, 3],
         [4, 5],
@@ -257,6 +263,7 @@ def test_prepare_frees_stale_slots_on_batched_path():
     sa = worker._assign_slot(100, reset=True)
     worker._assign_slot(101, reset=True)
     worker._ctx_len[sa] = 17
+    worker._generation_start_len[sa] = 11
 
     # Only request 101 survives; 100's slot must be freed + cleared.
     meta.request_ids = [101]
@@ -264,6 +271,7 @@ def test_prepare_frees_stale_slots_on_batched_path():
     assert 100 not in worker._req_to_slot
     assert sa in worker._free_slots
     assert int(worker._ctx_len[sa]) == 0
+    assert int(worker._generation_start_len[sa]) == 0
 
 
 def test_prepare_maps_unknown_request_to_scratch_row_not_slot_zero():
@@ -324,6 +332,10 @@ def test_prepare_assigns_slots_to_disagg_generation_requests():
     assert s0 != s1
     assert s0 != worker._scratch_slot and s1 != worker._scratch_slot
     assert worker._batch_to_slot[:2].tolist() == [s0, s1]
+
+    worker._ctx_len[s0] += 4
+    assert int(worker._ctx_len[s0] - worker._generation_start_len[s0]) == 4
+    assert int(worker._generation_start_len[s1]) == 0
 
     # Stable across steps: the same ids keep their slots (no churn / reassignment).
     meta.prepare()
