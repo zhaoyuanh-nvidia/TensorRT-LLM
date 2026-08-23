@@ -850,12 +850,15 @@ def plan_masked_fixed_verifier_draft_lens(
         )
     num_retained = verifier_token_budget - num_requests
 
+    uniform_floor = min(num_retained // num_requests, max_draft_len)
     conditional_probabilities = apply_sts(confidence_logits, temperatures)
     prefix_scores = torch.cumprod(conditional_probabilities, dim=1)
+    suffix_scores = prefix_scores[:, uniform_floor:]
+    suffix_width = max_draft_len - uniform_floor
     position_major_mask = (
-        real_request_mask.unsqueeze(0).expand(max_draft_len, -1).contiguous().view(-1)
+        real_request_mask.unsqueeze(0).expand(suffix_width, -1).contiguous().view(-1)
     )
-    position_major_scores = prefix_scores.transpose(0, 1).contiguous().view(-1)
+    position_major_scores = suffix_scores.transpose(0, 1).contiguous().view(-1)
     ranking_scores = torch.where(
         position_major_mask,
         position_major_scores,
@@ -873,12 +876,19 @@ def plan_masked_fixed_verifier_draft_lens(
         selection_order,
         torch.arange(selection_order.numel(), device=confidence_logits.device),
     )
-    selected_position_major = (selection_ranks < num_retained) & position_major_mask
-    selected_drafts = selected_position_major.view(max_draft_len, num_requests).transpose(0, 1)
-    compact_retained_lens = selected_drafts.sum(dim=1, dtype=torch.int32)
-
     real_request_count = real_request_mask.sum(dtype=torch.long)
-    compact_is_executable = num_retained <= real_request_count * max_draft_len
+    mandatory_retained = real_request_count * uniform_floor
+    num_extra_retained = (num_retained - mandatory_retained).clamp_min(0)
+    selected_position_major = (selection_ranks < num_extra_retained) & position_major_mask
+    selected_drafts = selected_position_major.view(suffix_width, num_requests).transpose(0, 1)
+    compact_retained_lens = (
+        selected_drafts.sum(dim=1, dtype=torch.int32)
+        + real_request_mask.to(torch.int32) * uniform_floor
+    )
+
+    compact_is_executable = (mandatory_retained <= num_retained) & (
+        num_retained <= real_request_count * max_draft_len
+    )
     full_retained_lens = real_request_mask.to(torch.int32) * max_draft_len
     return torch.where(
         compact_is_executable,

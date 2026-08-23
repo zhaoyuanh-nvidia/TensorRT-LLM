@@ -24,16 +24,15 @@ from tensorrt_llm._torch.pyexecutor.model_engine import (
     _assert_dspark_confidence_attention_extent,
     _bind_dspark_confidence_attention_layout,
     _bind_dspark_spec_query_lens,
-    _refresh_dspark_confidence_graph_generation_lengths,
     _build_dspark_confidence_pack_layout,
     _expand_generation_graph_capture_shapes,
+    _refresh_dspark_confidence_graph_generation_lengths,
 )
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
-from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.pyexecutor.sampler import TorchSampler
+from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.speculative.dspark import DSparkSpecMetadata
 from tensorrt_llm._torch.speculative.dspark_confidence import (
-    DSparkConfidenceDeviceLayout,
     build_confidence_device_layout,
     validate_confidence_device_layout_row_map,
 )
@@ -272,6 +271,48 @@ def test_fixed_capture_inventory_has_compact_and_ordinary_key_per_g():
     config.clear_confidence_capture_verifier_token_budget()
     assert config.resolve_confidence_verifier_token_budget(2) == 9
     assert config.resolve_confidence_verifier_token_budget(4) == 17
+
+
+def test_k6_v816_capture_inventory_and_attention_extents():
+    schedule = {16: 102, 32: 204, 64: 408, 128: 816}
+    config = DSparkDecodingConfig(
+        max_draft_len=6,
+        speculative_model="/tmp/dummy_model",
+        confidence_mode="fixed_budget",
+        confidence_verifier_token_budget_schedule=schedule,
+    )
+
+    enabled, shapes = _expand_generation_graph_capture_shapes(
+        [(graph_batch_size, 6) for graph_batch_size in schedule], config
+    )
+    assert enabled
+    assert set(shapes) == {
+        (graph_batch_size, 6, verifier_token_budget)
+        for graph_batch_size, verifier_token_budget in schedule.items()
+    } | {(graph_batch_size, 6, None) for graph_batch_size in schedule}
+
+    compact_retained = torch.tensor([6] * 48 + [5] * 80, dtype=torch.int32)
+    ordinary_retained = torch.full((128,), 6, dtype=torch.int32)
+    observed = []
+    for retained, verifier_budget in (
+        (compact_retained, 816),
+        (ordinary_retained, 896),
+        (compact_retained, 816),
+    ):
+        layout = build_confidence_device_layout(
+            retained,
+            torch.ones(128, dtype=torch.bool),
+            torch.arange(128),
+            verifier_budget,
+            physical_draft_len=6,
+        )
+        observed.append(layout.query_lens.clone())
+        assert int(layout.query_token_count) == verifier_budget
+        assert int(layout.verifier_token_budget) == verifier_budget
+
+    assert observed[0].tolist() == [7] * 48 + [6] * 80
+    assert observed[1].tolist() == [7] * 128
+    assert torch.equal(observed[0], observed[2])
 
 
 def test_smaller_g_profile_capture_inventory_has_every_exact_cell():

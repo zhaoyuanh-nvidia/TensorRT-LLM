@@ -711,6 +711,71 @@ def test_masked_fixed_lens_match_original_when_every_row_is_real():
     assert torch.equal(actual, expected)
 
 
+def test_masked_fixed_k6_v816_keeps_k5_floor_and_assigns_48_extras():
+    retained = plan_masked_fixed_verifier_draft_lens(
+        torch.zeros(128, 6),
+        verifier_token_budget=816,
+        real_request_mask=torch.ones(128, dtype=torch.bool),
+    )
+
+    assert retained.tolist() == [6] * 48 + [5] * 80
+    assert int(retained.sum()) == 688
+    assert int(retained.min()) == 5
+
+
+def test_masked_fixed_k6_confidence_ranks_only_sixth_draft():
+    logits = torch.zeros(4, 6)
+    logits[:, -1] = torch.tensor([-10.0, 10.0, -5.0, 5.0])
+
+    retained = plan_masked_fixed_verifier_draft_lens(
+        logits,
+        verifier_token_budget=26,
+        real_request_mask=torch.ones(4, dtype=torch.bool),
+    )
+
+    assert retained.tolist() == [5, 6, 5, 6]
+
+
+def test_masked_fixed_full_k_handles_empty_ranked_suffix():
+    retained = plan_masked_fixed_verifier_draft_lens(
+        torch.zeros(4, 6),
+        verifier_token_budget=28,
+        real_request_mask=torch.ones(4, dtype=torch.bool),
+    )
+
+    assert retained.tolist() == [6] * 4
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_masked_fixed_k6_v816_cuda_graph_replay_preserves_floor_and_storage():
+    logits = torch.zeros(128, 6, device="cuda")
+    real_mask = torch.ones(128, dtype=torch.bool, device="cuda")
+
+    warmup_stream = torch.cuda.Stream()
+    warmup_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup_stream):
+        for _ in range(3):
+            plan_masked_fixed_verifier_draft_lens(logits, 816, real_mask)
+    torch.cuda.current_stream().wait_stream(warmup_stream)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        retained = plan_masked_fixed_verifier_draft_lens(logits, 816, real_mask)
+    retained_ptr = retained.data_ptr()
+
+    graph.replay()
+    torch.cuda.synchronize()
+    assert retained.tolist() == [6] * 48 + [5] * 80
+
+    logits[:, -1].copy_(torch.linspace(-10.0, 10.0, 128, device="cuda"))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert retained.tolist() == [5] * 80 + [6] * 48
+    assert int(retained.sum()) == 688
+    assert int(retained.min()) == 5
+    assert retained.data_ptr() == retained_ptr
+
+
 def test_randomized_plans_match_cpu_reference_and_preserve_invariants() -> None:
     generator = torch.Generator().manual_seed(20260818)
     for num_requests in (1, 2, 7, 128):
