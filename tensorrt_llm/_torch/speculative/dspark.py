@@ -324,10 +324,12 @@ class DSparkWorker(SpecWorkerBase):
             )
             else None
         )
-        # Attention-DP ranks own different requests but must replay the same
-        # target graph tier.  Sum each rank's fixed-shape candidate-yield
-        # vector so tier choice maximizes global predicted TPS rather than
-        # letting one noisy rank force the largest locally selected tier.
+        # Non-native attention-DP layouts need one globally optimized graph
+        # tier, so sum each rank's fixed-shape candidate-yield vector. Native
+        # uniform routing already admits a compact graph only when PyExecutor's
+        # later host vote sees the same K on every rank; disagreement safely
+        # falls back to physical full K. Avoiding this tiny device collective
+        # is therefore correct and removes it from every native decode step.
         self._confidence_yield_all_reduce = (
             AllReduce(
                 mapping,
@@ -338,6 +340,11 @@ class DSparkWorker(SpecWorkerBase):
                 getattr(spec_config, "is_dynamic_budget_confidence_enabled", False)
                 and mapping.tp_size > 1
                 and mapping.enable_attention_dp
+                and not getattr(
+                    spec_config,
+                    "is_native_uniform_confidence_enabled",
+                    False,
+                )
             )
             else None
         )
@@ -1074,6 +1081,12 @@ class DSparkWorker(SpecWorkerBase):
                             candidate_budgets,
                             candidate_step_times,
                             uniform_floor,
+                            allow_padded_uniform_compact=bool(
+                                getattr(
+                                    self.spec_config,
+                                    "is_native_uniform_confidence_enabled",
+                                    False,
+                                )),
                             request_progress=request_progress,
                             **plan_kwargs,
                         )

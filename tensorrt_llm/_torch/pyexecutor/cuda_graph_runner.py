@@ -170,6 +170,10 @@ class CUDAGraphRunner:
         self.confidence_adp_execution_batch_size = 0
         self.confidence_adp_verifier_token_budget = 0
         self.confidence_adp_route_epoch = 0
+        # One-shot proof published after PyExecutor's native route agreement.
+        # A valid dense K-1/K route has already synchronized G/K/epoch across
+        # attention-DP peers, so graph padding must not repeat that collective.
+        self.confidence_native_uniform_adp_agreed_route = None
         self.confidence_force_full_k_route = False
         self.confidence_device_layout = None
         self.confidence_query_lens_host = None
@@ -1129,6 +1133,9 @@ class CUDAGraphRunner:
         device layout; ordinary full-K input chooses a new common G for the
         next plan. The exchange precedes request padding and graph keying.
         """
+        agreed_native_route = getattr(
+            self, "confidence_native_uniform_adp_agreed_route", None)
+        self.confidence_native_uniform_adp_agreed_route = None
         self.confidence_adp_execution_batch_size = 0
         self.confidence_adp_verifier_token_budget = 0
         self.confidence_adp_route_epoch = 0
@@ -1214,6 +1221,42 @@ class CUDAGraphRunner:
         native_uniform_route = bool(
             getattr(new_tensors_device,
                     "dspark_confidence_native_uniform", False))
+        if (native_uniform_route and isinstance(agreed_native_route, tuple)
+                and len(agreed_native_route) == 4):
+            route_g, route_epoch, runtime_draft_len, agreed_real_count = (
+                int(value) for value in agreed_native_route)
+            real_requests = [
+                request for request in generation_requests
+                if not request.is_dummy
+            ]
+            candidates = (
+                self.spec_config.
+                resolve_confidence_native_uniform_draft_len_candidates(route_g)
+                if route_g > 0 else ())
+            route_ready = bool(
+                batch.num_context_requests == 0 and real_requests
+                and len(real_requests) == agreed_real_count
+                and len(real_requests) <= route_g
+                and route_g in self.supported_batch_sizes
+                and route_g <= self.max_supported_batch_size
+                and route_g <= self.config.batch_size and route_epoch > 0
+                and runtime_draft_len in candidates
+                and all(
+                    len(request.py_draft_tokens) == runtime_draft_len
+                    and request.py_draft_tokens_effective_len ==
+                    runtime_draft_len for request in real_requests))
+            if not route_ready:
+                self.confidence_force_full_k_route = True
+                raise RuntimeError(
+                    "DSpark native-uniform ADP agreement was not preserved "
+                    "through graph padding: "
+                    f"G={route_g}, epoch={route_epoch}, "
+                    f"K={runtime_draft_len}, real={len(real_requests)}, "
+                    f"agreed_real={agreed_real_count}")
+            self.confidence_adp_execution_batch_size = route_g
+            self.confidence_adp_route_epoch = route_epoch
+            self.confidence_force_full_k_route = True
+            return route_g
         carried_layout = getattr(new_tensors_device,
                                  "dspark_confidence_layout", None)
         carried_epoch = getattr(new_tensors_device,
@@ -1539,14 +1582,23 @@ class CUDAGraphRunner:
 
         if common_confidence_batch is not None:
             if common_confidence_batch == 0:
-                return 0
-            # A generation-only DSpark confidence batch can be ineligible only
-            # because its real N is not itself a captured graph size. The
-            # readiness exchange above proves every peer can instead use the
-            # same captured G before any confidence plan/draft is made.
-            can_run_cuda_graph = True
-            new_batch_size = common_confidence_batch
-        elif self.enabled and self.config.enable_attention_dp:
+                if not self.spec_config.is_native_uniform_confidence_enabled:
+                    return 0
+                # Native uniform routing keeps a physical full-K proposal
+                # available. When no common confidence G is possible (for
+                # example, one attention-DP rank has drained), fall back to
+                # the ordinary attention-DP CUDA-graph agreement below rather
+                # than forcing every peer into the slower eager path.
+                common_confidence_batch = None
+            else:
+                # A generation-only DSpark confidence batch can be ineligible only
+                # because its real N is not itself a captured graph size. The
+                # readiness exchange above proves every peer can instead use the
+                # same captured G before any confidence plan/draft is made.
+                can_run_cuda_graph = True
+                new_batch_size = common_confidence_batch
+        if (common_confidence_batch is None and self.enabled
+                and self.config.enable_attention_dp):
             graph_batch_info = self.config.dist.tp_allgather(
                 [can_run_cuda_graph, batch_size])
             all_can_run_cuda_graph = all(rank_info[0]
@@ -1762,6 +1814,17 @@ class CUDAGraphRunner:
         consumes, regressing tightly-sized deployments.
         """
         if not (self.enabled and self.padding_enabled):
+            return
+        if (isinstance(self.spec_config, DSparkDecodingConfig)
+                and self.spec_config.is_native_uniform_confidence_enabled):
+            # A persistent padding dummy consumes one real sequence slot. At
+            # the largest captured G that turns a full batch into G-1 real
+            # requests and leaves one request in the tail wave. Native uniform
+            # routing can allocate the dummy lazily as soon as the first real
+            # request completes; before then a full-G batch needs no padding.
+            logger.info(
+                "Deferring DSpark native-uniform CUDA graph padding dummy "
+                "allocation until the first padded live batch.")
             return
         kv_cache_manager = resource_manager.get_resource_manager(
             self.config.kv_cache_manager_key)

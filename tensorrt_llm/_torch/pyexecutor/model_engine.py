@@ -7853,6 +7853,37 @@ class PyTorchModelEngine(ModelEngine):
         return authorized
 
     @staticmethod
+    def _has_dspark_confidence_successor_route(outputs: Dict[str, Any]) -> bool:
+        """Return whether DSpark published a route for the next iteration."""
+        return ("next_draft_lens" in outputs or bool(
+            outputs.get("dspark_confidence_native_uniform", False)) and
+                "dspark_confidence_native_uniform_draft_len" in outputs)
+
+    @staticmethod
+    def _should_seal_dspark_confidence_successor_route(
+            outputs: Dict[str, Any], execution_batch_size: int,
+            synthetic_capture: bool) -> bool:
+        """Return whether a published successor route needs live provenance.
+
+        Native uniform publishes only a tentative scalar while retaining the
+        physical full-K proposal, so a missing live seal safely falls back to
+        full K at the consumer. Packed confidence has already materialized a
+        compact device layout and must never leave this boundary unsealed.
+        Synthetic all-dummy capture also needs no live successor provenance.
+        """
+        if not PyTorchModelEngine._has_dspark_confidence_successor_route(
+                outputs):
+            return False
+        if execution_batch_size > 0:
+            return True
+        if (synthetic_capture or bool(
+                outputs.get("dspark_confidence_native_uniform", False))):
+            return False
+        raise RuntimeError(
+            "DSpark confidence produced compact draft lengths without an "
+            "authorized ADP execution batch")
+
+    @staticmethod
     def _set_dspark_confidence_adp_plan_readiness(
             spec_metadata: Optional[SpecMetadata], cuda_graph_runner: Any,
             spec_config: Any, is_warmup: bool,
@@ -8329,16 +8360,22 @@ class PyTorchModelEngine(ModelEngine):
 
             self._execute_logit_post_processors(scheduled_requests, outputs)
 
-            if (not self.is_draft_model
-                    and isinstance(spec_metadata, DSparkSpecMetadata)
-                    and "next_draft_lens" in outputs):
+            if not self.is_draft_model and isinstance(spec_metadata,
+                                                       DSparkSpecMetadata):
                 execution_g = int(
                     getattr(self.cuda_graph_runner,
                             "confidence_adp_execution_batch_size", 0))
-                if execution_g <= 0:
-                    raise RuntimeError(
-                        "DSpark confidence produced compact draft lengths "
-                        "without an authorized ADP execution batch")
+                synthetic_capture = bool(
+                    getattr(self.cuda_graph_runner, "_capture_allowed", False)
+                    and self.is_warmup and gen_requests
+                    and all(request.is_dummy for request in gen_requests))
+                seal_successor_route = (
+                    self._should_seal_dspark_confidence_successor_route(
+                        outputs, execution_g, synthetic_capture))
+            else:
+                seal_successor_route = False
+
+            if seal_successor_route:
                 route_epoch = int(
                     getattr(self, "_dspark_confidence_route_epoch", 0)) + 1
                 self._dspark_confidence_route_epoch = route_epoch

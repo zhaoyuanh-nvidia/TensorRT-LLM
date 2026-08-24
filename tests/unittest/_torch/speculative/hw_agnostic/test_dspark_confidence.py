@@ -533,6 +533,20 @@ def test_uniform_floor_padding_falls_back_to_full() -> None:
     assert plan.retained_lens.tolist() == [2, 2, 2, 0]
 
 
+def test_uniform_floor_native_dense_padding_allows_compact() -> None:
+    plan = plan_uniform_floor_two_tier_verifier_budget(
+        torch.full((4, 2), -20.0),
+        torch.tensor([8, 12]),
+        torch.tensor([1.0, 100.0]),
+        uniform_compact_floor=1,
+        real_request_mask=torch.tensor([True, True, True, False]),
+        request_progress=torch.tensor([0, 1, 2, 0]),
+        allow_padded_uniform_compact=True,
+    )
+    assert int(plan.verifier_token_budget) == 8
+    assert plan.retained_lens.tolist() == [1, 1, 1, 0]
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
 def test_uniform_floor_cuda_graph_weak_strong_weak_progress_replay() -> None:
     logits = torch.full((4, 2), -20.0, device="cuda")

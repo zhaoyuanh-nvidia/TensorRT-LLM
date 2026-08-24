@@ -459,6 +459,7 @@ def plan_uniform_floor_two_tier_verifier_budget(
     candidate_yield_reducer: Callable[[torch.Tensor], torch.Tensor] | None = None,
     real_request_mask: torch.Tensor | None = None,
     request_progress: torch.Tensor | None = None,
+    allow_padded_uniform_compact: bool = False,
 ) -> DynamicBudgetPlan:
     """Fast captured planner for one uniform compact tier plus physical full K.
 
@@ -466,7 +467,9 @@ def plan_uniform_floor_two_tier_verifier_budget(
     scatter, or candidate allocation. It sums the compact prefix and full
     survival directly per row. ``request_progress`` optionally adds a local
     minimum-progress veto before the existing ADP reduction, without a new
-    collective or host transfer.
+    collective or host transfer. ``allow_padded_uniform_compact`` reserves the
+    dense compact graph's physical draft capacity for padding rows while still
+    excluding those rows from predicted yield and returned real-row lengths.
     """
     if confidence_logits.ndim != 2:
         raise ValueError("confidence_logits must have shape [num_requests, max_draft_len]")
@@ -512,9 +515,14 @@ def plan_uniform_floor_two_tier_verifier_budget(
 
     real_request_count = real_request_mask.sum(dtype=torch.long)
     required_compact_retained = candidate_budgets[0].to(torch.long) - num_requests
+    compact_retained_capacity = (
+        torch.full_like(real_request_count,
+                        num_requests * uniform_compact_floor)
+        if allow_padded_uniform_compact else
+        real_request_count * uniform_compact_floor)
     compact_valid = (
-        (real_request_count == num_requests)
-        & (real_request_count * uniform_compact_floor == required_compact_retained)
+        (real_request_count > 0)
+        & (compact_retained_capacity == required_compact_retained)
     )
     local_scores = expected_yield / candidate_step_times_ms.to(torch.float32)
     compact_valid = compact_valid & (
