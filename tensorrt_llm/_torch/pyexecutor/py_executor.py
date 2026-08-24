@@ -937,10 +937,10 @@ class PyExecutor:
             if native_route_trace_dir else None)
         self._dspark_native_route_counts = (
             {} if self._dspark_native_route_trace_dir is not None else None)
-        # The normal attention-DP path carries the native uniform route vote
-        # in _can_queue's mandatory batch-size all-gather. Keep the exact
-        # ScheduledRequests object beside the result so a connector's second
-        # _can_queue call cannot publish a duplicate or stale route vote.
+        # Native uniform routing is finalized only after full-K resources have
+        # been reserved. Keep the exact ScheduledRequests object beside the
+        # result so a connector's second _can_queue call cannot publish a
+        # duplicate or stale route vote.
         self._dspark_native_uniform_adp_route_vote = None
         # Set at the executor loops' normal-exit `break` sites, and ONLY
         # there. It answers exactly one question for _event_loop_wrapper:
@@ -2837,6 +2837,8 @@ class PyExecutor:
                     self._handle_dynamic_draft_len(scheduled_batch)
 
                     self.resource_manager.prepare_resources(scheduled_batch)
+                    self._finalize_dspark_native_uniform_draft_len(
+                        scheduled_batch)
 
                     # The generation requests that do not have batch_idx
                     # need to be in front of the batch due to the assumptions
@@ -3412,7 +3414,10 @@ class PyExecutor:
             send_handles[microbatch_id] = None
 
     def _get_dspark_native_uniform_local_route(
-            self, scheduled_batch: ScheduledRequests
+            self,
+            scheduled_batch: ScheduledRequests,
+            *,
+            wait_for_ready: bool = False,
     ) -> Optional[Tuple[bool, int, int, int]]:
         """Read and validate this rank's iteration-owned K-1/K route."""
         spec_config = getattr(self.model_engine, "spec_config", None)
@@ -3448,11 +3453,17 @@ class PyExecutor:
             selected_host = getattr(
                 previous_device,
                 "dspark_confidence_native_uniform_draft_len_host", None)
-            if (ready_event is not None and selected_host is not None
-                    and ready_event.query()):
-                # Do not serialize the overlap pipeline solely to resolve a
-                # confidence route. A not-yet-ready scalar conservatively
-                # falls back to physical full K for this iteration.
+            route_ready = bool(ready_event is not None
+                               and selected_host is not None
+                               and ready_event.query())
+            if (not route_ready and wait_for_ready
+                    and ready_event is not None and selected_host is not None):
+                # Resource managers have already reserved physical full K.
+                # Waiting here is therefore safe and happens as late as the
+                # verifier route can be applied before input construction.
+                ready_event.synchronize()
+                route_ready = True
+            if route_ready:
                 current_ids = tuple(request.py_request_id
                                     for request in real_requests)
                 current_slots = tuple(request.py_seq_slot
@@ -3533,15 +3544,18 @@ class PyExecutor:
         return route_valid, candidate, route_g, route_epoch
 
     def _resolve_dspark_native_uniform_draft_len(
-            self, scheduled_batch: ScheduledRequests) -> Optional[int]:
+            self,
+            scheduled_batch: ScheduledRequests,
+            *,
+            full_k_resources_prepared: bool = False) -> Optional[int]:
         """Resolve one group-uniform dense DSpark draft length.
 
         The confidence graph emits a scalar K-1/K choice beside the full-K
-        proposal block. Under overlap scheduling, wait only for that scalar and
-        validate its iteration-owned roster; the full proposal block stays on
-        device for either route. The normal attention-DP path reuses the route
-        agreement piggybacked on _can_queue's mandatory all-gather. Direct or
-        nonstandard callers retain a dedicated agreement fallback. Any
+        proposal block. The full proposal block stays on device for either
+        route. Normal executor loops call this only after resource preparation
+        has conservatively reserved physical full K; at that final decision
+        point they wait for the scalar if necessary, then perform one small
+        attention-DP route agreement. Direct callers remain nonblocking. Any
         incomplete or asymmetric route falls back to physical full K.
         """
         spec_config = getattr(self.model_engine, "spec_config", None)
@@ -3559,7 +3573,8 @@ class PyExecutor:
             route_valid, candidate, route_g, route_epoch = cached_vote[1:]
         else:
             local_route = self._get_dspark_native_uniform_local_route(
-                scheduled_batch)
+                scheduled_batch,
+                wait_for_ready=full_k_resources_prepared)
             if local_route is None:
                 return None
             route_valid, candidate, route_g, route_epoch = local_route
@@ -3587,8 +3602,9 @@ class PyExecutor:
         rejection_on = getattr(spec_config, "use_rejection_sampling", False)
         for request in generation_requests:
             current_num_draft_tokens = len(request.py_draft_tokens)
-            request.py_needs_onehot_draft_probs = (
-                rejection_on and current_num_draft_tokens == 0)
+            if not full_k_resources_prepared:
+                request.py_needs_onehot_draft_probs = (
+                    rejection_on and current_num_draft_tokens == 0)
             if current_num_draft_tokens < runtime_draft_len:
                 request.py_draft_tokens.extend(
                     [DRAFT_BUFFER_PAD] *
@@ -3601,6 +3617,39 @@ class PyExecutor:
                 request.py_dspark_confidence_route_epoch = None
                 request.py_dspark_confidence_execution_batch_size = None
                 request.py_dspark_confidence_verifier_token_budget = None
+        return runtime_draft_len
+
+    def _prepare_dspark_native_uniform_full_k(
+            self, scheduled_batch: ScheduledRequests) -> None:
+        """Reserve and describe physical full K before resource preparation."""
+        max_draft_len = int(self.model_engine.max_draft_len)
+        spec_config = self.model_engine.spec_config
+        rejection_on = getattr(spec_config, "use_rejection_sampling", False)
+        DRAFT_BUFFER_PAD = 0
+        for request in scheduled_batch.generation_requests:
+            current_num_draft_tokens = len(request.py_draft_tokens)
+            request.py_needs_onehot_draft_probs = (
+                rejection_on and current_num_draft_tokens == 0)
+            if current_num_draft_tokens < max_draft_len:
+                request.py_draft_tokens.extend(
+                    [DRAFT_BUFFER_PAD] *
+                    (max_draft_len - current_num_draft_tokens))
+            elif current_num_draft_tokens > max_draft_len:
+                request.py_draft_tokens = request.py_draft_tokens[:max_draft_len]
+            request.py_draft_tokens_effective_len = max_draft_len
+        self.model_engine.runtime_draft_len = max_draft_len
+
+    def _finalize_dspark_native_uniform_draft_len(
+            self, scheduled_batch: ScheduledRequests) -> Optional[int]:
+        """Apply the late K-1/K route after conservative full-K reservation."""
+        spec_config = getattr(self.model_engine, "spec_config", None)
+        if (spec_config is None or not getattr(
+                spec_config, "is_native_uniform_confidence_enabled", False)):
+            return None
+        runtime_draft_len = self._resolve_dspark_native_uniform_draft_len(
+            scheduled_batch, full_k_resources_prepared=True)
+        if runtime_draft_len is not None:
+            self.model_engine.runtime_draft_len = runtime_draft_len
         return runtime_draft_len
 
     def _record_dspark_native_route(
@@ -3694,10 +3743,13 @@ class PyExecutor:
             self.model_engine.runtime_draft_len = 0
             return
 
-        native_uniform_draft_len = (
-            self._resolve_dspark_native_uniform_draft_len(scheduled_batch))
-        if native_uniform_draft_len is not None:
-            self.model_engine.runtime_draft_len = native_uniform_draft_len
+        spec_config = getattr(self.model_engine, "spec_config", None)
+        if (spec_config is not None and getattr(
+                spec_config, "is_native_uniform_confidence_enabled", False)):
+            # The confidence scalar is intentionally not queried here. Reserve
+            # physical full K first; executor loops finalize K-1/K immediately
+            # after resource preparation and before model input construction.
+            self._prepare_dspark_native_uniform_full_k(scheduled_batch)
             return
 
         if (self.model_engine.spec_config is not None
@@ -3770,35 +3822,8 @@ class PyExecutor:
         # For bs == 1, we cannot pad dummy request to make the batch non-empty since it will cause the batch size to be 2.
         # 1 for dummy request, 1 for the yet-to-complete but not-yet-updated request.
         if self.enable_attention_dp:
-            cached_vote = getattr(
-                self, "_dspark_native_uniform_adp_route_vote", None)
-            local_route = (
-                self._get_dspark_native_uniform_local_route(scheduled_batch)
-                if cached_vote is None or cached_vote[0] is not scheduled_batch
-                else None)
-            if local_route is not None:
-                rank_payloads = list(
-                    self.dist.tp_allgather(
-                        [scheduled_batch.batch_size, *local_route]))
-                payloads_valid = bool(
-                    rank_payloads and all(
-                        isinstance(payload, (list, tuple))
-                        and len(payload) == 5 for payload in rank_payloads))
-                tp_batch_sizes = (
-                    [int(payload[0]) for payload in rank_payloads]
-                    if payloads_valid else [0])
-                rank_routes = (
-                    [list(payload[1:]) for payload in rank_payloads]
-                    if payloads_valid else [])
-                route_valid, candidate, route_g, route_epoch = (
-                    self._agree_dspark_native_uniform_adp_route(
-                        rank_routes, local_route))
-                self._dspark_native_uniform_adp_route_vote = (
-                    scheduled_batch, route_valid, candidate, route_g,
-                    route_epoch)
-            else:
-                tp_batch_sizes = self.dist.tp_allgather(
-                    scheduled_batch.batch_size)
+            tp_batch_sizes = self.dist.tp_allgather(
+                scheduled_batch.batch_size)
             can_queue = 0 not in tp_batch_sizes
             can_queue_this_rank = scheduled_batch.batch_size > 0
         else:
@@ -4594,6 +4619,8 @@ class PyExecutor:
                     self._handle_dynamic_draft_len(scheduled_batch)
 
                     self.resource_manager.prepare_resources(scheduled_batch)
+                    self._finalize_dspark_native_uniform_draft_len(
+                        scheduled_batch)
 
                 if self.kv_connector_manager:
                     self.kv_connector_manager.handle_metadata()
@@ -5146,6 +5173,8 @@ class PyExecutor:
                     self._handle_dynamic_draft_len(scheduled_batch)
 
                     self.resource_manager.prepare_resources(scheduled_batch)
+                    self._finalize_dspark_native_uniform_draft_len(
+                        scheduled_batch)
 
                 if self.kv_connector_manager:
                     self.kv_connector_manager.handle_metadata()

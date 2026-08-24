@@ -439,7 +439,7 @@ def test_native_uniform_adp_route_publishes_one_shot_graph_padding_proof():
     executor.dist.tp_allgather.assert_called_once_with([True, 4, 2, 7])
 
 
-def test_native_uniform_adp_route_piggybacks_on_can_queue_allgather():
+def test_native_uniform_adp_route_is_finalized_after_full_k_reservation():
     config = DSparkDecodingConfig(
         max_draft_len=5,
         speculative_model="/tmp/dummy_model",
@@ -449,11 +449,20 @@ def test_native_uniform_adp_route_piggybacks_on_can_queue_allgather():
         confidence_sps_cost_table_path="/tmp/dummy-sps.json",
     )
     requests = [request_stub(1, 4, 0), request_stub(2, 4, 1)]
-    for request in requests:
-        request.py_dspark_confidence_execution_batch_size = 2
-        request.py_dspark_confidence_route_epoch = 7
     batch = ScheduledRequests()
     batch.generation_requests = requests
+    ready_event = Mock()
+    ready_event.query.return_value = False
+    previous_device = SimpleNamespace(
+        dspark_confidence_native_uniform=True,
+        dspark_confidence_native_uniform_ready_event=ready_event,
+        dspark_confidence_native_uniform_draft_len_host=torch.tensor(4),
+        dspark_confidence_request_ids=(1, 2),
+        dspark_confidence_seq_slots=(0, 1),
+        dspark_confidence_execution_batch_size=2,
+        dspark_confidence_route_epoch=7,
+        dspark_confidence_engine_generation=17,
+    )
     graph_runner = SimpleNamespace(
         confidence_native_uniform_adp_agreed_route=(99, 99, 5, 99))
     executor = object.__new__(PyExecutor)
@@ -463,28 +472,49 @@ def test_native_uniform_adp_route_piggybacks_on_can_queue_allgather():
         _dspark_confidence_engine_generation=17,
         cuda_graph_runner=graph_runner,
     )
-    executor.disable_overlap_scheduler = True
+    executor.disable_overlap_scheduler = False
     executor.enable_attention_dp = True
+    executor.previous_batch = SimpleNamespace(
+        sample_state=SimpleNamespace(device=previous_device))
+    executor.speculation_permanently_disabled = False
     executor.dist = Mock()
     executor.dist.tp_allgather.side_effect = lambda payload: [payload] * 2
     executor._dspark_native_uniform_adp_route_vote = None
+    executor._dspark_native_route_counts = None
 
     can_queue, can_queue_this_rank = PyExecutor._can_queue(executor, batch)
-    selected = PyExecutor._resolve_dspark_native_uniform_draft_len(
+    assert can_queue and can_queue_this_rank
+    ready_event.query.assert_not_called()
+
+    PyExecutor._handle_dynamic_draft_len(executor, batch)
+    reserved_lengths = [len(request.py_draft_tokens) for request in requests]
+    assert reserved_lengths == [5, 5]
+    assert executor.model_engine.runtime_draft_len == 5
+    ready_event.query.assert_not_called()
+
+    selected = PyExecutor._finalize_dspark_native_uniform_draft_len(
         executor, batch)
 
-    assert can_queue and can_queue_this_rank
     assert selected == 4
+    assert [len(request.py_draft_tokens) for request in requests] == [4, 4]
+    assert executor.model_engine.runtime_draft_len == 4
     assert graph_runner.confidence_native_uniform_adp_agreed_route == (
         2, 7, 4, 2)
-    executor.dist.tp_allgather.assert_called_once_with([2, True, 4, 2, 7])
+    ready_event.query.assert_called_once_with()
+    ready_event.synchronize.assert_called_once_with()
+    assert executor.dist.tp_allgather.call_count == 2
+    assert executor.dist.tp_allgather.call_args_list[0].args == (2, )
+    assert executor.dist.tp_allgather.call_args_list[1].args == (
+        [True, 4, 2, 7], )
 
     # A connector can recheck the same ScheduledRequests object after route
-    # resolution. Preserve the ordinary queue collective without publishing a
-    # second route vote for the already-consumed iteration.
+    # resolution. Preserve the ordinary queue collective without reading or
+    # publishing a second route vote for the already-consumed iteration.
     assert PyExecutor._can_queue(executor, batch) == (True, True)
-    assert executor.dist.tp_allgather.call_count == 2
+    assert executor.dist.tp_allgather.call_count == 3
     assert executor.dist.tp_allgather.call_args.args[0] == 2
+    ready_event.query.assert_called_once_with()
+    ready_event.synchronize.assert_called_once_with()
 
 
 @pytest.mark.parametrize("native_uniform", [False, True])
