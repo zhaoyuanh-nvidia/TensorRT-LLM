@@ -318,6 +318,24 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         self._trace_dspark_budget_transition(state, next_draft_lens_list)
         beam_idx = DEFAULT_BEAM_IDX
         runtime_draft_len = getattr(state, "runtime_draft_len", self.draft_len)
+        native_uniform = bool(
+            getattr(state, "dspark_confidence_native_uniform", False))
+        native_uniform_draft_len = runtime_draft_len
+        native_uniform_route_valid = False
+        if native_uniform:
+            native_uniform_draft_len_host = getattr(
+                state.host,
+                "dspark_confidence_native_uniform_draft_len_host",
+                None,
+            )
+            if native_uniform_draft_len_host is not None:
+                candidate = int(native_uniform_draft_len_host)
+                native_uniform_route_valid = candidate in (
+                    runtime_draft_len - 1,
+                    runtime_draft_len,
+                )
+                if native_uniform_route_valid:
+                    native_uniform_draft_len = candidate
 
         for req_idx, req in enumerate(state.requests):
             if req.state == LlmRequestState.GENERATION_COMPLETE:
@@ -357,7 +375,7 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             next_draft_len = (
                 next_draft_lens_list[req.py_seq_slot]
                 if next_draft_lens_list is not None
-                else runtime_draft_len
+                else native_uniform_draft_len
             )
             self._request_common_handling(
                 req,
@@ -411,17 +429,28 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             and route_epoch > 0 and len(surviving_requests) == len(planned_requests)
             and semantic_route_valid
         )
-        if route_complete:
-            computed_verifier_budget = execution_g + sum(
-                int(next_draft_lens_list[request.py_seq_slot])
-                for request in surviving_requests
-            )
+        native_route_complete = (
+            native_uniform and native_uniform_route_valid
+            and execution_g is not None and execution_g > 0
+            and route_epoch is not None and route_epoch > 0
+            and len(surviving_requests) == len(planned_requests)
+        )
+        if route_complete or native_route_complete:
+            computed_verifier_budget = (
+                int(execution_g) * (1 + int(native_uniform_draft_len))
+                if native_route_complete else int(execution_g) + sum(
+                    int(next_draft_lens_list[request.py_seq_slot])
+                    for request in surviving_requests
+                ))
             verifier_budget = (verifier_budget if verifier_budget is not None
                                else computed_verifier_budget)
-            if int(verifier_budget) != computed_verifier_budget:
+            if (not native_route_complete
+                    and int(verifier_budget) != computed_verifier_budget):
                 raise RuntimeError(
                     "DSpark carried verifier budget does not match retained "
                     "draft lengths")
+            if native_route_complete:
+                verifier_budget = computed_verifier_budget
             for request in surviving_requests:
                 previous_epoch = getattr(
                     request, "py_dspark_confidence_route_epoch", None)
@@ -448,7 +477,7 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
                 request.py_dspark_confidence_route_epoch = route_epoch
                 request.py_dspark_confidence_execution_batch_size = execution_g
                 request.py_dspark_confidence_verifier_token_budget = verifier_budget
-        elif next_draft_lens_list is not None:
+        elif next_draft_lens_list is not None or native_uniform:
             for request in surviving_requests:
                 request.py_draft_tokens_effective_len = len(
                     request.py_draft_tokens)

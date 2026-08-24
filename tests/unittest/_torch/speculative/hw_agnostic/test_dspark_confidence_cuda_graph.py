@@ -452,7 +452,7 @@ def test_native_uniform_adp_route_is_finalized_after_full_k_reservation():
     batch = ScheduledRequests()
     batch.generation_requests = requests
     ready_event = Mock()
-    ready_event.query.return_value = False
+    ready_event.query.return_value = True
     previous_device = SimpleNamespace(
         dspark_confidence_native_uniform=True,
         dspark_confidence_native_uniform_ready_event=ready_event,
@@ -484,13 +484,13 @@ def test_native_uniform_adp_route_is_finalized_after_full_k_reservation():
 
     can_queue, can_queue_this_rank = PyExecutor._can_queue(executor, batch)
     assert can_queue and can_queue_this_rank
-    ready_event.query.assert_not_called()
+    ready_event.query.assert_called_once_with()
 
     PyExecutor._handle_dynamic_draft_len(executor, batch)
     reserved_lengths = [len(request.py_draft_tokens) for request in requests]
     assert reserved_lengths == [5, 5]
     assert executor.model_engine.runtime_draft_len == 5
-    ready_event.query.assert_not_called()
+    ready_event.query.assert_called_once_with()
 
     selected = PyExecutor._finalize_dspark_native_uniform_draft_len(
         executor, batch)
@@ -501,20 +501,74 @@ def test_native_uniform_adp_route_is_finalized_after_full_k_reservation():
     assert graph_runner.confidence_native_uniform_adp_agreed_route == (
         2, 7, 4, 2)
     ready_event.query.assert_called_once_with()
-    ready_event.synchronize.assert_called_once_with()
-    assert executor.dist.tp_allgather.call_count == 2
-    assert executor.dist.tp_allgather.call_args_list[0].args == (2, )
-    assert executor.dist.tp_allgather.call_args_list[1].args == (
-        [True, 4, 2, 7], )
+    ready_event.synchronize.assert_not_called()
+    executor.dist.tp_allgather.assert_called_once_with([2, True, 4, 2, 7])
 
     # A connector can recheck the same ScheduledRequests object after route
     # resolution. Preserve the ordinary queue collective without reading or
     # publishing a second route vote for the already-consumed iteration.
     assert PyExecutor._can_queue(executor, batch) == (True, True)
-    assert executor.dist.tp_allgather.call_count == 3
+    assert executor.dist.tp_allgather.call_count == 2
     assert executor.dist.tp_allgather.call_args.args[0] == 2
     ready_event.query.assert_called_once_with()
-    ready_event.synchronize.assert_called_once_with()
+    ready_event.synchronize.assert_not_called()
+
+
+def test_native_uniform_adp_route_not_ready_falls_back_without_wait():
+    config = DSparkDecodingConfig(
+        max_draft_len=5,
+        speculative_model="/tmp/dummy_model",
+        confidence_mode="dynamic_budget",
+        confidence_native_uniform=True,
+        confidence_verifier_token_budget_tiers={2: [10, 12]},
+        confidence_sps_cost_table_path="/tmp/dummy-sps.json",
+    )
+    requests = [request_stub(1, 4, 0), request_stub(2, 4, 1)]
+    batch = ScheduledRequests()
+    batch.generation_requests = requests
+    ready_event = Mock()
+    ready_event.query.return_value = False
+    previous_device = SimpleNamespace(
+        dspark_confidence_native_uniform=True,
+        dspark_confidence_native_uniform_ready_event=ready_event,
+        dspark_confidence_native_uniform_draft_len_host=torch.tensor(4),
+        dspark_confidence_request_ids=(1, 2),
+        dspark_confidence_seq_slots=(0, 1),
+        dspark_confidence_execution_batch_size=2,
+        dspark_confidence_route_epoch=7,
+        dspark_confidence_engine_generation=17,
+    )
+    graph_runner = SimpleNamespace(
+        confidence_native_uniform_adp_agreed_route=(99, 99, 5, 99))
+    executor = object.__new__(PyExecutor)
+    executor.model_engine = SimpleNamespace(
+        spec_config=config,
+        max_draft_len=5,
+        _dspark_confidence_engine_generation=17,
+        cuda_graph_runner=graph_runner,
+    )
+    executor.disable_overlap_scheduler = False
+    executor.enable_attention_dp = True
+    executor.previous_batch = SimpleNamespace(
+        sample_state=SimpleNamespace(device=previous_device))
+    executor.speculation_permanently_disabled = False
+    executor.dist = Mock()
+    executor.dist.tp_allgather.side_effect = lambda payload: [payload] * 2
+    executor._dspark_native_uniform_adp_route_vote = None
+    executor._dspark_native_route_counts = None
+
+    assert PyExecutor._can_queue(executor, batch) == (True, True)
+    PyExecutor._handle_dynamic_draft_len(executor, batch)
+    selected = PyExecutor._finalize_dspark_native_uniform_draft_len(
+        executor, batch)
+
+    assert selected == 5
+    assert [len(request.py_draft_tokens) for request in requests] == [5, 5]
+    assert executor.model_engine.runtime_draft_len == 5
+    assert graph_runner.confidence_native_uniform_adp_agreed_route is None
+    ready_event.query.assert_called_once_with()
+    ready_event.synchronize.assert_not_called()
+    executor.dist.tp_allgather.assert_called_once_with([2, False, 5, 0, 0])
 
 
 @pytest.mark.parametrize("native_uniform", [False, True])
@@ -709,6 +763,7 @@ def test_native_uniform_overlap_never_reuses_stale_request_route():
     )
     executor.disable_overlap_scheduler = False
     executor.enable_attention_dp = False
+    executor._dspark_native_uniform_delayed_route = (4, 2, 6, 17)
     executor.previous_batch = SimpleNamespace(
         sample_state=SimpleNamespace(
             device=SimpleNamespace(dspark_confidence_native_uniform=False)))
@@ -2203,6 +2258,119 @@ def test_sampler_publishes_iteration_local_compact_route(monkeypatch):
         request.py_dspark_confidence_verifier_token_budget == 7
         for request in requests
     )
+
+
+def test_sampler_carries_native_uniform_route_after_natural_wait(monkeypatch):
+    sampler, state, requests = _make_sampler_route_state()
+    state.host.next_draft_lens = None
+    state.host.dspark_confidence_native_uniform_draft_len_host = torch.tensor(
+        4, dtype=torch.int32)
+    state.dspark_confidence_native_uniform = True
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.speculative.spec_sampler_base.add_token",
+        lambda *args, **kwargs: 1,
+    )
+    monkeypatch.setattr(
+        TorchSampler, "_handle_stop_criteria", lambda *args, **kwargs: False
+    )
+
+    SpecSampler.update_requests(sampler, state)
+
+    assert [request.py_draft_tokens_effective_len for request in requests] == [4, 4]
+    assert all(len(request.py_draft_tokens) == 5 for request in requests)
+    assert all(request.py_dspark_confidence_route_epoch == 7 for request in requests)
+    assert all(
+        request.py_dspark_confidence_execution_batch_size == 4
+        for request in requests
+    )
+    assert all(
+        request.py_dspark_confidence_verifier_token_budget == 20
+        for request in requests
+    )
+
+
+def test_native_uniform_executor_delayed_route_survives_roster_churn():
+    config = DSparkDecodingConfig(
+        max_draft_len=5,
+        speculative_model="/tmp/dummy_model",
+        confidence_mode="dynamic_budget",
+        confidence_native_uniform=True,
+        confidence_verifier_token_budget_tiers={2: [10, 12]},
+        confidence_sps_cost_table_path="/tmp/dummy-sps.json",
+    )
+    requests = [request_stub(1, 4, 0), request_stub(2, 4, 1)]
+    # Request-local metadata may be missing or heterogeneous when requests
+    # finish and are admitted between the completed and queued iterations.
+    requests[0].py_dspark_confidence_execution_batch_size = 4
+    requests[0].py_dspark_confidence_route_epoch = 6
+    requests[1].py_draft_tokens_effective_len = 5
+    batch = ScheduledRequests()
+    batch.generation_requests = requests
+    ready_event = Mock()
+    ready_event.query.return_value = False
+    previous_device = SimpleNamespace(
+        dspark_confidence_native_uniform=True,
+        dspark_confidence_native_uniform_ready_event=ready_event,
+        dspark_confidence_native_uniform_draft_len_host=torch.tensor(5),
+        # This carrier was planned before one request completed and another
+        # occupied its slot. Uniform prefix truncation has no row mapping, so
+        # the graph runner's physical-block validation is the safety proof.
+        dspark_confidence_request_ids=(10, 20),
+        dspark_confidence_seq_slots=(5, 6),
+        dspark_confidence_execution_batch_size=2,
+        dspark_confidence_route_epoch=7,
+        dspark_confidence_engine_generation=17,
+    )
+    executor = object.__new__(PyExecutor)
+    executor.model_engine = SimpleNamespace(
+        spec_config=config,
+        max_draft_len=5,
+        _dspark_confidence_engine_generation=17,
+        cuda_graph_runner=SimpleNamespace(
+            confidence_native_uniform_adp_agreed_route=None),
+    )
+    executor.disable_overlap_scheduler = False
+    executor._dspark_native_uniform_delayed_route = (4, 4, 6, 17)
+    executor.previous_batch = SimpleNamespace(
+        sample_state=SimpleNamespace(device=previous_device))
+
+    assert PyExecutor._get_dspark_native_uniform_local_route(
+        executor, batch) == (True, 4, 2, 7)
+    ready_event.query.assert_called_once_with()
+
+
+def test_executor_publishes_native_uniform_route_after_sampler_wait():
+    config = DSparkDecodingConfig(
+        max_draft_len=5,
+        speculative_model="/tmp/dummy_model",
+        confidence_mode="dynamic_budget",
+        confidence_native_uniform=True,
+        confidence_verifier_token_budget_tiers={2: [10, 12]},
+        confidence_sps_cost_table_path="/tmp/dummy-sps.json",
+    )
+    executor = object.__new__(PyExecutor)
+    executor.model_engine = SimpleNamespace(
+        spec_config=config,
+        max_draft_len=5,
+        _dspark_confidence_engine_generation=17,
+    )
+    executor._dspark_native_uniform_delayed_route = None
+    state = SimpleNamespace(
+        dspark_confidence_native_uniform=True,
+        dspark_confidence_execution_batch_size=2,
+        dspark_confidence_route_epoch=6,
+        dspark_confidence_engine_generation=17,
+        host=SimpleNamespace(
+            dspark_confidence_native_uniform_draft_len_host=torch.tensor(4)),
+    )
+
+    PyExecutor._publish_dspark_native_uniform_delayed_route(executor, state)
+
+    assert executor._dspark_native_uniform_delayed_route == (4, 2, 6, 17)
+
+    state.dspark_confidence_engine_generation = 18
+    PyExecutor._publish_dspark_native_uniform_delayed_route(executor, state)
+    assert executor._dspark_native_uniform_delayed_route is None
 
 
 def test_sampler_newer_route_publication_is_monotonic(monkeypatch):
