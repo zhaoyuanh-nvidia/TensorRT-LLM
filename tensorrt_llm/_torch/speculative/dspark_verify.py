@@ -32,8 +32,7 @@ import torch
 
 from ..._utils import prefer_pinned
 from ...logger import logger
-from .dspark_planner import (ExactSpsCostTable, SpsCostTable,
-                             compute_verify_token_budget)
+from .dspark_planner import ExactSpsCostTable, SpsCostTable, compute_verify_token_budget
 from .dspark_schedule import (
     NEUTRAL_CONFIDENCE_LOGIT,
     DSparkScheduleConfig,
@@ -88,9 +87,14 @@ class ExactSpsLocalDecision:
     compact_expected_yields: Tuple[float, ...]
 
 
-def _exact_cell_geometry(*, num_real: int, graph_batch_size: int,
-                         verifier_budget: int, min_verify_len: int,
-                         max_verify_len: int) -> Optional[Tuple[int, int, int]]:
+def _exact_cell_geometry(
+    *,
+    num_real: int,
+    graph_batch_size: int,
+    verifier_budget: int,
+    min_verify_len: int,
+    max_verify_len: int,
+) -> Optional[Tuple[int, int, int]]:
     """Return ``(pad_tokens, real_tokens, extra_budget)`` or infeasible.
 
     Every pad row shares one token length. Choosing the smallest feasible pad
@@ -116,8 +120,7 @@ def _exact_cell_geometry(*, num_real: int, graph_batch_size: int,
 
     pad_capacity = int(max_verify_len) + 1
     pad_lo = max(1, -(-(verifier_budget - real_capacity) // num_pad))
-    pad_hi = min(pad_capacity,
-                 (verifier_budget - real_floor) // num_pad)
+    pad_hi = min(pad_capacity, (verifier_budget - real_floor) // num_pad)
     if pad_lo > pad_hi:
         return None
     pad_tokens = pad_lo
@@ -216,24 +219,26 @@ class DSparkVerifyPlanner:
             "forced_steps": 0,
         }
 
-    def install_runtime_cost_table(
-            self, cost_table: SpsCostTable | ExactSpsCostTable) -> None:
+    def install_runtime_cost_table(self, cost_table: SpsCostTable | ExactSpsCostTable) -> None:
         """Install ModelEngine's already validated runtime cost object."""
         if isinstance(cost_table, ExactSpsCostTable):
             if cost_table.max_draft_len != self.cfg.resolved_max_verify_len:
                 raise ValueError(
                     "Exact SPS max_draft_len does not match planner: "
                     f"table={cost_table.max_draft_len}, "
-                    f"planner={self.cfg.resolved_max_verify_len}")
-            self.cost_table = cost_table
-            return
-        if self.cost_table is None:
-            self.cost_table = cost_table
+                    f"planner={self.cfg.resolved_max_verify_len}"
+                )
+        if self.cost_table is not None and self.cost_table != cost_table:
+            raise RuntimeError(
+                "DSpark planner already holds a different SPS cost object; "
+                "graph capture and runtime scheduling must share ModelEngine's "
+                "single validated instance"
+            )
+        self.cost_table = cost_table
 
     @property
     def exact_cost_table(self) -> Optional[ExactSpsCostTable]:
-        return (self.cost_table if isinstance(self.cost_table,
-                                              ExactSpsCostTable) else None)
+        return self.cost_table if isinstance(self.cost_table, ExactSpsCostTable) else None
 
     def prepare_exact_sps_decision(
         self,
@@ -251,33 +256,27 @@ class DSparkVerifyPlanner:
         self.stats["decisions"] += 1
         table = self.exact_cost_table
         if table is None:
-            raise RuntimeError(
-                "prepare_exact_sps_decision requires an exact SPS table")
+            raise RuntimeError("prepare_exact_sps_decision requires an exact SPS table")
         n = int(num_gen_requests)
         if n <= 0:
             self.stats["fallback_no_gen_requests"] += 1
             return None
         if self._forced_verify_len is not None or self._forced_budget_frac is not None:
-            raise RuntimeError(
-                "profiling overrides must use the legacy pinned decision path")
+            raise RuntimeError("profiling overrides must use the legacy pinned decision path")
 
         if self.device_windows:
             snapshot = self._ready_older_snapshot()
             if snapshot is None:
                 self.stats["fallback_no_snapshot"] += 1
                 return None
-            selected = self._gather_rows(
-                num_gen_requests=n, rows=rows, snapshot=snapshot)
+            selected = self._gather_rows(num_gen_requests=n, rows=rows, snapshot=snapshot)
             stamps, staged_seq = self._prev_stamps, self._prev_seq
         else:
             selected = self._gather_rows(num_gen_requests=n, rows=rows)
             stamps, staged_seq = None, None
         if selected is None:
             return None
-        self._note_snapshot_stats(selected,
-                                  rows,
-                                  stamps=stamps,
-                                  staged_seq=staged_seq)
+        self._note_snapshot_stats(selected, rows, stamps=stamps, staged_seq=staged_seq)
         survival = compute_survival(self.apply_calibration(selected))
         native_expected_yield = float(n) + float(survival.sum())
 
@@ -285,8 +284,8 @@ class DSparkVerifyPlanner:
         max_verify_len = int(self.cfg.resolved_max_verify_len)
         base_expected_yield = float(n) + float(survival[:, :floor].sum())
         candidates = np.sort(
-            survival[:, floor:max_verify_len].numpy().astype(
-                np.float64).reshape(-1))[::-1]
+            survival[:, floor:max_verify_len].numpy().astype(np.float64).reshape(-1)
+        )[::-1]
         prefix = np.concatenate(([0.0], np.cumsum(candidates)))
         compact_expected_yields = []
         for graph_batch_size, verifier_budget in table.candidate_cells():
@@ -301,8 +300,7 @@ class DSparkVerifyPlanner:
                 compact_expected_yields.append(-1.0)
                 continue
             _, _, extra = geometry
-            compact_expected_yields.append(base_expected_yield
-                                             + float(prefix[extra]))
+            compact_expected_yields.append(base_expected_yield + float(prefix[extra]))
         return ExactSpsLocalDecision(
             num_requests=n,
             survival=survival,
@@ -325,16 +323,12 @@ class DSparkVerifyPlanner:
         """
         table = self.exact_cost_table
         if table is None:
-            raise RuntimeError(
-                "allocate_exact_sps_candidate requires an exact SPS table")
+            raise RuntimeError("allocate_exact_sps_candidate requires an exact SPS table")
         n = int(decision.num_requests)
         graph_batch_size = int(graph_batch_size)
         verifier_budget = int(verifier_budget)
-        if verifier_budget not in table.production_candidate_budgets(
-                graph_batch_size):
-            raise ValueError(
-                f"Unmeasured exact SPS cell G={graph_batch_size}, "
-                f"V={verifier_budget}")
+        if verifier_budget not in table.production_candidate_budgets(graph_batch_size):
+            raise ValueError(f"Unmeasured exact SPS cell G={graph_batch_size}, V={verifier_budget}")
         floor = int(self.cfg.min_verify_len)
         max_verify_len = int(self.cfg.resolved_max_verify_len)
         geometry = _exact_cell_geometry(
@@ -347,21 +341,19 @@ class DSparkVerifyPlanner:
         if geometry is None:
             raise ValueError(
                 f"Exact SPS cell G={graph_batch_size}, V={verifier_budget} "
-                f"cannot fit {n} real requests with verify floor {floor}")
+                f"cannot fit {n} real requests with verify floor {floor}"
+            )
         pad_tokens, real_tokens, budget = geometry
         exact_cfg = replace(self.cfg, survival_eps=0.0)
         lens = schedule_verify_lens_topk(
-            survival=decision.survival, budget=budget,
-            cfg=exact_cfg).tolist()
+            survival=decision.survival, budget=budget, cfg=exact_cfg
+        ).tolist()
         if sum(int(value) + 1 for value in lens) != real_tokens:
-            raise RuntimeError(
-                "Exact SPS allocation did not spend its real-row token target")
+            raise RuntimeError("Exact SPS allocation did not spend its real-row token target")
         predicted = table.step_time(verifier_budget, graph_batch_size)
         self.last_predicted_step_ms = float(predicted)
-        self.stats["predicted_ms_sum"] = self.stats.get(
-            "predicted_ms_sum", 0.0) + float(predicted)
-        self.stats["predicted_steps"] = self.stats.get(
-            "predicted_steps", 0) + 1
+        self.stats["predicted_ms_sum"] = self.stats.get("predicted_ms_sum", 0.0) + float(predicted)
+        self.stats["predicted_steps"] = self.stats.get("predicted_steps", 0) + 1
         cell_hist = self.stats.setdefault("exact_cell_hist", {})
         cell = f"G{graph_batch_size}V{verifier_budget}"
         cell_hist[cell] = cell_hist.get(cell, 0) + 1
