@@ -2987,6 +2987,15 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         "degenerates to verify-all (no scheduling gain).",
         status="prototype")
 
+    confidence_sps_live_fingerprint_path: Optional[str] = Field(
+        default=None,
+        description=
+        "Path to an independently generated JSON fingerprint of the active "
+        "runtime. Required by schema-v2 exact T(G,V) cost tables so the table "
+        "cannot authenticate its own model, source, topology, GPU, or CUDA "
+        "graph ladder. Legacy one-dimensional SPS curves do not require it.",
+        status="prototype")
+
     confidence_verify_len_tiers: Optional[List[PositiveInt]] = Field(
         default=None,
         description=
@@ -3065,12 +3074,20 @@ class DSparkDecodingConfig(DecodingBaseConfig):
     def validate_confidence_scheduling(self):
         if not self.enable_confidence_scheduling:
             if (self.confidence_sts_path or self.confidence_sps_table_path
+                    or self.confidence_sps_live_fingerprint_path
                     or self.confidence_verify_len_tiers):
                 raise ValueError(
                     "confidence_sts_path / confidence_sps_table_path / "
+                    "confidence_sps_live_fingerprint_path / "
                     "confidence_verify_len_tiers require "
                     "enable_confidence_scheduling=True")
             return self
+
+        if (self.confidence_sps_live_fingerprint_path
+                and not self.confidence_sps_table_path):
+            raise ValueError(
+                "confidence_sps_live_fingerprint_path requires "
+                "confidence_sps_table_path")
 
         if self.max_draft_len is not None:
             tiers = self.confidence_verify_len_tiers or [
