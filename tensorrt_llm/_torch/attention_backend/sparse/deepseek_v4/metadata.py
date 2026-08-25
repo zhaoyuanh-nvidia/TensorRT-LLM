@@ -563,6 +563,18 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         cached_token_lens = self.cached_token_lens_cpu
         kv_lens = cached_token_lens[:num_requests] + self.seq_lens_kv[:num_requests]
 
+        if self.device_windows_mode and self.is_ragged_verify:
+            # The host split only chooses the captured shape.  Until the
+            # device prologue installs the freshly ranked windows, every
+            # host-side consumer must see a full-window upper bound rather
+            # than stale per-request shape values.  Keep this identical to the
+            # native DSA metadata contract.
+            nc, ns = self.num_contexts, self.num_seqs
+            kv_lens = kv_lens.clone()
+            kv_lens[nc:ns] += ((1 + self.max_draft_tokens) -
+                               self.seq_lens_kv[nc:ns])
+            self.kv_lens[nc:ns] = kv_lens[nc:ns]
+
         self.cached_token_lens_cuda[:num_requests].copy_(
             cached_token_lens[:num_requests], non_blocking=True
         )

@@ -46,7 +46,11 @@ from .dspark_ragged import (build_qo_indptr, build_row_maps_device,
 from .dspark_schedule import (NEUTRAL_CONFIDENCE_LOGIT, DSparkScheduleConfig,
                               compute_survival, schedule_verify_lens_topk)
 
-__all__ = ["DeviceWindowResult", "select_windows_device"]
+__all__ = [
+    "DeviceWindowResult",
+    "gather_packed_draft_tokens",
+    "select_windows_device",
+]
 
 
 @dataclass
@@ -68,6 +72,47 @@ class DeviceWindowResult:
     qo_indptr: torch.Tensor
     req_idx: torch.Tensor
     kv_correction: torch.Tensor
+
+
+def gather_packed_draft_tokens(
+    *,
+    next_draft_tokens: torch.Tensor,
+    batch_slots: torch.Tensor,
+    verify_lens: torch.Tensor,
+    qo_indptr: torch.Tensor,
+    num_real: int,
+    total_draft_tokens: int,
+) -> torch.Tensor:
+    """Gather the device-selected real draft rows, excluding bonus tokens.
+
+    ``verify_lens`` and ``qo_indptr`` describe token windows that include one
+    bonus/anchor per request.  The persistent draft buffer contains drafts
+    only, packed request-major.  Construct exactly ``total_draft_tokens``
+    owners so full-batch/full-K layouts never need a one-past-the-end discard
+    slot for anchors.
+    """
+    if total_draft_tokens < 0:
+        raise ValueError("total_draft_tokens must be non-negative")
+    if total_draft_tokens == 0:
+        return next_draft_tokens.new_empty((0, ))
+    device = verify_lens.device
+    rows = torch.arange(num_real, device=device, dtype=torch.long)
+    draft_counts = verify_lens[:num_real].to(torch.long) - 1
+    owners = torch.repeat_interleave(rows,
+                                    draft_counts,
+                                    output_size=total_draft_tokens)
+    # Removing one bonus from every preceding request converts the token
+    # prefix into a draft-only prefix.
+    draft_qo = (qo_indptr[:num_real + 1].to(torch.long) -
+                torch.arange(num_real + 1,
+                             device=device,
+                             dtype=torch.long))
+    flat = torch.arange(total_draft_tokens,
+                        device=device,
+                        dtype=torch.long)
+    offsets = flat - draft_qo[owners]
+    slots = batch_slots[:num_real].to(torch.long)[owners]
+    return next_draft_tokens[slots, offsets]
 
 
 def select_windows_device(

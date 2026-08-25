@@ -3352,6 +3352,27 @@ class PyExecutor:
             send_handles[microbatch_id].wait()
             send_handles[microbatch_id] = None
 
+    def get_dspark_ragged_stats(self) -> dict[str, object]:
+        """Return this rank's live DSpark ragged-verification counters.
+
+        The counters deliberately stay rank-local: attention-DP ranks own
+        different requests, so summing them would erase the per-rank graph and
+        fallback evidence needed to diagnose an uneven drain. Multi-rank MPI
+        callers reach rank 0 through ``collective_rpc``; the final shutdown log
+        remains the all-rank evidence channel for production runs.
+
+        Raises:
+            RuntimeError: if this executor has no initialized DSpark ragged
+                statistics object.
+        """
+        worker_fn = getattr(self.model_engine, "_get_spec_worker", None)
+        worker = worker_fn() if worker_fn else None
+        stats = getattr(worker, "ragged_stats", None) if worker else None
+        if stats is None:
+            raise RuntimeError(
+                "no initialized DSpark ragged statistics on this executor")
+        return stats.summary()
+
     def set_dspark_verify_len_pin(self, verify_len: Optional[int]) -> Optional[int]:
         """Queue a DSpark verify-length pin, or ``None`` to clear it.
 

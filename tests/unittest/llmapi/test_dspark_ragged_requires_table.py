@@ -37,6 +37,11 @@ def test_ragged_without_a_cost_table_is_rejected():
     assert _cfg(confidence_sps_table_path="/tmp/table.json").enable_ragged_verify
 
 
+def test_sts_calibration_does_not_substitute_for_a_cost_table():
+    with pytest.raises(ValueError, match="confidence_sps_table_path"):
+        _cfg(confidence_sts_path="/tmp/sts.json")
+
+
 def test_confidence_scheduling_without_ragged_is_rejected():
     """There is no uniform tier ladder to fall back to.
 

@@ -21,11 +21,13 @@ import types
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.deepseek_v4 import \
+from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.metadata import \
     DeepseekV4TrtllmAttentionMetadata
 from tensorrt_llm._torch.pyexecutor.llm_request import get_request_tokens_per_gen_step
-from tensorrt_llm._torch.speculative.dspark_device_select import \
-    select_windows_device
+from tensorrt_llm._torch.speculative.dspark_device_select import (
+    gather_packed_draft_tokens,
+    select_windows_device,
+)
 from tensorrt_llm._torch.speculative.dspark_ragged import (
     RaggedVerifyLayout,
     build_qo_indptr,
@@ -802,6 +804,42 @@ def test_select_windows_respects_published_split():
         assert (res.verify_lens[n_real:] == pad_len).all()
         assert int(res.verify_lens[:n_real].min()) >= cfg.min_verify_len + 1
         assert int(res.verify_lens[:n_real].max()) <= max_tok
+
+
+def test_device_window_draft_gather_omits_anchors():
+    next_draft = torch.arange(4 * 5, dtype=torch.int32).reshape(4, 5)
+    verify_lens = torch.tensor([6, 2, 4], dtype=torch.int32)
+    qo_indptr = build_qo_indptr(verify_lens)
+    slots = torch.tensor([2, 0, 3], dtype=torch.long)
+    packed = gather_packed_draft_tokens(
+        next_draft_tokens=next_draft,
+        batch_slots=slots,
+        verify_lens=verify_lens,
+        qo_indptr=qo_indptr,
+        num_real=3,
+        total_draft_tokens=9,
+    )
+    expected = torch.cat((next_draft[2, :5], next_draft[0, :1],
+                          next_draft[3, :3]))
+    assert torch.equal(packed, expected)
+
+
+def test_device_window_full_capacity_needs_no_discard_slot():
+    # G128/K5 exactly fills the persistent 128*5 draft allocation.  Anchors
+    # must be omitted rather than written at the one-past-capacity index 640.
+    g, k = 128, 5
+    next_draft = torch.arange(g * k, dtype=torch.int32).reshape(g, k)
+    verify_lens = torch.full((g, ), k + 1, dtype=torch.int32)
+    packed = gather_packed_draft_tokens(
+        next_draft_tokens=next_draft,
+        batch_slots=torch.arange(g),
+        verify_lens=verify_lens,
+        qo_indptr=build_qo_indptr(verify_lens),
+        num_real=g,
+        total_draft_tokens=g * k,
+    )
+    assert packed.numel() == g * k
+    assert torch.equal(packed, next_draft.flatten())
 
 
 def test_topk_tensor_budget_matches_int():

@@ -3055,16 +3055,17 @@ class DSparkDecodingConfig(DecodingBaseConfig):
                 "block whenever acceptance is high. To turn the feature off, "
                 "set enable_confidence_scheduling=False -- that verifies the "
                 "full drafted block, which is the only fallback.")
-        if (self.enable_ragged_verify and not self.confidence_sps_table_path
-                and not self.confidence_sts_path):
+        if self.enable_ragged_verify and not self.confidence_sps_table_path:
             # Without a profiled cost table the planner's budget degenerates to
             # verify-all -- correctly, since a flat model makes every extra
             # token look free -- so the ragged path silently never runs.
             raise ValueError(
                 "enable_ragged_verify=True requires a profiled cost table: pass "
                 "confidence_sps_table_path (produced by "
-                "`python tests/microbenchmarks/dspark_sps_profiler.py`) "
-                "or confidence_sts_path. Without one the planner cannot compare "
+                "`python tests/microbenchmarks/dspark_sps_profiler.py`). "
+                "confidence_sts_path only calibrates confidence logits; it "
+                "does not describe verifier cost. Without an SPS table the "
+                "planner cannot compare "
                 "the cost of extra verify tokens against their expected "
                 "acceptance, so it declines to trim and every request receives "
                 "the full window -- the ragged path runs but changes nothing. "
@@ -5962,6 +5963,21 @@ class TorchLlmArgs(BaseLlmArgs):
         A hard error at construction is the only signal that survives.
         """
         cuda_graph_config = self.cuda_graph_config
+        if self.guided_decoding_backend is not None:
+            raise ValueError(
+                "speculative_config.enable_ragged_verify=True does not yet "
+                "support guided decoding. Guided-decoder bitmasks are laid "
+                "out with one uniform speculative stride; applying them to "
+                "packed per-request verify windows would shift every request "
+                "after the first short window. Disable guided decoding or "
+                "disable ragged verification.")
+        if self.enable_lora or self.lora_config is not None:
+            raise ValueError(
+                "speculative_config.enable_ragged_verify=True does not yet "
+                "support LoRA. LoRA metadata expands generation requests "
+                "with one uniform speculative stride, which cannot represent "
+                "packed per-request verify windows. Disable LoRA or disable "
+                "ragged verification.")
         # `fit_ragged_verify_lens` plans against the padded row count and
         # reserves tokens for the CUDA-graph padding rows, so it presumes those
         # rows exist. With padding off, `_get_padded_batch` adds none: the batch
