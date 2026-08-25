@@ -7,19 +7,20 @@ allocation, tier derivation, SGLang decision parity, the verify-length pin,
 snapshot instruments, and reconciliation guards.
 """
 
+import hashlib
 import itertools
+import json
 
 import numpy as np
 import pytest
 import torch
 
 from tensorrt_llm._torch.speculative.dspark_planner import (
-    SpsCostTable,
-    budget_argmax_over_uniform_lens,
-    check_table_fingerprint,
-    compute_verify_token_budget,
-    derive_verify_len_tiers,
-)
+    ExactSpsCostTable, SpsCostTable, budget_argmax_over_uniform_lens,
+    check_table_fingerprint, compute_verify_token_budget,
+    derive_verify_len_tiers, load_sps_cost_table,
+    load_validated_sps_cost_table, select_exact_sps_candidate,
+    validate_sps_cost_table_payload)
 from tensorrt_llm._torch.speculative.dspark_schedule import (
     DSparkScheduleConfig,
     compute_survival,
@@ -120,28 +121,523 @@ def test_cost_table_rejects_malformed_input():
     with pytest.raises(ValueError, match="positive"):
         SpsCostTable(token_counts=(0,), step_time_ms=(0.0,))
     with pytest.raises(ValueError, match="minimum_predicted_gain"):
-        SpsCostTable(token_counts=(0,), step_time_ms=(1.0,), minimum_predicted_gain=-0.01)
+        SpsCostTable(token_counts=(0,),
+                     step_time_ms=(1.0,),
+                     minimum_predicted_gain=-0.01)
 
 
 def test_minimum_gain_guard_falls_back_to_full_budget():
     """A noise-sized compact advantage must preserve ordinary full K."""
     bs, block = 4, 5
     survival = np.ones((bs, block), dtype=np.float64)
-    full_tokens = bs * (block + 1)
     table = SpsCostTable(
-        token_counts=(2 * bs, full_tokens),
+        token_counts=(2 * bs, bs * (block + 1)),
         step_time_ms=(3.3, 10.0),
         minimum_predicted_gain=0.02,
     )
-    budget = compute_verify_token_budget(
+
+    assert compute_verify_token_budget(
         survival=survival,
         num_gen_requests=bs,
         cost_table=table,
         min_verify_len=1,
         max_verify_len=block,
         allowed_lens=[1, block],
+    ) == bs * (block - 1)
+    assert compute_verify_token_budget(
+        survival=survival,
+        num_gen_requests=bs,
+        cost_table=table,
+        min_verify_len=1,
+        max_verify_len=block,
+    ) == bs * (block - 1)
+    assert budget_argmax_over_uniform_lens(
+        survival=survival,
+        num_gen_requests=bs,
+        cost_table=table,
+        allowed_lens=[1, block],
+    ) == block
+
+
+def test_minimum_gain_threshold_edge_keeps_compact_candidate():
+    survival = np.ones((1, 2), dtype=np.float64)
+    at_threshold = SpsCostTable(
+        token_counts=(2, 3),
+        step_time_ms=(1.6, 3.0),
+        minimum_predicted_gain=0.25,
     )
-    assert budget == bs * (block - 1)
+    above_threshold = SpsCostTable(
+        token_counts=(2, 3),
+        step_time_ms=(1.6, 3.0),
+        minimum_predicted_gain=0.250001,
+    )
+
+    assert compute_verify_token_budget(
+        survival=survival,
+        num_gen_requests=1,
+        cost_table=at_threshold,
+        allowed_lens=[1, 2],
+    ) == 0
+    assert compute_verify_token_budget(
+        survival=survival,
+        num_gen_requests=1,
+        cost_table=at_threshold,
+    ) == 0
+    assert budget_argmax_over_uniform_lens(
+        survival=survival,
+        num_gen_requests=1,
+        cost_table=at_threshold,
+        allowed_lens=[1, 2],
+    ) == 1
+    assert compute_verify_token_budget(
+        survival=survival,
+        num_gen_requests=1,
+        cost_table=above_threshold,
+        allowed_lens=[1, 2],
+    ) == 1
+    assert budget_argmax_over_uniform_lens(
+        survival=survival,
+        num_gen_requests=1,
+        cost_table=above_threshold,
+        allowed_lens=[1, 2],
+    ) == 2
+
+
+def _multi_g_sps_payload():
+    fingerprint = {
+        "gpu": "B300",
+        "gpu_count": 8,
+        "gpu_snapshot_sha256": "a" * 64,
+        "global_graph_batch_sizes": [512, 1024],
+        "max_draft_len": 5,
+        "rank_local_graph_batch_sizes": [64, 128],
+        "runtime_snapshot": "runtime-v2",
+        "source_diff_sha256": "b" * 64,
+        "source_head": "23b73d8",
+        "topology": "DEP8",
+    }
+    cells = {
+        64: ((0, 352), (6.0, 5.2)),
+        128: ((0, 704, 736), (8.0, 7.0, 7.2)),
+    }
+    payload = {
+        "schema_version": 2,
+        "minimum_predicted_gain": 0.02,
+        "cost_tables": {
+            str(graph_batch_size): {
+                "token_counts": list(verifier_budgets),
+                "step_time_ms": list(step_times),
+            }
+            for graph_batch_size, (verifier_budgets, step_times) in cells.items()
+        },
+        "engine_fingerprint": fingerprint,
+        "measurements": [
+            {
+                "rank_local_graph_batch_size": graph_batch_size,
+                "rank_local_verifier_budget": verifier_budget,
+                "step_time_ms": step_time,
+                "source_result_sha256": "c" * 64,
+            }
+            for graph_batch_size, (verifier_budgets, step_times) in cells.items()
+            for verifier_budget, step_time in zip(verifier_budgets, step_times)
+        ],
+    }
+    payload["engine_fingerprint_sha256"] = hashlib.sha256(
+        json.dumps(fingerprint, sort_keys=True,
+                   separators=(",", ":")).encode()).hexdigest()
+    return payload
+
+
+def _load_test_exact(path, payload):
+    return load_validated_sps_cost_table(
+        path,
+        graph_batch_sizes=[64, 128],
+        max_draft_len=5,
+        live_engine_fingerprint=dict(payload["engine_fingerprint"]),
+    )
+
+
+def test_exact_cost_table_never_interpolates(tmp_path):
+    payload = _multi_g_sps_payload()
+    path = tmp_path / "multi-g-sps.json"
+    path.write_text(json.dumps(payload))
+
+    with pytest.raises(ValueError,
+                       match="require load_validated_sps_cost_table"):
+        load_sps_cost_table(path)
+    table, _ = load_validated_sps_cost_table(
+        path,
+        graph_batch_sizes=[64, 128],
+        max_draft_len=5,
+        live_engine_fingerprint=dict(payload["engine_fingerprint"]),
+    )
+
+    assert isinstance(table, ExactSpsCostTable)
+    assert table.minimum_predicted_gain == pytest.approx(0.02)
+    assert table.candidate_budgets(64) == (352,)
+    assert table.candidate_budgets(128) == (704, 736)
+    assert table.candidate_budgets(128,
+                                   include_native=True) == (0, 704, 736)
+    assert table.step_time(0, 128) == pytest.approx(8.0)
+    assert table.step_time(704, 128) == pytest.approx(7.0)
+    with pytest.raises(ValueError,
+                       match=r"no direct measurements for G=128, V=\[720\]"):
+        table.step_time(720, 128)
+    with pytest.raises(ValueError, match="no direct measurements for G=256"):
+        table.step_time(704, 256)
+    with pytest.raises(TypeError, match="requested verifier budget"):
+        table.step_time(704.5, 128)
+
+
+def test_exact_cost_table_rejects_fractional_programmatic_cells():
+    table = SpsCostTable(token_counts=(0, 704), step_time_ms=(8.0, 7.0))
+    with pytest.raises(TypeError, match="graph batch size"):
+        ExactSpsCostTable(tables={128.5: table}, max_draft_len=5)
+    with pytest.raises(TypeError, match="measured verifier budget"):
+        ExactSpsCostTable(
+            tables={
+                128: SpsCostTable(token_counts=(0, 704.5),
+                                  step_time_ms=(8.0, 7.0))
+            },
+            max_draft_len=5,
+        )
+    with pytest.raises(ValueError, match="V=0 native static K5"):
+        ExactSpsCostTable(
+            tables={
+                128: SpsCostTable(token_counts=(704,), step_time_ms=(7.0,))
+            },
+            max_draft_len=5,
+        )
+
+
+@pytest.mark.parametrize("invalid_budget", [127, 769])
+def test_exact_cost_table_direct_construction_bounds_positive_cells(
+        invalid_budget):
+    with pytest.raises(ValueError, match=r"G <= V <= G\*\(K\+1\)"):
+        ExactSpsCostTable(
+            tables={
+                128: SpsCostTable(token_counts=(0, invalid_budget),
+                                  step_time_ms=(8.0, 7.0))
+            },
+            max_draft_len=5,
+        )
+
+
+def test_legacy_cost_table_loader_remains_interpolating(tmp_path):
+    direct = SpsCostTable(token_counts=(0, 100),
+                          step_time_ms=(1.0, 5.0))
+    assert direct.minimum_predicted_gain == 0.0
+
+    path = tmp_path / "legacy.json"
+    path.write_text(
+        json.dumps({
+            "token_counts": [0, 100],
+            "step_time_ms": [1.0, 5.0],
+            "_meta": {
+                "lookup": "interp"
+            },
+        }))
+
+    table, _ = load_sps_cost_table(path)
+
+    assert isinstance(table, SpsCostTable)
+    assert table.step_time(50) == pytest.approx(3.0)
+    assert table.minimum_predicted_gain == pytest.approx(0.01)
+
+    path.write_text(
+        json.dumps({
+            "token_counts": [0, 100],
+            "step_time_ms": [1.0, 5.0],
+            "minimum_predicted_gain": 0.03,
+        }))
+    table, _ = load_sps_cost_table(path)
+    assert table.minimum_predicted_gain == pytest.approx(0.03)
+
+
+def test_exact_cost_table_loader_requires_schema_v2(tmp_path):
+    payload = _multi_g_sps_payload()
+    payload["schema_version"] = 1
+    path = tmp_path / "wrong-version.json"
+    path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="schema_version=2"):
+        load_validated_sps_cost_table(
+            path,
+            graph_batch_sizes=[64, 128],
+            max_draft_len=5,
+            live_engine_fingerprint=dict(payload["engine_fingerprint"]),
+        )
+
+    payload = _multi_g_sps_payload()
+    del payload["schema_version"]
+    path = tmp_path / "missing-version.json"
+    path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="schema_version=2"):
+        load_validated_sps_cost_table(
+            path,
+            graph_batch_sizes=[64, 128],
+            max_draft_len=5,
+            live_engine_fingerprint=dict(payload["engine_fingerprint"]),
+        )
+
+    payload = _multi_g_sps_payload()
+    del payload["cost_tables"]
+    path = tmp_path / "missing-tables.json"
+    path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="missing required fields: cost_tables"):
+        load_validated_sps_cost_table(
+            path,
+            graph_batch_sizes=[64, 128],
+            max_draft_len=5,
+            live_engine_fingerprint=dict(payload["engine_fingerprint"]),
+        )
+
+
+@pytest.mark.parametrize("marker", ["engine_fingerprint", "measurements"])
+def test_v2_markers_cannot_downgrade_to_legacy(tmp_path, marker):
+    exact_payload = _multi_g_sps_payload()
+    mixed_payload = {
+        "token_counts": [0, 100],
+        "step_time_ms": [1.0, 5.0],
+        marker: exact_payload[marker],
+    }
+    path = tmp_path / f"mixed-{marker}.json"
+    path.write_text(json.dumps(mixed_payload))
+
+    with pytest.raises(ValueError,
+                       match="require load_validated_sps_cost_table"):
+        load_sps_cost_table(path)
+    with pytest.raises(ValueError, match="schema_version=2"):
+        load_validated_sps_cost_table(
+            path,
+            graph_batch_sizes=[64, 128],
+            max_draft_len=5,
+            live_engine_fingerprint=dict(exact_payload["engine_fingerprint"]),
+        )
+
+
+def test_schema_v2_validation_accepts_exact_runtime_grid():
+    payload = _multi_g_sps_payload()
+
+    fingerprint = validate_sps_cost_table_payload(
+        payload,
+        graph_batch_sizes=[64, 128],
+        max_draft_len=5,
+        live_engine_fingerprint=dict(payload["engine_fingerprint"]),
+    )
+
+    assert fingerprint["source_head"] == "23b73d8"
+
+
+def test_schema_v2_validation_requires_the_runtime_graph_grid():
+    payload = _multi_g_sps_payload()
+    with pytest.raises(ValueError, match="must match exactly"):
+        validate_sps_cost_table_payload(
+            payload,
+            graph_batch_sizes=[64],
+            max_draft_len=5,
+            live_engine_fingerprint=dict(payload["engine_fingerprint"]),
+        )
+
+
+def test_schema_v2_validation_requires_independent_live_fingerprint():
+    payload = _multi_g_sps_payload()
+    with pytest.raises(ValueError, match="independently supplied"):
+        validate_sps_cost_table_payload(
+            payload,
+            graph_batch_sizes=[64, 128],
+            max_draft_len=5,
+        )
+    with pytest.raises(ValueError, match="independently of the SPS"):
+        validate_sps_cost_table_payload(
+            payload,
+            graph_batch_sizes=[64, 128],
+            max_draft_len=5,
+            live_engine_fingerprint=payload["engine_fingerprint"],
+        )
+
+
+def test_schema_v2_validation_authenticates_and_matches_fingerprint():
+    payload = _multi_g_sps_payload()
+    live = dict(payload["engine_fingerprint"])
+    payload["engine_fingerprint"]["topology"] = "TEP8"
+    with pytest.raises(ValueError, match="SHA256"):
+        validate_sps_cost_table_payload(
+            payload,
+            graph_batch_sizes=[64, 128],
+            max_draft_len=5,
+            live_engine_fingerprint=live,
+        )
+
+    payload = _multi_g_sps_payload()
+    live = dict(payload["engine_fingerprint"])
+    live["runtime_snapshot"] = "different"
+    with pytest.raises(ValueError, match="does not match active runtime"):
+        validate_sps_cost_table_payload(
+            payload,
+            graph_batch_sizes=[64, 128],
+            max_draft_len=5,
+            live_engine_fingerprint=live,
+        )
+
+
+def test_schema_v2_validation_requires_native_v0_for_every_g():
+    payload = _multi_g_sps_payload()
+    payload["cost_tables"]["128"]["token_counts"].pop(0)
+    payload["cost_tables"]["128"]["step_time_ms"].pop(0)
+    payload["measurements"] = [
+        item for item in payload["measurements"]
+        if not (item["rank_local_graph_batch_size"] == 128
+                and item["rank_local_verifier_budget"] == 0)
+    ]
+
+    with pytest.raises(ValueError, match="V=0 native static K5"):
+        validate_sps_cost_table_payload(
+            payload,
+            graph_batch_sizes=[64, 128],
+            max_draft_len=5,
+            live_engine_fingerprint=dict(payload["engine_fingerprint"]),
+        )
+
+
+@pytest.mark.parametrize("invalid_budget", [64, 784])
+def test_schema_v2_validation_bounds_positive_verifier_budgets(
+        invalid_budget):
+    payload = _multi_g_sps_payload()
+    original_budget = 704 if invalid_budget == 64 else 736
+    table_index = 1 if invalid_budget == 64 else 2
+    payload["cost_tables"]["128"]["token_counts"][
+        table_index] = invalid_budget
+    for measurement in payload["measurements"]:
+        if (measurement["rank_local_graph_batch_size"] == 128
+                and measurement["rank_local_verifier_budget"]
+                == original_budget):
+            measurement["rank_local_verifier_budget"] = invalid_budget
+
+    with pytest.raises(ValueError, match=r"G <= V <= G\*\(K\+1\)"):
+        validate_sps_cost_table_payload(
+            payload,
+            graph_batch_sizes=[64, 128],
+            max_draft_len=5,
+            live_engine_fingerprint=dict(payload["engine_fingerprint"]),
+        )
+
+
+def test_schema_v2_validation_rejects_extra_or_mismatched_provenance():
+    payload = _multi_g_sps_payload()
+    payload["cost_tables"]["128"]["token_counts"].append(752)
+    payload["cost_tables"]["128"]["step_time_ms"].append(7.4)
+    with pytest.raises(ValueError, match="cells must match exactly"):
+        validate_sps_cost_table_payload(
+            payload,
+            graph_batch_sizes=[64, 128],
+            max_draft_len=5,
+            live_engine_fingerprint=dict(payload["engine_fingerprint"]),
+        )
+
+    payload = _multi_g_sps_payload()
+    payload["measurements"][0]["step_time_ms"] += 0.1
+    with pytest.raises(ValueError, match="do not match measurement"):
+        validate_sps_cost_table_payload(
+            payload,
+            graph_batch_sizes=[64, 128],
+            max_draft_len=5,
+            live_engine_fingerprint=dict(payload["engine_fingerprint"]),
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation,message",
+    [
+        (lambda payload: payload.update({"unknown": 1}), "unknown fields"),
+        (lambda payload: payload.update({"measurements": None}), "null fields"),
+        (lambda payload: payload["cost_tables"]["128"].update(
+            {"unknown": 1}), "unknown fields"),
+        (lambda payload: payload["engine_fingerprint"].update(
+            {"unknown": 1}), "unknown fields"),
+    ],
+)
+def test_schema_v2_rejects_null_and_unknown_fields(tmp_path, mutation,
+                                                   message):
+    payload = _multi_g_sps_payload()
+    mutation(payload)
+    path = tmp_path / "invalid-shape.json"
+    path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match=message):
+        _load_test_exact(path, payload)
+
+
+@pytest.mark.parametrize(
+    "mutation,message",
+    [
+        (lambda payload: payload["cost_tables"]["128"]["token_counts"].__setitem__(
+            1, 704.0), "JSON integer"),
+        (lambda payload: payload["measurements"][1].update(
+            {"rank_local_verifier_budget": 352.5}), "JSON integer"),
+        (lambda payload: payload.update({"minimum_predicted_gain": -0.1}),
+         "non-negative and finite"),
+        (lambda payload: payload.update(
+            {"minimum_predicted_gain": float("nan")}),
+         "non-negative and finite"),
+        (lambda payload: payload["cost_tables"]["64"]["step_time_ms"].__setitem__(
+            0, 0.0), "positive and finite"),
+        (lambda payload: payload["cost_tables"]["64"]["step_time_ms"].__setitem__(
+            0, float("inf")), "positive and finite"),
+    ],
+)
+def test_schema_v2_rejects_fractional_or_invalid_numbers(tmp_path, mutation,
+                                                         message):
+    payload = _multi_g_sps_payload()
+    mutation(payload)
+    path = tmp_path / "invalid-number.json"
+    path.write_text(json.dumps(payload))
+    with pytest.raises((TypeError, ValueError), match=message):
+        _load_test_exact(path, payload)
+
+
+def test_schema_v2_rejects_fractional_graph_key(tmp_path):
+    payload = _multi_g_sps_payload()
+    payload["cost_tables"]["128.0"] = payload["cost_tables"].pop("128")
+    path = tmp_path / "fractional-g.json"
+    path.write_text(json.dumps(payload))
+    with pytest.raises(TypeError, match="canonical positive integer string"):
+        _load_test_exact(path, payload)
+
+
+def test_exact_selector_keeps_native_on_tie_or_below_threshold():
+    table = ExactSpsCostTable(
+        tables={
+            128: SpsCostTable(token_counts=(0, 704),
+                              step_time_ms=(10.0, 8.0))
+        },
+        max_draft_len=5,
+        minimum_predicted_gain=0.02,
+    )
+
+    assert select_exact_sps_candidate(
+        graph_batch_size=128,
+        native_expected_yield=10.0,
+        compact_expected_yields={704: 8.0},
+        cost_table=table,
+    ) == 0
+    assert select_exact_sps_candidate(
+        graph_batch_size=128,
+        native_expected_yield=10.0,
+        compact_expected_yields={704: 8.08},
+        cost_table=table,
+    ) == 0
+    assert select_exact_sps_candidate(
+        graph_batch_size=128,
+        native_expected_yield=10.0,
+        compact_expected_yields={704: 8.24},
+        cost_table=table,
+    ) == 704
+    with pytest.raises(ValueError, match="must not include native V=0"):
+        select_exact_sps_candidate(
+            graph_batch_size=128,
+            native_expected_yield=10.0,
+            compact_expected_yields={0: 10.0, 704: 8.24},
+            cost_table=table,
+        )
 
 
 # --------------------------------------------------------------------------
