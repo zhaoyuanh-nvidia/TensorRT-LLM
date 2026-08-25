@@ -21,10 +21,12 @@ from tensorrt_llm.llmapi.llm_args import DSparkDecodingConfig
 
 
 def _cfg(**kwargs):
-    base = dict(max_draft_len=5,
-                speculative_model="/nonexistent/model",
-                enable_confidence_scheduling=True,
-                enable_ragged_verify=True)
+    base = dict(
+        max_draft_len=5,
+        speculative_model="/nonexistent/model",
+        enable_confidence_scheduling=True,
+        enable_ragged_verify=True,
+    )
     base.update(kwargs)
     return DSparkDecodingConfig(**base)
 
@@ -56,7 +58,9 @@ def test_confidence_scheduling_without_ragged_is_rejected():
     whole drafted block (confidence scheduling off).
     """
     with pytest.raises(ValueError, match="enable_ragged_verify"):
-        DSparkDecodingConfig(max_draft_len=5,
-                             speculative_model="/nonexistent/model",
-                             enable_confidence_scheduling=True,
-                             enable_ragged_verify=False)
+        DSparkDecodingConfig(
+            max_draft_len=5,
+            speculative_model="/nonexistent/model",
+            enable_confidence_scheduling=True,
+            enable_ragged_verify=False,
+        )

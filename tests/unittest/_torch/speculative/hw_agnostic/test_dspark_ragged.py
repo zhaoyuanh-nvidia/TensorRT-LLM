@@ -21,8 +21,9 @@ import types
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.metadata import \
-    DeepseekV4TrtllmAttentionMetadata
+from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.metadata import (
+    DeepseekV4TrtllmAttentionMetadata,
+)
 from tensorrt_llm._torch.pyexecutor.llm_request import get_request_tokens_per_gen_step
 from tensorrt_llm._torch.speculative.dspark_device_select import (
     gather_packed_draft_tokens,
@@ -427,7 +428,7 @@ def test_shape_requires_bs_buckets():
 # identically -- a lone decline used to take the whole ADP group eager.
 # ---------------------------------------------------------------------------
 
-MAXLEN_BUCKETS = [16, 24, 32, 40, 48]   # padded_bs 8, tiers 1..5 -> 8*(t+1)
+MAXLEN_BUCKETS = [16, 24, 32, 40, 48]  # padded_bs 8, tiers 1..5 -> 8*(t+1)
 
 
 def _shape6(num_real, total, peers):
@@ -456,9 +457,12 @@ def test_slacky_batch_keeps_the_smallest_bucket():
     peers = [(3, 9), (6, 30), (5, 11)]
     got = _shape6(num_real=3, total=9, peers=peers)
     ungated = choose_ragged_capture_shape(
-        num_real_requests=3, total_verify_tokens=9,
-        bs_buckets=BS_BUCKETS, token_buckets=MAXLEN_BUCKETS,
-        peer_stats=peers)
+        num_real_requests=3,
+        total_verify_tokens=9,
+        bs_buckets=BS_BUCKETS,
+        token_buckets=MAXLEN_BUCKETS,
+        peer_stats=peers,
+    )
     assert got.bucket == ungated.bucket == 32
     assert got.padded_bs == ungated.padded_bs == 8
 
@@ -466,14 +470,18 @@ def test_slacky_batch_keeps_the_smallest_bucket():
 def test_group_declines_together_when_nothing_decomposes():
     """When no captured bucket works for every rank, every rank must see the
     same ValueError -- a group-consistent decline replays the uniform graph."""
-    truncated = [16, 24, 32, 40]   # top tier 48 not captured
-    peers = [(5, 30), (4, 24)]     # pinned: 40 fails (5,30), 32 fails it too
+    truncated = [16, 24, 32, 40]  # top tier 48 not captured
+    peers = [(5, 30), (4, 24)]  # pinned: 40 fails (5,30), 32 fails it too
     for r, t in peers:
         with pytest.raises(ValueError, match="decomposable by every rank"):
             choose_ragged_capture_shape(
-                num_real_requests=r, total_verify_tokens=t,
-                bs_buckets=BS_BUCKETS, token_buckets=truncated,
-                peer_stats=peers, max_verify_len=6)
+                num_real_requests=r,
+                total_verify_tokens=t,
+                bs_buckets=BS_BUCKETS,
+                token_buckets=truncated,
+                peer_stats=peers,
+                max_verify_len=6,
+            )
 
 
 def test_uniform_batch_shape_matches_the_one_dimensional_rule():
@@ -646,13 +654,12 @@ def _host_fill(lens, padded_bs, bucket, max_verify_len):
         graph_num_tokens=bucket,
         total_verify_tokens=sum(lens),
     )
-    return layout.fill_bucket(max_verify_len=max_verify_len,
-                              padded_bs=padded_bs)
+    return layout.fill_bucket(max_verify_len=max_verify_len, padded_bs=padded_bs)
 
 
 def _device_fill(lens, padded_bs, bucket, max_verify_len):
     padded = torch.ones(padded_bs, dtype=torch.int32)
-    padded[:len(lens)] = torch.tensor(lens, dtype=torch.int32)
+    padded[: len(lens)] = torch.tensor(lens, dtype=torch.int32)
     return fill_bucket_device(
         padded,
         num_real=torch.tensor(len(lens)),
@@ -663,7 +670,7 @@ def _device_fill(lens, padded_bs, bucket, max_verify_len):
 
 def _feasible(lens, padded_bs, bucket, max_verify_len):
     n_pad = padded_bs - len(lens)
-    return (sum(lens) + n_pad <= bucket <= padded_bs * max_verify_len)
+    return sum(lens) + n_pad <= bucket <= padded_bs * max_verify_len
 
 
 def _all_lens(n_real, max_verify_len):
@@ -683,8 +690,7 @@ def test_fill_parity_exhaustive_small(max_verify_len):
     for n_real in (1, 2, 3):
         for padded_bs in (n_real, n_real + 1, n_real + 3):
             for lens in _all_lens(n_real, max_verify_len):
-                for bucket in range(padded_bs,
-                                    padded_bs * max_verify_len + 1):
+                for bucket in range(padded_bs, padded_bs * max_verify_len + 1):
                     if not _feasible(lens, padded_bs, bucket, max_verify_len):
                         continue
                     host = _host_fill(lens, padded_bs, bucket, max_verify_len)
@@ -692,7 +698,8 @@ def test_fill_parity_exhaustive_small(max_verify_len):
                     assert torch.equal(dev, host.verify_lens), (
                         f"lens={lens} padded_bs={padded_bs} bucket={bucket} "
                         f"max={max_verify_len}: device {dev.tolist()} != "
-                        f"host {host.verify_lens.tolist()}")
+                        f"host {host.verify_lens.tolist()}"
+                    )
                     checked += 1
     assert checked > 100
 
@@ -704,8 +711,7 @@ def test_fill_parity_randomized_large():
     for _ in range(200):
         n_real = int(torch.randint(1, 129, (1,), generator=gen))
         padded_bs = n_real + int(torch.randint(0, 9, (1,), generator=gen))
-        lens = torch.randint(1, max_verify_len + 1, (n_real,),
-                             generator=gen).tolist()
+        lens = torch.randint(1, max_verify_len + 1, (n_real,), generator=gen).tolist()
         lo, hi = sum(lens) + (padded_bs - n_real), padded_bs * max_verify_len
         bucket = int(torch.randint(lo, hi + 1, (1,), generator=gen))
         host = _host_fill(lens, padded_bs, bucket, max_verify_len)
@@ -748,8 +754,7 @@ def test_fill_pad_fill_constrained_split():
         n_real = int(torch.randint(1, 65, (1,), generator=gen))
         n_pad = int(torch.randint(0, 9, (1,), generator=gen))
         padded_bs = n_real + n_pad
-        pad_fill = int(torch.randint(1, max_verify_len + 1, (1,),
-                                     generator=gen))
+        pad_fill = int(torch.randint(1, max_verify_len + 1, (1,), generator=gen))
         lens = torch.randint(2, max_verify_len + 1, (n_real,), generator=gen)
         lo = int(lens.sum()) + n_pad * pad_fill
         hi = n_real * max_verify_len + n_pad * pad_fill
@@ -758,11 +763,13 @@ def test_fill_pad_fill_constrained_split():
         bucket = int(torch.randint(lo, hi + 1, (1,), generator=gen))
         padded = torch.ones(padded_bs, dtype=torch.int32)
         padded[:n_real] = lens.to(torch.int32)
-        filled = fill_bucket_device(padded,
-                                    num_real=torch.tensor(n_real),
-                                    graph_num_tokens=bucket,
-                                    max_verify_len=max_verify_len,
-                                    pad_fill=pad_fill)
+        filled = fill_bucket_device(
+            padded,
+            num_real=torch.tensor(n_real),
+            graph_num_tokens=bucket,
+            max_verify_len=max_verify_len,
+            pad_fill=pad_fill,
+        )
         assert int(filled.sum()) == bucket
         assert (filled[n_real:] == pad_fill).all()
         assert (filled[:n_real] >= lens.to(torch.int32)).all()
@@ -781,13 +788,14 @@ def test_select_windows_respects_published_split():
         n_pad = int(torch.randint(0, 5, (1,), generator=gen))
         padded_bs = n_real + n_pad
         pad_len = int(torch.randint(1, max_tok + 1, (1,), generator=gen))
-        real_target = int(
-            torch.randint(n_real * 2, n_real * max_tok + 1, (1,),
-                          generator=gen))
+        real_target = int(torch.randint(n_real * 2, n_real * max_tok + 1, (1,), generator=gen))
         bucket = real_target + n_pad * pad_len
-        budget = max(0, min(int(torch.randint(0, n_real * K + 1, (1,),
-                                              generator=gen)),
-                            real_target - n_real * 2))
+        budget = max(
+            0,
+            min(
+                int(torch.randint(0, n_real * K + 1, (1,), generator=gen)), real_target - n_real * 2
+            ),
+        )
         conf = torch.randn(padded_bs + 4, K, generator=gen) * 2
         slot_idx = torch.arange(padded_bs, dtype=torch.long)
         res = select_windows_device(
@@ -819,8 +827,7 @@ def test_device_window_draft_gather_omits_anchors():
         num_real=3,
         total_draft_tokens=9,
     )
-    expected = torch.cat((next_draft[2, :5], next_draft[0, :1],
-                          next_draft[3, :3]))
+    expected = torch.cat((next_draft[2, :5], next_draft[0, :1], next_draft[3, :3]))
     assert torch.equal(packed, expected)
 
 
@@ -829,7 +836,7 @@ def test_device_window_full_capacity_needs_no_discard_slot():
     # must be omitted rather than written at the one-past-capacity index 640.
     g, k = 128, 5
     next_draft = torch.arange(g * k, dtype=torch.int32).reshape(g, k)
-    verify_lens = torch.full((g, ), k + 1, dtype=torch.int32)
+    verify_lens = torch.full((g,), k + 1, dtype=torch.int32)
     packed = gather_packed_draft_tokens(
         next_draft_tokens=next_draft,
         batch_slots=torch.arange(g),
@@ -849,14 +856,10 @@ def test_topk_tensor_budget_matches_int():
     cfg = DSparkScheduleConfig(block_size=5, min_verify_len=1)
     for _ in range(30):
         bs = int(torch.randint(1, 65, (1,), generator=gen))
-        survival = compute_survival(
-            torch.rand(bs, 5, generator=gen))
+        survival = compute_survival(torch.rand(bs, 5, generator=gen))
         for budget in (0, 1, bs, 2 * bs, bs * 4, bs * 10):
-            host = schedule_verify_lens_topk(survival=survival,
-                                             budget=budget, cfg=cfg)
-            dev = schedule_verify_lens_topk(survival=survival,
-                                            budget=torch.tensor(budget),
-                                            cfg=cfg)
+            host = schedule_verify_lens_topk(survival=survival, budget=budget, cfg=cfg)
+            dev = schedule_verify_lens_topk(survival=survival, budget=torch.tensor(budget), cfg=cfg)
             assert torch.equal(host, dev)
 
 
@@ -864,8 +867,8 @@ def test_planner_lag2_ring_and_budget_split(monkeypatch):
     """Device-window mode: the budget reads the snapshot one staging older
     (lag-2), and the shape lens spread the budget uniformly to floor + budget."""
     monkeypatch.setenv("TLLM_DSPARK_DEVICE_WINDOWS", "1")
-    from tensorrt_llm._torch.speculative.dspark_verify import \
-        DSparkVerifyPlanner
+    from tensorrt_llm._torch.speculative.dspark_verify import DSparkVerifyPlanner
+
     cfg = DSparkScheduleConfig(block_size=5, min_verify_len=1)
     planner = DSparkVerifyPlanner(cfg=cfg)
     assert planner.device_windows
@@ -900,15 +903,14 @@ def test_planner_lag2_ring_and_budget_split(monkeypatch):
 def _host_select(rows, budget, bucket, padded_bs, cfg):
     """The lag-free host reference: calibrate -> survival -> topk -> fill."""
     survival = compute_survival(torch.sigmoid(rows))
-    scheduled = schedule_verify_lens_topk(survival=survival, budget=budget,
-                                          cfg=cfg)
+    scheduled = schedule_verify_lens_topk(survival=survival, budget=budget, cfg=cfg)
     token_lens = (scheduled + 1).tolist()
     layout = RaggedVerifyLayout.from_verify_lens(
         torch.tensor(token_lens, dtype=torch.int32),
         graph_num_tokens=bucket,
-        total_verify_tokens=sum(token_lens))
-    return layout.fill_bucket(
-        max_verify_len=cfg.resolved_max_verify_len + 1, padded_bs=padded_bs)
+        total_verify_tokens=sum(token_lens),
+    )
+    return layout.fill_bucket(max_verify_len=cfg.resolved_max_verify_len + 1, padded_bs=padded_bs)
 
 
 def test_select_windows_device_matches_host_chain():
@@ -934,10 +936,12 @@ def test_select_windows_device_matches_host_chain():
         stamp[slots[stale_rows]] = 3
 
         budget = int(torch.randint(0, n_real * K, (1,), generator=gen))
-        lo = n_real * (cfg.min_verify_len + 1) + min(
-            budget, n_real * (K - cfg.min_verify_len)) + (padded_bs - n_real)
-        bucket = min(padded_bs * max_token_len,
-                     lo + int(torch.randint(0, 8, (1,), generator=gen)))
+        lo = (
+            n_real * (cfg.min_verify_len + 1)
+            + min(budget, n_real * (K - cfg.min_verify_len))
+            + (padded_bs - n_real)
+        )
+        bucket = min(padded_bs * max_token_len, lo + int(torch.randint(0, 8, (1,), generator=gen)))
 
         result = select_windows_device(
             confidence_logits=conf,
@@ -956,8 +960,7 @@ def test_select_windows_device_matches_host_chain():
         assert torch.equal(result.qo_indptr, host.qo_indptr)
         assert int(result.verify_lens.sum()) == bucket
         # Row maps must describe exactly the filled lens.
-        want_req, want_corr = build_row_maps_device(
-            host.verify_lens, graph_num_tokens=bucket)
+        want_req, want_corr = build_row_maps_device(host.verify_lens, graph_num_tokens=bucket)
         assert torch.equal(result.req_idx, want_req)
         assert torch.equal(result.kv_correction, want_corr)
 
@@ -984,15 +987,15 @@ def test_prologue_kv_pairing_matches_host_staging():
 
         # Pre-offset kv_lens must equal host-with-w staging: the indexer's
         # slot mapping and the expanded per-token extents derive from it.
-        assert torch.equal(kv_lens,
-                           (past_seen + 2 * true_lens).to(torch.int32))
+        assert torch.equal(kv_lens, (past_seen + 2 * true_lens).to(torch.int32))
 
         # In-graph correction at replay.
         effective = kv_lens + offsets
 
         # Reference: host staging directly with the true windows w.
-        want = (past_seen + 2 * true_lens).to(torch.int32) + (
-            new_tokens_lens - true_lens).to(torch.int32)
+        want = (past_seen + 2 * true_lens).to(torch.int32) + (new_tokens_lens - true_lens).to(
+            torch.int32
+        )
         assert torch.equal(effective, want)
 
 
@@ -1027,8 +1030,7 @@ _MISSING = object()
         (0, 6, 1),
     ],
 )
-def test_tokens_per_gen_step_resolves_each_request_window(
-        verify_len, runtime_tokens, expected):
+def test_tokens_per_gen_step_resolves_each_request_window(verify_len, runtime_tokens, expected):
     req = _Req()
     if verify_len is not _MISSING:
         req.py_verify_len = verify_len
@@ -1091,8 +1093,7 @@ def _dummy(nc, staged_split, seq_lens_dev, max_draft_tokens=5, cap=16):
 
 
 def _call(d, num_gen_tokens):
-    return DeepseekV4TrtllmAttentionMetadata._sync_gen_tokens_per_seq(
-        d, num_gen_tokens)
+    return DeepseekV4TrtllmAttentionMetadata._sync_gen_tokens_per_seq(d, num_gen_tokens)
 
 
 def test_vector_sources_from_seq_lens_not_host_split():
@@ -1145,8 +1146,7 @@ class _Runner:
 def test_will_pad_to_rejects_row_counts_the_ladder_cannot_reach():
     """The ragged fit must not derive a bucket grid from row counts the
     captured padding ladder cannot reach."""
-    from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
-        CUDAGraphRunner
+    from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner
 
     runner = _Runner([1, 2, 4, 8, 128, 192, 256], cfg_batch_size=256)
     will = CUDAGraphRunner.will_pad_to
@@ -1164,17 +1164,16 @@ def test_will_pad_to_rejects_row_counts_the_ladder_cannot_reach():
 def test_graph_key_uses_the_agreed_bucket_not_a_fresh_sum():
     """Every attention-DP rank must key on the same fitted bucket -- never a
     fresh re-sum of the padded batch, which can diverge across ranks."""
-    from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
-        CUDAGraphRunner
+    from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner
 
     class _R:
         spec_config = type("S", (), {"enable_ragged_verify": True})()
         agreed_ragged_bucket = None
 
     def _batch(*verify_lens):
-        return types.SimpleNamespace(generation_requests=[
-            types.SimpleNamespace(py_verify_len=v) for v in verify_lens
-        ])
+        return types.SimpleNamespace(
+            generation_requests=[types.SimpleNamespace(py_verify_len=v) for v in verify_lens]
+        )
 
     r = _R()
     get = CUDAGraphRunner._ragged_verify_bucket
@@ -1219,10 +1218,12 @@ def test_capture_publishes_the_bucket_it_shaped_the_batch_to():
     PyTorchModelEngine._set_warmup_ragged_windows(engine, batch, 24, 5)
 
     assert sum(1 + r.py_verify_len for r in requests) == 24, (
-        "the warmup batch must hit the bucket exactly")
+        "the warmup batch must hit the bucket exactly"
+    )
     assert runner.agreed_ragged_bucket == 24, (
         "capture shaped the batch to 24 tokens but did not publish it, so the "
-        "graph would be keyed as if the batch were uniform")
+        "graph would be keyed as if the batch were uniform"
+    )
 
     # A narrower bucket at the same batch size, to prove it is per-entry and
     # not set once: capture walks every tier for every batch size.
@@ -1233,5 +1234,6 @@ def test_capture_publishes_the_bucket_it_shaped_the_batch_to():
     # An empty batch publishes nothing rather than a stale or zero bucket.
     runner.agreed_ragged_bucket = None
     PyTorchModelEngine._set_warmup_ragged_windows(
-        engine, types.SimpleNamespace(generation_requests=[]), 24, 5)
+        engine, types.SimpleNamespace(generation_requests=[]), 24, 5
+    )
     assert runner.agreed_ragged_bucket is None

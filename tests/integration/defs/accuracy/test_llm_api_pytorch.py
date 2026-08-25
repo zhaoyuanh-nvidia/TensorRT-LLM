@@ -4476,10 +4476,9 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
         # There is nothing for a cost table to inform here, which is the point
         # -- this run has to be reproducible without one so it can serve as the
         # reference for the two scheduled modes.
-        spec_config = DSparkDecodingConfig(
-            max_draft_len=5,
-            speculative_model=self.MODEL_PATH,
-            enable_confidence_scheduling=False)
+        spec_config = DSparkDecodingConfig(max_draft_len=5,
+                                           speculative_model=self.MODEL_PATH,
+                                           enable_confidence_scheduling=False)
         with LLM(self.MODEL_PATH,
                  attn_backend="TRTLLM",
                  tensor_parallel_size=8,
@@ -4503,8 +4502,7 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_mpi_world_size(8)
     @parametrize_with_ids("moe_backend", ["MEGAMOE_DEEPGEMM", "TRTLLM"])
-    def test_gsm8k_dep8_ragged_verify(self, moe_backend, tmp_path,
-                                      monkeypatch):
+    def test_gsm8k_dep8_ragged_verify(self, moe_backend, tmp_path, monkeypatch):
         """Per-request verify windows, overlap scheduler on.
 
         ``enable_padding=True`` is required rather than incidental: the ragged
@@ -4531,17 +4529,16 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
         # non-flat because compact mode's production configuration contract
         # requires a measured-cost surface rather than an accidental no-op.
         sps_table_path = tmp_path / "dspark-ragged-correctness-sps.json"
-        sps_table_path.write_text(
-            json.dumps({
-                "token_counts": [1, 768],
-                "step_time_ms": [1.0, 2.0],
-                "fixed_overhead_ms": 0.0,
-                "_meta": {
-                    "lookup": "interp",
-                    "encoding": "decomposed",
-                },
-            }),
-            encoding="utf-8")
+        sps_table_path.write_text(json.dumps({
+            "token_counts": [1, 768],
+            "step_time_ms": [1.0, 2.0],
+            "fixed_overhead_ms": 0.0,
+            "_meta": {
+                "lookup": "interp",
+                "encoding": "decomposed",
+            },
+        }),
+                                  encoding="utf-8")
         spec_config = DSparkDecodingConfig(
             max_draft_len=5,
             speculative_model=self.MODEL_PATH,
@@ -4567,12 +4564,13 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
             # at a full batch. The host split may be uniform because it only
             # chooses that shape; the device-window counter below proves fresh
             # confidence re-ranked the same compact budget before replay.
-            [applied_frac] = llm._executor.collective_rpc(
-                "set_dspark_budget_frac", args=(0.5, ))
+            [applied_frac
+             ] = llm._executor.collective_rpc("set_dspark_budget_frac",
+                                              args=(0.5, ))
             assert applied_frac == pytest.approx(0.5, abs=1e-6)
             score, acc_params = self._run_gsm8k(llm)
-            [ragged_stats] = llm._executor.collective_rpc(
-                "get_dspark_ragged_stats")
+            [ragged_stats
+             ] = llm._executor.collective_rpc("get_dspark_ragged_stats")
             assert ragged_stats["device_window_steps"] > 0, ragged_stats
             assert (ragged_stats["forced_device_window_trimmed_steps"]
                     > 0), ragged_stats

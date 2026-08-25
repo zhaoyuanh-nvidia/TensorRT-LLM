@@ -32,8 +32,12 @@ import torch
 from ..._utils import prefer_pinned
 from ...logger import logger
 from .dspark_planner import SpsCostTable, compute_verify_token_budget
-from .dspark_schedule import (NEUTRAL_CONFIDENCE_LOGIT, DSparkScheduleConfig,
-                              compute_survival, schedule_verify_lens_topk)
+from .dspark_schedule import (
+    NEUTRAL_CONFIDENCE_LOGIT,
+    DSparkScheduleConfig,
+    compute_survival,
+    schedule_verify_lens_topk,
+)
 
 #: Profiling-only pin (SPS profiling / STS collection): fixes every request's
 #: verify window at this length, bypassing the planner. Not a serving knob.
@@ -142,7 +146,8 @@ class DSparkVerifyPlanner:
             raise ValueError(
                 f"{DEVICE_WINDOWS_ENV}=1 is incompatible with "
                 f"{FORCE_VERIFY_LEN_ENV}: the pin fixes host windows that "
-                f"device selection would silently override")
+                f"device selection would silently override"
+            )
         self._prev_buffer: Optional[torch.Tensor] = None
         self._prev_event: Optional[torch.cuda.Event] = None
         self._prev_stamps: Optional[torch.Tensor] = None
@@ -156,6 +161,7 @@ class DSparkVerifyPlanner:
             "fallback_no_confidence": 0,
             "fallback_short_snapshot": 0,
             "fallback_no_gen_requests": 0,
+            "fallback_full_k": 0,
             "forced_steps": 0,
         }
 
@@ -163,9 +169,12 @@ class DSparkVerifyPlanner:
     def max_tier(self) -> int:
         return self.tiers[-1] if self.tiers else self.cfg.resolved_max_verify_len
 
-    def stage_confidence(self, confidence_logits: torch.Tensor,
-                         stamps: Optional[torch.Tensor] = None,
-                         staged_seq: Optional[int] = None) -> None:
+    def stage_confidence(
+        self,
+        confidence_logits: torch.Tensor,
+        stamps: Optional[torch.Tensor] = None,
+        staged_seq: Optional[int] = None,
+    ) -> None:
         """Start a non-blocking device->host copy of the confidence buffer.
 
         ``confidence_logits`` is the worker's whole slot-indexed buffer, staged
@@ -181,12 +190,9 @@ class DSparkVerifyPlanner:
             # Rotate before overwriting: what was current becomes the older
             # (lag-2) snapshot the budget argmax reads; the old older buffer's
             # storage is reused for this staging. Pure reference swaps.
-            self._host_buffer, self._prev_buffer = (self._prev_buffer,
-                                                    self._host_buffer)
-            self._copy_event, self._prev_event = (self._prev_event,
-                                                  self._copy_event)
-            self._host_stamps, self._prev_stamps = (self._prev_stamps,
-                                                    self._host_stamps)
+            self._host_buffer, self._prev_buffer = (self._prev_buffer, self._host_buffer)
+            self._copy_event, self._prev_event = (self._prev_event, self._copy_event)
+            self._host_stamps, self._prev_stamps = (self._prev_stamps, self._host_stamps)
             self._staged_seq, self._prev_seq = self._prev_seq, self._staged_seq
             self._prev_valid = self._snapshot_valid
             self._snapshot_valid = False
@@ -200,12 +206,10 @@ class DSparkVerifyPlanner:
             self._copy_event = torch.cuda.Event()
         self._host_buffer.copy_(confidence_logits, non_blocking=True)
         if stamps is not None:
-            if (self._host_stamps is None
-                    or self._host_stamps.shape != stamps.shape):
-                self._host_stamps = torch.empty(stamps.shape,
-                                                dtype=torch.int32,
-                                                device="cpu",
-                                                pin_memory=prefer_pinned())
+            if self._host_stamps is None or self._host_stamps.shape != stamps.shape:
+                self._host_stamps = torch.empty(
+                    stamps.shape, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
+                )
             self._host_stamps.copy_(stamps, non_blocking=True)
             self._staged_seq = staged_seq
         self._copy_event.record()
@@ -230,21 +234,21 @@ class DSparkVerifyPlanner:
         try:
             value = int(raw)
         except ValueError:
-            raise ValueError(
-                f"{self._FORCE_ENV}={raw!r} is not an integer") from None
+            raise ValueError(f"{self._FORCE_ENV}={raw!r} is not an integer") from None
         lo, hi = int(self.cfg.min_verify_len), int(self.cfg.resolved_max_verify_len)
         if not lo <= value <= hi:
-            raise ValueError(
-                f"{self._FORCE_ENV}={value} outside [{lo}, {hi}]")
+            raise ValueError(f"{self._FORCE_ENV}={value} outside [{lo}, {hi}]")
         if value not in self.tiers:
             raise ValueError(
                 f"{self._FORCE_ENV}={value} is not in the captured tier ladder "
                 f"{self.tiers}; every step would fall out of CUDA-graph replay "
-                f"and the measured times would not be step costs")
+                f"and the measured times would not be step costs"
+            )
         logger.warning(
             f"DSpark: verify length PINNED to {value} by {self._FORCE_ENV}. "
             f"This bypasses the planner entirely and is a profiling mode, not a "
-            f"serving configuration.")
+            f"serving configuration."
+        )
         return value
 
     def validate_verify_len_pin(self, value: Optional[int]) -> Optional[int]:
@@ -259,7 +263,8 @@ class DSparkVerifyPlanner:
             raise ValueError(
                 f"verify-length pin {value} is not in the captured tier ladder "
                 f"{self.tiers}; every step would fall out of CUDA-graph replay "
-                f"and the measured times would not be step costs")
+                f"and the measured times would not be step costs"
+            )
         return value
 
     def _read_forced_budget_frac(self) -> Optional[float]:
@@ -269,14 +274,14 @@ class DSparkVerifyPlanner:
         try:
             value = float(raw)
         except ValueError:
-            raise ValueError(
-                f"{FORCE_BUDGET_FRAC_ENV}={raw!r} is not a float") from None
+            raise ValueError(f"{FORCE_BUDGET_FRAC_ENV}={raw!r} is not a float") from None
         value = self.validate_budget_frac(value)
         logger.warning(
             f"DSpark: verify budget FORCED to {value} of the trimmable "
             f"maximum by {FORCE_BUDGET_FRAC_ENV}. Windows still follow "
             f"confidence; this is a profiling mode, not a serving "
-            f"configuration.")
+            f"configuration."
+        )
         return value
 
     def validate_budget_frac(self, value: Optional[float]) -> Optional[float]:
@@ -307,8 +312,7 @@ class DSparkVerifyPlanner:
         what applies rather than what it asked for.
         """
         value = self.validate_budget_frac(value)
-        wire = (0 if value is None else
-                max(1, int(round(value * _FRAC_WIRE_SCALE))))
+        wire = 0 if value is None else max(1, int(round(value * _FRAC_WIRE_SCALE)))
         self._pending_budget_frac = wire
         return None if value is None else min(1.0, wire / _FRAC_WIRE_SCALE)
 
@@ -327,15 +331,15 @@ class DSparkVerifyPlanner:
         # tolerated for both rather than fixed for one.
         if self._pending_budget_frac == wire_value:
             self._pending_budget_frac = -1
-        new_frac = (None if wire_value == 0 else
-                    min(1.0, wire_value / _FRAC_WIRE_SCALE))
+        new_frac = None if wire_value == 0 else min(1.0, wire_value / _FRAC_WIRE_SCALE)
         if new_frac == self._forced_budget_frac:
             return
         self._forced_budget_frac = new_frac
         logger.warning(
             f"DSpark: verify budget fraction set to {new_frac} at runtime. "
             f"This bypasses the cost table and is a profiling mode, not a "
-            f"serving configuration.")
+            f"serving configuration."
+        )
 
     def request_verify_len_pin(self, value: Optional[int]) -> Optional[int]:
         """Queue a pin (or ``None`` to clear) for the next decode step.
@@ -373,12 +377,16 @@ class DSparkVerifyPlanner:
         logger.warning(
             f"DSpark: verify length pin set to {new_pin} at runtime. This "
             f"bypasses the planner and is a profiling mode, not a serving "
-            f"configuration.")
+            f"configuration."
+        )
 
-    def _note_snapshot_stats(self, selected: torch.Tensor,
-                             rows: Optional[Sequence[int]],
-                             stamps: Optional[torch.Tensor] = None,
-                             staged_seq: Optional[int] = None) -> None:
+    def _note_snapshot_stats(
+        self,
+        selected: torch.Tensor,
+        rows: Optional[Sequence[int]],
+        stamps: Optional[torch.Tensor] = None,
+        staged_seq: Optional[int] = None,
+    ) -> None:
         """Record snapshot-quality stats: stamp-lag histogram (staleness per
         gathered row) and neutral-row count ("unknown" rows entering the
         argmax as certainties). Observability only; never changes behaviour.
@@ -391,22 +399,17 @@ class DSparkVerifyPlanner:
             n = int(selected.shape[0])
             self.stats["snap_rows"] = self.stats.get("snap_rows", 0) + n
             neutral = int((selected >= NEUTRAL_CONFIDENCE_LOGIT - 1.0).all(dim=1).sum())
-            self.stats["snap_neutral_rows"] = (
-                self.stats.get("snap_neutral_rows", 0) + neutral)
-            if (stamps is not None and staged_seq is not None
-                    and rows is not None):
+            self.stats["snap_neutral_rows"] = self.stats.get("snap_neutral_rows", 0) + neutral
+            if stamps is not None and staged_seq is not None and rows is not None:
                 idx = torch.as_tensor(list(rows), dtype=torch.long)
                 idx = idx.clamp_(0, stamps.shape[0] - 1)
-                lags = (int(staged_seq)
-                        - stamps[idx].to(torch.int64))
+                lags = int(staged_seq) - stamps[idx].to(torch.int64)
                 hist = self.stats.setdefault("stamp_lag_hist", {})
-                for lag, cnt in zip(*[t.tolist() for t in lags.unique(
-                        return_counts=True)]):
+                for lag, cnt in zip(*[t.tolist() for t in lags.unique(return_counts=True)]):
                     key = int(max(-2, min(int(lag), 8)))
                     hist[key] = hist.get(key, 0) + int(cnt)
         except Exception as exc:  # noqa: BLE001 - instruments must not kill steps
-            self.stats["snap_stats_errors"] = (
-                self.stats.get("snap_stats_errors", 0) + 1)
+            self.stats["snap_stats_errors"] = self.stats.get("snap_stats_errors", 0) + 1
             if self.stats["snap_stats_errors"] == 1:
                 logger.warning(f"DSpark snapshot stats failed once: {exc}")
 
@@ -424,8 +427,11 @@ class DSparkVerifyPlanner:
         return self._prev_buffer
 
     def _gather_rows(
-        self, *, num_gen_requests: int, rows: Optional[Sequence[int]],
-        snapshot: Optional[torch.Tensor] = None
+        self,
+        *,
+        num_gen_requests: int,
+        rows: Optional[Sequence[int]],
+        snapshot: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
         """This step's confidence, one row per generation request, or None.
 
@@ -485,8 +491,7 @@ class DSparkVerifyPlanner:
             # The frac sweep stays honest in device mode: it replaces only the
             # argmax; the device top-k still spends the budget for real.
             budget = int(round(self._forced_budget_frac * n * trimmable))
-            self.stats["forced_budget_steps"] = (
-                self.stats.get("forced_budget_steps", 0) + 1)
+            self.stats["forced_budget_steps"] = self.stats.get("forced_budget_steps", 0) + 1
         else:
             if self.cost_table is None or self.cost_table.is_flat:
                 self.stats["fallback_flat_cost"] += 1
@@ -495,13 +500,12 @@ class DSparkVerifyPlanner:
             if snapshot is None:
                 self.stats["fallback_no_snapshot"] += 1
                 return None
-            selected = self._gather_rows(num_gen_requests=n, rows=rows,
-                                         snapshot=snapshot)
+            selected = self._gather_rows(num_gen_requests=n, rows=rows, snapshot=snapshot)
             if selected is None:
                 return None
-            self._note_snapshot_stats(selected, rows,
-                                      stamps=self._prev_stamps,
-                                      staged_seq=self._prev_seq)
+            self._note_snapshot_stats(
+                selected, rows, stamps=self._prev_stamps, staged_seq=self._prev_seq
+            )
             survival = compute_survival(self.apply_calibration(selected))
             budget = compute_verify_token_budget(
                 survival=survival.numpy().astype(np.float64),
@@ -511,19 +515,29 @@ class DSparkVerifyPlanner:
                 max_verify_len=self.cfg.resolved_max_verify_len,
                 allowed_lens=self.tiers,
             )
+            full_budget = n * trimmable
+            if int(budget) >= full_budget:
+                # The full tier is not a ragged schedule. Returning None
+                # preserves the ordinary static-K executor path instead of
+                # paying packing, metadata, and device-window overhead to
+                # replay an equivalent full-token graph.
+                self.stats["fallback_full_k"] += 1
+                return None
             floor_tokens = n * (self.cfg.min_verify_len + 1)
-            predicted = float(self.cost_table.step_times(
-                np.asarray([floor_tokens + int(budget)]), n)[0])
+            predicted = float(
+                self.cost_table.step_times(np.asarray([floor_tokens + int(budget)]), n)[0]
+            )
             self.last_predicted_step_ms = predicted
-            self.stats["predicted_ms_sum"] = (
-                self.stats.get("predicted_ms_sum", 0.0) + predicted)
-            self.stats["predicted_steps"] = (
-                self.stats.get("predicted_steps", 0) + 1)
+            self.stats["predicted_ms_sum"] = self.stats.get("predicted_ms_sum", 0.0) + predicted
+            self.stats["predicted_steps"] = self.stats.get("predicted_steps", 0) + 1
         budget = max(0, min(int(budget), n * trimmable))
         base, extra = divmod(budget, n)
         shape_lens = [
-            min(self.cfg.min_verify_len + base + (1 if i < extra else 0),
-                self.cfg.resolved_max_verify_len) for i in range(n)
+            min(
+                self.cfg.min_verify_len + base + (1 if i < extra else 0),
+                self.cfg.resolved_max_verify_len,
+            )
+            for i in range(n)
         ]
         return budget, shape_lens
 
@@ -559,15 +573,14 @@ class DSparkVerifyPlanner:
             # cap-accept this measures a schedule's true acceptance cost --
             # execution stays full-block, the window is only an accounting
             # cap -- so two budgets can be compared with identical compute.
-            selected = self._gather_rows(num_gen_requests=num_gen_requests,
-                                         rows=rows)
+            selected = self._gather_rows(num_gen_requests=num_gen_requests, rows=rows)
             if selected is None:
                 return None
             self._note_snapshot_stats(selected, rows)
             survival = compute_survival(self.apply_calibration(selected))
-            lens = schedule_verify_lens_topk(survival=survival,
-                                             budget=int(budget_override),
-                                             cfg=self.cfg).tolist()
+            lens = schedule_verify_lens_topk(
+                survival=survival, budget=int(budget_override), cfg=self.cfg
+            ).tolist()
         elif self._forced_verify_len is not None:
             # Must stay ahead of the cost-table gate (the profiler runs without
             # a table) and must set `lens` rather than return, so the pinned
@@ -579,20 +592,17 @@ class DSparkVerifyPlanner:
             # table gets built). Unlike the pin, the windows stay real: the
             # forced fraction only replaces the argmax'd budget, and the
             # confidence top-k spends it exactly as in production.
-            selected = self._gather_rows(num_gen_requests=num_gen_requests,
-                                         rows=rows)
+            selected = self._gather_rows(num_gen_requests=num_gen_requests, rows=rows)
             if selected is None:
                 return None
             self._note_snapshot_stats(selected, rows)
             survival = compute_survival(self.apply_calibration(selected))
-            trimmable = (self.cfg.resolved_max_verify_len
-                         - self.cfg.min_verify_len)
-            budget = int(round(self._forced_budget_frac
-                               * int(num_gen_requests) * trimmable))
-            self.stats["forced_budget_steps"] = (
-                self.stats.get("forced_budget_steps", 0) + 1)
-            lens = schedule_verify_lens_topk(survival=survival, budget=budget,
-                                             cfg=self.cfg).tolist()
+            trimmable = self.cfg.resolved_max_verify_len - self.cfg.min_verify_len
+            budget = int(round(self._forced_budget_frac * int(num_gen_requests) * trimmable))
+            self.stats["forced_budget_steps"] = self.stats.get("forced_budget_steps", 0) + 1
+            lens = schedule_verify_lens_topk(
+                survival=survival, budget=budget, cfg=self.cfg
+            ).tolist()
         else:
             if self.cost_table is None or self.cost_table.is_flat:
                 self.stats["fallback_flat_cost"] += 1
@@ -616,19 +626,30 @@ class DSparkVerifyPlanner:
                 # bucket, pushing a budget chosen below a cost riser back over it.
                 allowed_lens=self.tiers,
             )
+            full_budget = int(num_gen_requests) * (
+                self.cfg.resolved_max_verify_len - self.cfg.min_verify_len
+            )
+            if int(budget) >= full_budget:
+                # Full K must use the native uniform path. The explicit
+                # profiling overrides above intentionally bypass this gate so
+                # forced-full-through-ragged remains measurable as a control.
+                self.stats["fallback_full_k"] += 1
+                return None
             # Predicted step cost, recorded so runs can be reconciled against
             # measured hostStepTimeMS; a systematic gap flags a wrong or
             # mismatched cost table.
             floor_tokens = int(num_gen_requests) * (self.cfg.min_verify_len + 1)
-            predicted = float(self.cost_table.step_times(
-                np.asarray([floor_tokens + int(budget)]),
-                int(num_gen_requests))[0])
+            predicted = float(
+                self.cost_table.step_times(
+                    np.asarray([floor_tokens + int(budget)]), int(num_gen_requests)
+                )[0]
+            )
             self.last_predicted_step_ms = predicted
-            self.stats["predicted_ms_sum"] = (
-                self.stats.get("predicted_ms_sum", 0.0) + predicted)
-            self.stats["predicted_steps"] = (
-                self.stats.get("predicted_steps", 0) + 1)
-            lens = schedule_verify_lens_topk(survival=survival, budget=budget, cfg=self.cfg).tolist()
+            self.stats["predicted_ms_sum"] = self.stats.get("predicted_ms_sum", 0.0) + predicted
+            self.stats["predicted_steps"] = self.stats.get("predicted_steps", 0) + 1
+            lens = schedule_verify_lens_topk(
+                survival=survival, budget=budget, cfg=self.cfg
+            ).tolist()
             # Local decision histograms, recorded before the bucket fit widens
             # the realized windows (verify_len_hist is post-fit).
             rung = self.cfg.min_verify_len + int(budget) // max(int(num_gen_requests), 1)
