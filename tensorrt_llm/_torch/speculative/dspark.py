@@ -446,7 +446,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
         """
         import json
 
-        from .dspark_planner import SpsCostTable
+        from .dspark_planner import SpsCostTable, _is_exact_sps_payload
         from .dspark_schedule import DSparkScheduleConfig
         from .dspark_verify import DSparkVerifyPlanner
 
@@ -457,42 +457,51 @@ class DSv4DSparkWorker(SpecWorkerBase):
         if table_path:
             with open(table_path, encoding="utf-8") as f:
                 raw = json.load(f)
-            # The overhead fields are optional but not cosmetic: omitting them
-            # asserts ``step_time_ms`` already measures whole steps at the
-            # deployment's batch size.
-            from .dspark_planner import check_table_fingerprint
+            if _is_exact_sps_payload(raw):
+                # ModelEngine validates schema-v2 against the independently
+                # supplied live fingerprint before graph capture, because it
+                # owns the actual CUDA graph ladder. PyExecutor installs that
+                # validated object on this planner before the first decision.
+                cost_table = None
+                logger.info(
+                    f"DSpark: deferring exact SPS table {table_path} to the "
+                    "validated ModelEngine runtime table")
+            else:
+                # The overhead fields are optional but not cosmetic: omitting them
+                # asserts ``step_time_ms`` already measures whole steps at the
+                # deployment's batch size.
+                from .dspark_planner import check_table_fingerprint
 
-            if (raw.get("_meta") or {}).get("lookup") != "interp":
-                logger.warning(
-                    f"DSpark cost table {table_path} carries no "
-                    f"lookup='interp' marker: it may predate the "
-                    f"interpolating consumer. Tables written for the old "
-                    f"floor lookup dropped shelf-closing breakpoints on "
-                    f"purpose, and interpolating across those gaps re-bills "
-                    f"every mid-shelf total upward. Re-emit the table with a "
-                    f"current profiler if trimming behaves oddly."
+                if (raw.get("_meta") or {}).get("lookup") != "interp":
+                    logger.warning(
+                        f"DSpark cost table {table_path} carries no "
+                        f"lookup='interp' marker: it may predate the "
+                        f"interpolating consumer. Tables written for the old "
+                        f"floor lookup dropped shelf-closing breakpoints on "
+                        f"purpose, and interpolating across those gaps re-bills "
+                        f"every mid-shelf total upward. Re-emit the table with a "
+                        f"current profiler if trimming behaves oddly.")
+                check_table_fingerprint(
+                    payload=raw,
+                    live={
+                        "tp": int(self.mapping.tp_size),
+                        "ep": int(self.mapping.moe_ep_size),
+                        "attention_dp": bool(self.mapping.enable_attention_dp),
+                        "block": int(block_size),
+                        "max_batch_size": int(max_batch),
+                        # moe_backend deliberately absent: a wrong live value would
+                        # false-reject a correct table; the table's value surfaces on
+                        # the "check manually" INFO line instead.
+                    },
                 )
-            check_table_fingerprint(
-                payload=raw,
-                live={
-                    "tp": int(self.mapping.tp_size),
-                    "ep": int(self.mapping.moe_ep_size),
-                    "attention_dp": bool(self.mapping.enable_attention_dp),
-                    "block": int(block_size),
-                    "max_batch_size": int(max_batch),
-                    # moe_backend deliberately absent: a wrong live value would
-                    # false-reject a correct table; the table's value surfaces on
-                    # the "check manually" INFO line instead.
-                },
-            )
-            cost_table = SpsCostTable(
-                token_counts=[int(v) for v in raw["token_counts"]],
-                step_time_ms=[float(v) for v in raw["step_time_ms"]],
-                fixed_overhead_ms=float(raw.get("fixed_overhead_ms", 0.0)),
-                batch_sizes=[int(v) for v in raw.get("batch_sizes", [])],
-                batch_overhead_ms=[float(v) for v in raw.get("batch_overhead_ms", [])],
-                minimum_predicted_gain=float(raw.get("minimum_predicted_gain", 0.01)),
-            )
+                cost_table = SpsCostTable(
+                    token_counts=[int(v) for v in raw["token_counts"]],
+                    step_time_ms=[float(v) for v in raw["step_time_ms"]],
+                    fixed_overhead_ms=float(raw.get("fixed_overhead_ms", 0.0)),
+                    batch_sizes=[int(v) for v in raw.get("batch_sizes", [])],
+                    batch_overhead_ms=[float(v) for v in raw.get("batch_overhead_ms", [])],
+                    minimum_predicted_gain=float(raw.get("minimum_predicted_gain", 0.01)),
+                )
         else:
             # Flat = "unprofiled": the planner keeps verifying the full block
             # rather than trimming on a cost model where every token is free.
@@ -595,10 +604,11 @@ class DSv4DSparkWorker(SpecWorkerBase):
         self.ragged_stats.planner_stats = self.verify_planner.stats
         logger.info(
             f"DSpark verify planner: tiers={self.verify_planner.tiers}, "
-            f"profiled_cost_table={not cost_table.is_flat}, "
+            f"profiled_cost_table={cost_table is None or not cost_table.is_flat}, "
             f"ragged_verify_mode={self.ragged_verify_mode.value}"
         )
-        if self.ragged_verify_mode.trims_submitted_tokens and cost_table.is_flat:
+        if (self.ragged_verify_mode.trims_submitted_tokens
+                and cost_table is not None and cost_table.is_flat):
             logger.warning(
                 "DSpark ragged verify is set to 'compact' but the cost table is "
                 "flat, so the planner's budget degenerates to verify-all and "
