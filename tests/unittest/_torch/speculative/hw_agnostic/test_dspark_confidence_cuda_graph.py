@@ -464,7 +464,9 @@ def test_native_uniform_adp_route_is_finalized_after_full_k_reservation():
         dspark_confidence_engine_generation=17,
     )
     graph_runner = SimpleNamespace(
-        confidence_native_uniform_adp_agreed_route=(99, 99, 5, 99))
+        confidence_native_uniform_adp_agreed_route=(99, 99, 5, 99),
+        _round_up_batch_size=Mock(return_value=2),
+    )
     executor = object.__new__(PyExecutor)
     executor.model_engine = SimpleNamespace(
         spec_config=config,
@@ -484,13 +486,14 @@ def test_native_uniform_adp_route_is_finalized_after_full_k_reservation():
 
     can_queue, can_queue_this_rank = PyExecutor._can_queue(executor, batch)
     assert can_queue and can_queue_this_rank
-    ready_event.query.assert_called_once_with()
+    ready_event.query.assert_not_called()
+    executor.dist.tp_allgather.assert_called_once_with(2)
 
     PyExecutor._handle_dynamic_draft_len(executor, batch)
     reserved_lengths = [len(request.py_draft_tokens) for request in requests]
     assert reserved_lengths == [5, 5]
     assert executor.model_engine.runtime_draft_len == 5
-    ready_event.query.assert_called_once_with()
+    ready_event.query.assert_not_called()
 
     selected = PyExecutor._finalize_dspark_native_uniform_draft_len(
         executor, batch)
@@ -502,13 +505,16 @@ def test_native_uniform_adp_route_is_finalized_after_full_k_reservation():
         2, 7, 4, 2)
     ready_event.query.assert_called_once_with()
     ready_event.synchronize.assert_not_called()
-    executor.dist.tp_allgather.assert_called_once_with([2, True, 4, 2, 7])
+    assert executor.dist.tp_allgather.call_count == 2
+    assert executor.dist.tp_allgather.call_args_list[1].args[0] == [
+        True, 4, 2, 7
+    ]
 
     # A connector can recheck the same ScheduledRequests object after route
     # resolution. Preserve the ordinary queue collective without reading or
     # publishing a second route vote for the already-consumed iteration.
     assert PyExecutor._can_queue(executor, batch) == (True, True)
-    assert executor.dist.tp_allgather.call_count == 2
+    assert executor.dist.tp_allgather.call_count == 3
     assert executor.dist.tp_allgather.call_args.args[0] == 2
     ready_event.query.assert_called_once_with()
     ready_event.synchronize.assert_not_called()
@@ -539,7 +545,9 @@ def test_native_uniform_adp_route_not_ready_falls_back_without_wait():
         dspark_confidence_engine_generation=17,
     )
     graph_runner = SimpleNamespace(
-        confidence_native_uniform_adp_agreed_route=(99, 99, 5, 99))
+        confidence_native_uniform_adp_agreed_route=(99, 99, 5, 99),
+        _round_up_batch_size=Mock(return_value=2),
+    )
     executor = object.__new__(PyExecutor)
     executor.model_engine = SimpleNamespace(
         spec_config=config,
@@ -568,7 +576,215 @@ def test_native_uniform_adp_route_not_ready_falls_back_without_wait():
     assert graph_runner.confidence_native_uniform_adp_agreed_route is None
     ready_event.query.assert_called_once_with()
     ready_event.synchronize.assert_not_called()
-    executor.dist.tp_allgather.assert_called_once_with([2, False, 5, 0, 0])
+    assert executor.dist.tp_allgather.call_count == 2
+    assert executor.dist.tp_allgather.call_args_list[0].args[0] == 2
+    assert executor.dist.tp_allgather.call_args_list[1].args[0] == [
+        False, 5, 0, 0
+    ]
+
+
+def test_native_uniform_adp_unconfigured_tail_graph_skips_route_collective():
+    config = DSparkDecodingConfig(
+        max_draft_len=5,
+        speculative_model="/tmp/dummy_model",
+        confidence_mode="dynamic_budget",
+        confidence_native_uniform=True,
+        confidence_verifier_token_budget_tiers={128: [640, 768]},
+        confidence_sps_cost_table_path="/tmp/dummy-sps.json",
+    )
+    requests = [request_stub(1, 4, 0), request_stub(2, 4, 1)]
+    batch = ScheduledRequests()
+    batch.generation_requests = requests
+    ready_event = Mock()
+    ready_event.query.return_value = True
+    previous_device = SimpleNamespace(
+        dspark_confidence_native_uniform=True,
+        dspark_confidence_native_uniform_ready_event=ready_event,
+        dspark_confidence_native_uniform_draft_len_host=torch.tensor(4),
+        dspark_confidence_execution_batch_size=32,
+        dspark_confidence_route_epoch=7,
+        dspark_confidence_engine_generation=17,
+    )
+    graph_runner = SimpleNamespace(
+        confidence_native_uniform_adp_agreed_route=(99, 99, 5, 99),
+        _round_up_batch_size=Mock(return_value=32),
+    )
+    executor = object.__new__(PyExecutor)
+    executor.model_engine = SimpleNamespace(
+        spec_config=config,
+        max_draft_len=5,
+        _dspark_confidence_engine_generation=17,
+        cuda_graph_runner=graph_runner,
+    )
+    executor.disable_overlap_scheduler = False
+    executor.enable_attention_dp = True
+    executor.previous_batch = SimpleNamespace(
+        sample_state=SimpleNamespace(device=previous_device))
+    executor.speculation_permanently_disabled = False
+    executor.dist = Mock()
+    executor.dist.tp_allgather.side_effect = lambda payload: [payload] * 2
+    executor._dspark_native_uniform_adp_route_vote = None
+    executor._dspark_native_uniform_adp_route_eligibility = None
+    executor._dspark_native_route_counts = None
+
+    assert PyExecutor._can_queue(executor, batch) == (True, True)
+    PyExecutor._handle_dynamic_draft_len(executor, batch)
+    selected = PyExecutor._finalize_dspark_native_uniform_draft_len(
+        executor, batch)
+
+    assert selected == 5
+    assert executor.model_engine.runtime_draft_len == 5
+    assert graph_runner.confidence_native_uniform_adp_agreed_route is None
+    ready_event.query.assert_not_called()
+    executor.dist.tp_allgather.assert_called_once_with(2)
+    assert executor._dspark_native_uniform_adp_route_vote[5] == (
+        "unconfigured_graph_bypass")
+
+
+def test_native_uniform_adp_asymmetric_peers_use_common_max_graph():
+    config = DSparkDecodingConfig(
+        max_draft_len=5,
+        speculative_model="/tmp/dummy_model",
+        confidence_mode="dynamic_budget",
+        confidence_native_uniform=True,
+        confidence_verifier_token_budget_tiers={128: [640, 768]},
+        confidence_sps_cost_table_path="/tmp/dummy-sps.json",
+    )
+    requests = [request_stub(1, 4, 0), request_stub(2, 4, 1)]
+    batch = ScheduledRequests()
+    batch.generation_requests = requests
+    ready_event = Mock()
+    ready_event.query.return_value = True
+    previous_device = SimpleNamespace(
+        dspark_confidence_native_uniform=True,
+        dspark_confidence_native_uniform_ready_event=ready_event,
+        dspark_confidence_native_uniform_draft_len_host=torch.tensor(4),
+        dspark_confidence_execution_batch_size=128,
+        dspark_confidence_route_epoch=7,
+        dspark_confidence_engine_generation=17,
+    )
+    graph_runner = SimpleNamespace(
+        confidence_native_uniform_adp_agreed_route=(99, 99, 5, 99),
+        _round_up_batch_size=Mock(return_value=128),
+    )
+    executor = object.__new__(PyExecutor)
+    executor.model_engine = SimpleNamespace(
+        spec_config=config,
+        max_draft_len=5,
+        _dspark_confidence_engine_generation=17,
+        cuda_graph_runner=graph_runner,
+    )
+    executor.disable_overlap_scheduler = False
+    executor.enable_attention_dp = True
+    executor.previous_batch = SimpleNamespace(
+        sample_state=SimpleNamespace(device=previous_device))
+    executor.speculation_permanently_disabled = False
+    executor.dist = Mock()
+
+    def allgather(payload):
+        return [payload] * 2 if isinstance(payload, list) else [2, 100]
+
+    executor.dist.tp_allgather.side_effect = allgather
+    executor._dspark_native_uniform_adp_route_vote = None
+    executor._dspark_native_uniform_adp_route_eligibility = None
+    executor._dspark_native_route_counts = None
+
+    assert PyExecutor._can_queue(executor, batch) == (True, True)
+    PyExecutor._handle_dynamic_draft_len(executor, batch)
+    selected = PyExecutor._finalize_dspark_native_uniform_draft_len(
+        executor, batch)
+
+    assert selected == 4
+    assert graph_runner.confidence_native_uniform_adp_agreed_route == (
+        128, 7, 4, 2)
+    ready_event.query.assert_called_once_with()
+    assert executor.dist.tp_allgather.call_count == 2
+    assert executor.dist.tp_allgather.call_args_list[0].args[0] == 2
+    assert executor.dist.tp_allgather.call_args_list[1].args[0] == [
+        True, 4, 128, 7
+    ]
+
+
+def test_native_uniform_adp_context_peer_bypasses_route_symmetrically():
+    config = DSparkDecodingConfig(
+        max_draft_len=5,
+        speculative_model="/tmp/dummy_model",
+        confidence_mode="dynamic_budget",
+        confidence_native_uniform=True,
+        confidence_verifier_token_budget_tiers={128: [640, 768]},
+        confidence_sps_cost_table_path="/tmp/dummy-sps.json",
+    )
+    requests = [request_stub(1, 4, 0), request_stub(2, 4, 1)]
+    batch = ScheduledRequests()
+    batch.generation_requests = requests
+    batch.context_requests_chunking = [SimpleNamespace()]
+    ready_event = Mock()
+    previous_device = SimpleNamespace(
+        dspark_confidence_native_uniform=True,
+        dspark_confidence_native_uniform_ready_event=ready_event,
+        dspark_confidence_native_uniform_draft_len_host=torch.tensor(4),
+        dspark_confidence_execution_batch_size=128,
+        dspark_confidence_route_epoch=7,
+        dspark_confidence_engine_generation=17,
+    )
+    graph_runner = SimpleNamespace(
+        confidence_native_uniform_adp_agreed_route=(99, 99, 5, 99),
+        _round_up_batch_size=Mock(return_value=128),
+    )
+    executor = object.__new__(PyExecutor)
+    executor.model_engine = SimpleNamespace(
+        spec_config=config,
+        max_draft_len=5,
+        _dspark_confidence_engine_generation=17,
+        cuda_graph_runner=graph_runner,
+    )
+    executor.disable_overlap_scheduler = False
+    executor.enable_attention_dp = True
+    executor.previous_batch = SimpleNamespace(
+        sample_state=SimpleNamespace(device=previous_device))
+    executor.dist = Mock()
+    executor.dist.tp_allgather.return_value = [-3, 2]
+    executor._dspark_native_uniform_adp_route_vote = None
+    executor._dspark_native_uniform_adp_route_eligibility = None
+    executor._dspark_native_route_counts = None
+
+    assert PyExecutor._can_queue(executor, batch) == (True, True)
+    selected = PyExecutor._finalize_dspark_native_uniform_draft_len(
+        executor, batch)
+
+    assert selected == 5
+    assert graph_runner.confidence_native_uniform_adp_agreed_route is None
+    ready_event.query.assert_not_called()
+    graph_runner._round_up_batch_size.assert_not_called()
+    executor.dist.tp_allgather.assert_called_once_with(-3)
+    assert executor._dspark_native_uniform_adp_route_vote[5] == (
+        "context_bypass")
+
+
+def test_static_adp_admission_keeps_plain_scalar_collective():
+    batch = ScheduledRequests()
+    batch.generation_requests = [
+        request_stub(1, 5, 0),
+        request_stub(2, 5, 1),
+    ]
+    graph_runner = SimpleNamespace(
+        _round_up_batch_size=Mock(return_value=128))
+    executor = object.__new__(PyExecutor)
+    executor.model_engine = SimpleNamespace(
+        spec_config=SimpleNamespace(
+            is_native_uniform_confidence_enabled=False),
+        cuda_graph_runner=graph_runner,
+    )
+    executor.enable_attention_dp = True
+    executor.dist = Mock()
+    executor.dist.tp_allgather.return_value = [2, 2]
+    executor._dspark_native_uniform_adp_route_eligibility = object()
+
+    assert PyExecutor._can_queue(executor, batch) == (True, True)
+
+    executor.dist.tp_allgather.assert_called_once_with(2)
+    graph_runner._round_up_batch_size.assert_not_called()
+    assert executor._dspark_native_uniform_adp_route_eligibility is None
 
 
 @pytest.mark.parametrize("native_uniform", [False, True])
@@ -654,6 +870,7 @@ def test_native_uniform_route_trace_flushes_rank_local_counts(tmp_path):
     executor = object.__new__(PyExecutor)
     executor._dspark_native_route_trace_dir = str(tmp_path)
     executor._dspark_native_route_counts = {}
+    executor._dspark_native_route_source_counts = {}
     executor.global_rank = 3
     executor.dist = SimpleNamespace(tp_rank=3)
 
@@ -663,6 +880,7 @@ def test_native_uniform_route_trace_flushes_rank_local_counts(tmp_path):
         runtime_draft_len=4,
         execution_batch_size=128,
         real_request_count=127,
+        route_source="current",
     )
     PyExecutor._record_dspark_native_route(
         executor,
@@ -670,6 +888,7 @@ def test_native_uniform_route_trace_flushes_rank_local_counts(tmp_path):
         runtime_draft_len=4,
         execution_batch_size=128,
         real_request_count=127,
+        route_source="current",
     )
     PyExecutor._record_dspark_native_route(
         executor,
@@ -677,6 +896,7 @@ def test_native_uniform_route_trace_flushes_rank_local_counts(tmp_path):
         runtime_draft_len=5,
         execution_batch_size=0,
         real_request_count=2,
+        route_source="fallback",
     )
 
     PyExecutor._flush_dspark_native_route_trace(executor)
@@ -704,7 +924,26 @@ def test_native_uniform_route_trace_flushes_rank_local_counts(tmp_path):
             },
         ],
     }
+    source_payload = json.loads(
+        (tmp_path / "rank-3-sources.json").read_text())
+    assert source_payload == {
+        "schema": "dspark-native-uniform-route-source-trace-v1",
+        "global_rank": 3,
+        "tp_rank": 3,
+        "recorded_iterations": 3,
+        "sources": [
+            {
+                "source": "current",
+                "iterations": 2,
+            },
+            {
+                "source": "fallback",
+                "iterations": 1,
+            },
+        ],
+    }
     assert executor._dspark_native_route_counts is None
+    assert executor._dspark_native_route_source_counts is None
 
 
 def test_native_uniform_asymmetric_host_route_falls_back_to_full_k():

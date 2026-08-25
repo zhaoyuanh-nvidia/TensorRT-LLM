@@ -937,11 +937,19 @@ class PyExecutor:
             if native_route_trace_dir else None)
         self._dspark_native_route_counts = (
             {} if self._dspark_native_route_trace_dir is not None else None)
+        self._dspark_native_route_source_counts = (
+            {} if self._dspark_native_route_trace_dir is not None else None)
         # Native uniform routing is finalized only after full-K resources have
         # been reserved. Keep the exact ScheduledRequests object beside the
-        # result so a connector's second _can_queue call cannot publish a
-        # duplicate or stale route vote.
+        # result so duplicate finalization cannot publish a stale route vote.
         self._dspark_native_uniform_adp_route_vote = None
+        # Admission already gathers one scalar batch size per attention-DP
+        # rank. Reuse that collective to prove whether every rank will execute
+        # the same graph size and that the graph owns a native K-1/K ladder.
+        # Tail graphs without a ladder can then stay on ordinary full K without
+        # querying confidence or issuing a second collective.
+        self._dspark_native_uniform_adp_route_eligibility = None
+        self._dspark_native_uniform_route_source = "fallback"
         # Most overlap iterations queue their next proposal before the current
         # confidence scalar reaches host.  Retain the newest scalar consumed by
         # the sampler's ordinary wait as a one-iteration-delayed predictor.
@@ -3472,10 +3480,13 @@ class PyExecutor:
             self, scheduled_batch: ScheduledRequests
     ) -> Optional[Tuple[bool, int, int, int]]:
         """Read and validate this rank's iteration-owned K-1/K route."""
+        self._dspark_native_uniform_route_source = "disabled"
         spec_config = getattr(self.model_engine, "spec_config", None)
         if (spec_config is None or not getattr(
                 spec_config, "is_native_uniform_confidence_enabled", False)):
             return None
+
+        self._dspark_native_uniform_route_source = "fallback"
 
         max_draft_len = int(self.model_engine.max_draft_len)
         generation_requests = scheduled_batch.generation_requests
@@ -3530,6 +3541,7 @@ class PyExecutor:
             )
             if (ready_event is not None and selected_host is not None
                     and ready_event.query()):
+                self._dspark_native_uniform_route_source = "current"
                 candidate = int(selected_host)
                 route_g = device_route_g
                 route_epoch = device_route_epoch
@@ -3550,6 +3562,7 @@ class PyExecutor:
             delayed_route = getattr(
                 self, "_dspark_native_uniform_delayed_route", None)
             if delayed_route is not None:
+                self._dspark_native_uniform_route_source = "delayed"
                 (candidate, source_g, source_epoch,
                  source_engine_generation) = delayed_route
                 route_g = device_route_g
@@ -3590,6 +3603,7 @@ class PyExecutor:
             carried_route_present = any(
                 value is not None for value in (*route_batches, *route_epochs))
             if carried_route_present:
+                self._dspark_native_uniform_route_source = "request_carried"
                 if (len(effective_lens) == len(route_batches) ==
                         len(route_epochs) == 1):
                     candidate_value = next(iter(effective_lens))
@@ -3639,10 +3653,11 @@ class PyExecutor:
         proposal block. The full proposal block stays on device for either
         route. Normal executor loops apply it only after resource preparation
         has conservatively reserved physical full K. Attention-DP executors
-        resolve and cache the route nonblocking in the mandatory queue
-        all-gather, then apply the cached result at that late point. Direct or
-        nonstandard callers retain a dedicated nonblocking agreement fallback.
-        Any incomplete or asymmetric route falls back to physical full K.
+        query the nonblocking confidence event only at that late point and then
+        perform rank agreement. This gives the current iteration-owned scalar
+        useful CPU-side preparation time to arrive while preserving the full-K
+        reservation invariant. Any incomplete or asymmetric route falls back
+        to physical full K.
         """
         spec_config = getattr(self.model_engine, "spec_config", None)
         if (spec_config is None or not getattr(
@@ -3653,25 +3668,44 @@ class PyExecutor:
         generation_requests = scheduled_batch.generation_requests
         real_requests = [request for request in generation_requests
                          if not request.is_dummy]
+        graph_runner = getattr(self.model_engine, "cuda_graph_runner", None)
         cached_vote = getattr(
             self, "_dspark_native_uniform_adp_route_vote", None)
         if cached_vote is not None and cached_vote[0] is scheduled_batch:
-            route_valid, candidate, route_g, route_epoch = cached_vote[1:]
+            route_valid, candidate, route_g, route_epoch = cached_vote[1:5]
+            route_source = (
+                str(cached_vote[5]) if len(cached_vote) > 5 else "cached")
         else:
-            local_route = self._get_dspark_native_uniform_local_route(
-                scheduled_batch)
-            if local_route is None:
-                return None
-            route_valid, candidate, route_g, route_epoch = local_route
-            if self.enable_attention_dp:
-                rank_routes = list(self.dist.tp_allgather(list(local_route)))
-                route_valid, candidate, route_g, route_epoch = (
-                    self._agree_dspark_native_uniform_adp_route(
-                        rank_routes, local_route))
+            eligibility = getattr(
+                self, "_dspark_native_uniform_adp_route_eligibility", None)
+            if (self.enable_attention_dp and eligibility is not None
+                    and eligibility[0] is scheduled_batch
+                    and not bool(eligibility[1])):
+                route_valid = False
+                candidate = max_draft_len
+                route_g = int(eligibility[2])
+                route_epoch = 0
+                route_source = str(eligibility[3])
+                if graph_runner is not None:
+                    graph_runner.confidence_native_uniform_adp_agreed_route = None
+            else:
+                local_route = self._get_dspark_native_uniform_local_route(
+                    scheduled_batch)
+                if local_route is None:
+                    return None
+                route_source = str(
+                    getattr(self, "_dspark_native_uniform_route_source",
+                            "unknown"))
+                route_valid, candidate, route_g, route_epoch = local_route
+                if self.enable_attention_dp:
+                    rank_routes = list(
+                        self.dist.tp_allgather(list(local_route)))
+                    route_valid, candidate, route_g, route_epoch = (
+                        self._agree_dspark_native_uniform_adp_route(
+                            rank_routes, local_route))
             self._dspark_native_uniform_adp_route_vote = (
-                scheduled_batch, route_valid, candidate, route_g, route_epoch)
-
-        graph_runner = getattr(self.model_engine, "cuda_graph_runner", None)
+                scheduled_batch, route_valid, candidate, route_g, route_epoch,
+                route_source)
 
         runtime_draft_len = candidate if route_valid else max_draft_len
         self._record_dspark_native_route(
@@ -3679,6 +3713,7 @@ class PyExecutor:
             runtime_draft_len=runtime_draft_len,
             execution_batch_size=route_g,
             real_request_count=len(real_requests),
+            route_source=route_source,
         )
         if route_valid and graph_runner is not None:
             graph_runner.confidence_native_uniform_adp_agreed_route = (
@@ -3739,7 +3774,8 @@ class PyExecutor:
 
     def _record_dspark_native_route(
             self, *, route_valid: bool, runtime_draft_len: int,
-            execution_batch_size: int, real_request_count: int) -> None:
+            execution_batch_size: int, real_request_count: int,
+            route_source: str = "unknown") -> None:
         """Record one native verifier route without per-step file I/O.
 
         The opt-in trace is a rank-local in-memory counter. It makes selected
@@ -3756,16 +3792,24 @@ class PyExecutor:
             int(real_request_count),
         )
         counts[key] = counts.get(key, 0) + 1
+        source_counts = getattr(
+            self, "_dspark_native_route_source_counts", None)
+        if source_counts is not None:
+            source = str(route_source)
+            source_counts[source] = source_counts.get(source, 0) + 1
 
     def _flush_dspark_native_route_trace(self) -> None:
         """Atomically publish the opt-in rank-local route counter."""
         trace_dir = getattr(self, "_dspark_native_route_trace_dir", None)
         counts = getattr(self, "_dspark_native_route_counts", None)
+        source_counts = getattr(
+            self, "_dspark_native_route_source_counts", None)
         if trace_dir is None or counts is None:
             return
         # Cleanup can be reached more than once during staged teardown. Clear
         # first so only the first caller owns publication.
         self._dspark_native_route_counts = None
+        self._dspark_native_route_source_counts = None
         try:
             os.makedirs(trace_dir, exist_ok=True)
             rank = int(self.global_rank)
@@ -3796,6 +3840,28 @@ class PyExecutor:
                 json.dump(payload, file, indent=2, sort_keys=True)
                 file.write("\n")
             os.replace(temporary, destination)
+            if source_counts is not None:
+                source_destination = os.path.join(
+                    trace_dir, f"rank-{rank}-sources.json")
+                source_temporary = (
+                    source_destination + f".tmp-{os.getpid()}")
+                source_payload = {
+                    "schema": "dspark-native-uniform-route-source-trace-v1",
+                    "global_rank": rank,
+                    "tp_rank": int(self.dist.tp_rank),
+                    "recorded_iterations": sum(source_counts.values()),
+                    "sources": [
+                        {
+                            "source": source,
+                            "iterations": iterations,
+                        }
+                        for source, iterations in sorted(source_counts.items())
+                    ],
+                }
+                with open(source_temporary, "w", encoding="utf-8") as file:
+                    json.dump(source_payload, file, indent=2, sort_keys=True)
+                    file.write("\n")
+                os.replace(source_temporary, source_destination)
         except Exception:
             logger.error(
                 "Failed to publish DSpark native route trace: "
@@ -3907,41 +3973,90 @@ class PyExecutor:
         # For bs == 1, we cannot pad dummy request to make the batch non-empty since it will cause the batch size to be 2.
         # 1 for dummy request, 1 for the yet-to-complete but not-yet-updated request.
         if self.enable_attention_dp:
-            cached_vote = getattr(
-                self, "_dspark_native_uniform_adp_route_vote", None)
-            local_route = (
-                self._get_dspark_native_uniform_local_route(scheduled_batch)
-                if cached_vote is None or cached_vote[0] is not scheduled_batch
-                else None)
-            if local_route is not None:
-                rank_payloads = list(
-                    self.dist.tp_allgather(
-                        [scheduled_batch.batch_size, *local_route]))
-                payloads_valid = bool(
-                    rank_payloads and all(
-                        isinstance(payload, (list, tuple))
-                        and len(payload) == 5 for payload in rank_payloads))
-                tp_batch_sizes = (
-                    [int(payload[0]) for payload in rank_payloads]
-                    if payloads_valid else [0])
-                rank_routes = (
-                    [list(payload[1:]) for payload in rank_payloads]
-                    if payloads_valid else [])
-                route_valid, candidate, route_g, route_epoch = (
-                    self._agree_dspark_native_uniform_adp_route(
-                        rank_routes, local_route))
-                self._dspark_native_uniform_adp_route_vote = (
-                    scheduled_batch, route_valid, candidate, route_g,
-                    route_epoch)
+            # Keep admission independent of confidence readiness. Native
+            # uniform routing is queried after full-K resource preparation,
+            # giving the current device scalar more time to reach host without
+            # synchronizing the executor loop here. Encode context presence in
+            # the sign so the same scalar collective can also make the native
+            # route eligibility decision rank-symmetric.
+            spec_config = getattr(self.model_engine, "spec_config", None)
+            native_uniform = bool(
+                spec_config is not None and getattr(
+                    spec_config, "is_native_uniform_confidence_enabled", False))
+            local_batch_size = int(scheduled_batch.batch_size)
+            queue_payload = (
+                -local_batch_size
+                if native_uniform and int(
+                    getattr(scheduled_batch, "num_context_requests", 0)) > 0
+                else local_batch_size)
+            tp_batch_sizes = self.dist.tp_allgather(
+                queue_payload)
+            if native_uniform:
+                self._cache_dspark_native_uniform_adp_route_eligibility(
+                    scheduled_batch, tp_batch_sizes)
             else:
-                tp_batch_sizes = self.dist.tp_allgather(
-                    scheduled_batch.batch_size)
+                self._dspark_native_uniform_adp_route_eligibility = None
             can_queue = 0 not in tp_batch_sizes
             can_queue_this_rank = scheduled_batch.batch_size > 0
         else:
             can_queue = can_queue_this_rank = scheduled_batch.batch_size > 0
 
         return can_queue, can_queue_this_rank
+
+    def _cache_dspark_native_uniform_adp_route_eligibility(
+            self, scheduled_batch, tp_batch_sizes) -> None:
+        """Prove a native route is useful using the admission collective.
+
+        Every attention-DP rank receives the same signed batch-size vector, so
+        each rank makes the same decision. A negative value marks a context
+        batch. Attention DP pads every rank to the smallest captured graph that
+        holds the largest peer batch; only that common graph is eligible for
+        the later route collective when it has native draft-length candidates.
+        """
+        eligible = False
+        route_g = 0
+        source = "tail_bypass"
+        spec_config = getattr(self.model_engine, "spec_config", None)
+        graph_runner = getattr(self.model_engine, "cuda_graph_runner", None)
+        if (spec_config is None or not getattr(
+                spec_config, "is_native_uniform_confidence_enabled", False)):
+            source = "disabled"
+        elif graph_runner is None:
+            source = "no_graph_runner"
+        else:
+            try:
+                rank_batch_sizes = [int(value) for value in tp_batch_sizes]
+            except (TypeError, ValueError):
+                rank_batch_sizes = []
+                source = "invalid_batch_sizes"
+
+            if rank_batch_sizes:
+                if 0 in rank_batch_sizes:
+                    source = "empty_peer"
+                elif any(value < 0 for value in rank_batch_sizes):
+                    source = "context_bypass"
+                else:
+                    round_up = getattr(graph_runner, "_round_up_batch_size",
+                                       None)
+                    if not callable(round_up):
+                        source = "no_graph_rounding"
+                    else:
+                        route_g = int(round_up(max(rank_batch_sizes)))
+                        if route_g <= 0:
+                            source = "uncaptured_graph"
+                        else:
+                            candidates = (
+                                spec_config.
+                                resolve_confidence_native_uniform_draft_len_candidates(
+                                    route_g))
+                            if candidates:
+                                eligible = True
+                                source = "configured_graph"
+                            else:
+                                source = "unconfigured_graph_bypass"
+
+        self._dspark_native_uniform_adp_route_eligibility = (
+            scheduled_batch, eligible, route_g, source)
 
     def _revert_gen_alloc(self, scheduled_batch):
         """Revert KV cache capacity growth when the batch is skipped.
