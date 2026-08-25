@@ -21,18 +21,17 @@ def test_device_window_repacking_follows_fresh_token_owners():
         seeds=torch.empty(6, dtype=torch.int64),
         request_offsets=torch.tensor([10, 20, 30], dtype=torch.int64),
         offsets=torch.empty(6, dtype=torch.int64),
-        _sampling_params_signature=[("request", ), ("expanded", )],
+        _sampling_params_signature=[("request",), ("expanded",)],
     )
 
     SpecMetadata.remap_expanded_sampling_params(meta, owners, owners.numel())
 
-    assert torch.equal(meta.temperatures,
-                       meta.request_temperatures.index_select(0, owners))
+    assert torch.equal(meta.temperatures, meta.request_temperatures.index_select(0, owners))
     assert torch.equal(meta.top_ks, meta.request_top_ks.index_select(0, owners))
     assert torch.equal(meta.top_ps, meta.request_top_ps.index_select(0, owners))
     assert torch.equal(meta.seeds, meta.request_seeds.index_select(0, owners))
     assert torch.equal(meta.offsets, meta.request_offsets.index_select(0, owners))
-    assert meta._sampling_params_signature[0] == ("request", )
+    assert meta._sampling_params_signature[0] == ("request",)
     assert meta._sampling_params_signature[1] is None
 
 
@@ -50,8 +49,7 @@ def test_device_window_repacking_ignores_unallocated_optional_buffers():
         offsets=None,
         _sampling_params_signature=[None, None],
     )
-    SpecMetadata.remap_expanded_sampling_params(meta,
-                                                torch.tensor([0]), 1)
+    SpecMetadata.remap_expanded_sampling_params(meta, torch.tensor([0]), 1)
 
 
 def test_device_window_repacking_forces_next_host_expansion():
@@ -70,10 +68,10 @@ def test_device_window_repacking_forces_next_host_expansion():
         offsets=None,
         _sampling_params_signature=[values, (values, (2, 4))],
     )
-    SpecMetadata.remap_expanded_sampling_params(
-        meta, torch.tensor([0, 1, 1, 1, 0, 0]), 6)
+    SpecMetadata.remap_expanded_sampling_params(meta, torch.tensor([0, 1, 1, 1, 0, 0]), 6)
 
-    need_request, need_expanded = (
-        SpecMetadata._sampling_params_buffers_need_update(meta, per_request))
+    need_request, need_expanded = SpecMetadata._sampling_params_buffers_need_update(
+        meta, per_request
+    )
     assert need_request is False
     assert need_expanded is True

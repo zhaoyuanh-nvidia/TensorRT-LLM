@@ -72,6 +72,10 @@ class SpsCostTable:
             ``tau / T`` is a ratio, so they do not cancel.
         batch_sizes / batch_overhead_ms: optional ``alpha(bs)`` breakpoints --
             the batch-size-dependent, non-trimmable part of the step.
+        minimum_predicted_gain: a compact candidate must beat full K by at
+            least this relative goodput margin. Runtime profiler artifacts
+            default it to one percent so calibration and timing noise resolve
+            to the native full-K path instead of an unproven trim.
 
     Lookup is a clamped linear interpolation between breakpoints; a flat shelf
     must be MEASURED as two breakpoints with equal values (a floor lookup makes
@@ -85,6 +89,10 @@ class SpsCostTable:
     fixed_overhead_ms: float = 0.0
     batch_sizes: Sequence[int] = field(default_factory=tuple)
     batch_overhead_ms: Sequence[float] = field(default_factory=tuple)
+    # Direct constructors (primarily unit tests and offline analysis) retain
+    # the mathematical argmax by default. Runtime-loaded profiler artifacts
+    # supply a conservative non-zero guard; see ``DSparkWorker``.
+    minimum_predicted_gain: float = 0.0
 
     def __post_init__(self) -> None:
         if len(self.token_counts) != len(self.step_time_ms):
@@ -109,6 +117,8 @@ class SpsCostTable:
             raise ValueError("batch_sizes must be strictly increasing")
         if any(not math.isfinite(t) or t < 0.0 for t in self.batch_overhead_ms):
             raise ValueError("batch_overhead_ms entries must be >= 0 and finite")
+        if not math.isfinite(self.minimum_predicted_gain) or self.minimum_predicted_gain < 0.0:
+            raise ValueError("minimum_predicted_gain must be >= 0 and finite")
 
     def batch_overhead(self, num_requests: int) -> float:
         """``alpha(num_requests)`` -- 0.0 when the table has no batch axis."""
@@ -119,7 +129,8 @@ class SpsCostTable:
                 float(num_requests),
                 np.asarray(self.batch_sizes, dtype=np.float64),
                 np.asarray(self.batch_overhead_ms, dtype=np.float64),
-            ))
+            )
+        )
 
     def step_time(self, num_tokens: int, num_requests: int = 0) -> float:
         """``bias + alpha(num_requests) + theta(num_tokens)``, in ms."""
@@ -164,8 +175,10 @@ def check_table_fingerprint(*, payload: dict, live: dict) -> None:
             "DSpark cost table carries no engine fingerprint; cannot verify it "
             "was profiled on this configuration. Tables are engine-specific "
             "(same cell measured 23%% apart across two configs) -- regenerate "
-            "with a current profiler to get load-time checking.")
+            "with a current profiler to get load-time checking."
+        )
         return
+
     def _facts_differ(a, b) -> bool:
         try:
             return float(a) != float(b)
@@ -178,21 +191,21 @@ def check_table_fingerprint(*, payload: dict, live: dict) -> None:
         if _facts_differ(fp[key], live[key])
     }
     if mismatched:
-        detail = ", ".join(f"{k}: table={a!r} engine={b!r}"
-                           for k, (a, b) in mismatched.items())
+        detail = ", ".join(f"{k}: table={a!r} engine={b!r}" for k, (a, b) in mismatched.items())
         raise ValueError(
             f"DSpark cost table was profiled on a different engine "
             f"configuration ({detail}). Its step times do not describe this "
             f"engine, so the planner would trim to the wrong economics. "
             f"Re-profile on this configuration, or remove "
-            f"confidence_sps_table_path to run without trimming.")
+            f"confidence_sps_table_path to run without trimming."
+        )
     unchecked = sorted(set(fp) - set(live))
     if unchecked:
         logger.info(
             f"DSpark cost table fingerprint: verified "
             f"{sorted(set(fp) & set(live))}; not verifiable at this site "
-            f"(check manually): "
-            + ", ".join(f"{k}={fp[k]!r}" for k in unchecked))
+            f"(check manually): " + ", ".join(f"{k}={fp[k]!r}" for k in unchecked)
+        )
 
 
 def compute_verify_token_budget(
@@ -250,19 +263,31 @@ def compute_verify_token_budget(
     tokens = floor_tokens + np.arange(tau.size)
     theta = tau / cost_table.step_times(tokens, num_gen_requests)
     if allowed_lens is None:
-        return int(np.argmax(theta))
+        best = int(np.argmax(theta))
+        full = int(theta.size - 1)
+        if best != full and theta[best] < theta[full] * (1.0 + cost_table.minimum_predicted_gain):
+            return full
+        return best
     # Tier-aligned: the same theta curve, evaluated only at totals the executor
     # can land on -- n = bs*(t - min_verify_len) gives tokens = bs*(t+1)
     # = total_verify_tokens(bs, t).
-    idx = sorted({
-        int(bs) * (int(t) - int(min_verify_len))
-        for t in allowed_lens
-        if int(min_verify_len) <= int(t) <= cap
-    })
+    idx = sorted(
+        {
+            int(bs) * (int(t) - int(min_verify_len))
+            for t in allowed_lens
+            if int(min_verify_len) <= int(t) <= cap
+        }
+    )
     idx = [n for n in idx if 0 <= n < theta.size]
     if not idx:
         return 0
-    return int(max(idx, key=lambda n: theta[n]))
+    best = int(max(idx, key=lambda n: (theta[n], n)))
+    full = int(bs) * (cap - int(min_verify_len))
+    if full in idx and (
+        best != full and theta[best] < theta[full] * (1.0 + cost_table.minimum_predicted_gain)
+    ):
+        return full
+    return best
 
 
 def derive_verify_len_tiers(
@@ -350,11 +375,16 @@ def budget_argmax_over_uniform_lens(
 
     surv = np.asarray(survival, dtype=np.float64)
     best_len, best_theta = lens[0], -np.inf
+    scores = {}
     for length in lens:
         # Expected yield: the bonus token plus survival of every verified
         # position, floor included.
         tau = float(num_gen_requests) + float(surv[:, :length].sum())
         theta = tau / cost_table.step_time(total_verify_tokens(bs, length), num_gen_requests)
+        scores[length] = theta
         if theta > best_theta:
             best_len, best_theta = length, theta
+    full = max(lens)
+    if best_len != full and best_theta < scores[full] * (1.0 + cost_table.minimum_predicted_gain):
+        return int(full)
     return int(best_len)

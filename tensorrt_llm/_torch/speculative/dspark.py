@@ -217,13 +217,15 @@ class DSparkWorker(SpecWorkerBase):
         import os as _os
 
         from .dspark_sts import STS_COLLECT_ENV
+
         if _os.environ.get(STS_COLLECT_ENV) and not self.return_confidence:
             raise ValueError(
                 f"{STS_COLLECT_ENV} is set but enable_confidence_scheduling is "
                 f"off; the recorder is only built on the confidence path, so "
                 f"this run would complete cleanly and collect NOTHING. Enable "
                 f"confidence scheduling (a missing cost table keeps the "
-                f"planner on the full block) or unset the variable.")
+                f"planner on the full block) or unset the variable."
+            )
         self._confidence_logits: Optional[torch.Tensor] = None  # [max_batch+2, block]
         # Draft-pass stamps for the buffer above; allocated in ``_lazy_init``.
         self._confidence_stamp: Optional[torch.Tensor] = None
@@ -384,8 +386,7 @@ class DSparkWorker(SpecWorkerBase):
             # write, distinguishing fresh data from a stale replay or the
             # neutral fill. Written in-graph through the same ``slots`` scatter
             # as the confidence; the scalar is bumped outside the graph.
-            self._confidence_stamp = torch.zeros(
-                (num_rows + 1,), dtype=torch.int32, device="cuda")
+            self._confidence_stamp = torch.zeros((num_rows + 1,), dtype=torch.int32, device="cuda")
             self._draft_seq_host = 0
             # Bumped by ``fill_`` from the executor's host path, outside
             # inference mode -- an inference tensor refuses that update, so
@@ -393,8 +394,7 @@ class DSparkWorker(SpecWorkerBase):
             # above intentionally stays an inference tensor (written in-graph
             # only).
             with torch.inference_mode(False):
-                self._draft_seq_cuda = torch.zeros((), dtype=torch.int32,
-                                                   device="cuda")
+                self._draft_seq_cuda = torch.zeros((), dtype=torch.int32, device="cuda")
             self._build_verify_planner(draft_model, block_size, max_batch)
         self._free_slots = deque(range(max_batch))
         self._req_to_slot = {}
@@ -429,6 +429,7 @@ class DSparkWorker(SpecWorkerBase):
             # asserts ``step_time_ms`` already measures whole steps at the
             # deployment's batch size.
             from .dspark_planner import check_table_fingerprint
+
             if (raw.get("_meta") or {}).get("lookup") != "interp":
                 logger.warning(
                     f"DSpark cost table {table_path} carries no "
@@ -437,23 +438,28 @@ class DSparkWorker(SpecWorkerBase):
                     f"floor lookup dropped shelf-closing breakpoints on "
                     f"purpose, and interpolating across those gaps re-bills "
                     f"every mid-shelf total upward. Re-emit the table with a "
-                    f"current profiler if trimming behaves oddly.")
-            check_table_fingerprint(payload=raw, live={
-                "tp": int(self.mapping.tp_size),
-                "ep": int(self.mapping.moe_ep_size),
-                "attention_dp": bool(self.mapping.enable_attention_dp),
-                "block": int(block_size),
-                "max_batch_size": int(max_batch),
-                # moe_backend deliberately absent: a wrong live value would
-                # false-reject a correct table; the table's value surfaces on
-                # the "check manually" INFO line instead.
-            })
+                    f"current profiler if trimming behaves oddly."
+                )
+            check_table_fingerprint(
+                payload=raw,
+                live={
+                    "tp": int(self.mapping.tp_size),
+                    "ep": int(self.mapping.moe_ep_size),
+                    "attention_dp": bool(self.mapping.enable_attention_dp),
+                    "block": int(block_size),
+                    "max_batch_size": int(max_batch),
+                    # moe_backend deliberately absent: a wrong live value would
+                    # false-reject a correct table; the table's value surfaces on
+                    # the "check manually" INFO line instead.
+                },
+            )
             cost_table = SpsCostTable(
                 token_counts=[int(v) for v in raw["token_counts"]],
                 step_time_ms=[float(v) for v in raw["step_time_ms"]],
                 fixed_overhead_ms=float(raw.get("fixed_overhead_ms", 0.0)),
                 batch_sizes=[int(v) for v in raw.get("batch_sizes", [])],
                 batch_overhead_ms=[float(v) for v in raw.get("batch_overhead_ms", [])],
+                minimum_predicted_gain=float(raw.get("minimum_predicted_gain", 0.01)),
             )
         else:
             # Flat = "unprofiled": the planner keeps verifying the full block
@@ -469,6 +475,7 @@ class DSparkWorker(SpecWorkerBase):
         # Calibration lives on the draft's confidence head; fall back to a plain
         # sigmoid when the head is absent (no confidence to calibrate anyway).
         from .dspark_sts import resolve_confidence_head
+
         head = resolve_confidence_head(draft_model)
         apply_calibration = head.apply_sts if head is not None else None
         sts_path = self.spec_config.confidence_sts_path
@@ -479,11 +486,13 @@ class DSparkWorker(SpecWorkerBase):
                 f"confidence_sts_path is set but no confidence head was found "
                 f"on {type(draft_model).__name__}; calibration cannot be "
                 f"applied, so the planner would schedule on raw sigmoid "
-                f"survivals. This is a model-wiring bug, not a config choice.")
+                f"survivals. This is a model-wiring bug, not a config choice."
+            )
         if sts_path and head is not None:
             # Accepts either key spelling ("sts_temperatures" here,
             # "temperatures" in SGLang); the vectors are interchangeable.
             from .dspark_sts import load_sts_temperatures_from_path
+
             temps = load_sts_temperatures_from_path(sts_path)
             head.load_sts_temperatures(torch.tensor(temps, dtype=torch.float32))
             logger.info(f"DSpark: loaded STS calibration from {sts_path}")
@@ -513,33 +522,43 @@ class DSparkWorker(SpecWorkerBase):
 
         # The env var overrides the config knob so the mode can be swapped
         # without editing a serving config.
-        from .dspark_observability import (DSparkRaggedStats, RaggedVerifyMode,
-                                           read_ragged_verify_mode)
+        from .dspark_observability import (
+            DSparkRaggedStats,
+            RaggedVerifyMode,
+            read_ragged_verify_mode,
+        )
 
-        configured = (RaggedVerifyMode.COMPACT
-                      if self.spec_config.enable_ragged_verify else
-                      RaggedVerifyMode.STATIC)
+        configured = (
+            RaggedVerifyMode.COMPACT
+            if self.spec_config.enable_ragged_verify
+            else RaggedVerifyMode.STATIC
+        )
         self.ragged_verify_mode = read_ragged_verify_mode(default=configured)
-        if (self.verify_planner is not None
-                and self.verify_planner.forced_budget_frac is not None
-                and not self.ragged_verify_mode.trims_submitted_tokens):
+        if (
+            self.verify_planner is not None
+            and self.verify_planner.forced_budget_frac is not None
+            and not self.ragged_verify_mode.trims_submitted_tokens
+        ):
             raise ValueError(
                 "TLLM_DSPARK_FORCE_BUDGET_FRAC is set but ragged verify mode "
                 f"'{self.ragged_verify_mode.value}' does not trim submitted "
                 "tokens; the fraction would be logged as FORCED and silently "
-                "never applied. Unset it or run compact mode.")
+                "never applied. Unset it or run compact mode."
+            )
         # STS collection is env-gated; it costs one device->host copy per
         # decode step.
         from .dspark_sts import make_recorder_from_env
+
         self.sts_recorder = make_recorder_from_env(
             block_size=int(block_size),
             rank=int(self.mapping.rank),
-            has_cost_table=bool(
-                self.spec_config.confidence_sps_table_path),
-            ragged_mode=self.ragged_verify_mode.value)
+            has_cost_table=bool(self.spec_config.confidence_sps_table_path),
+            ragged_mode=self.ragged_verify_mode.value,
+        )
 
-        self.ragged_stats = DSparkRaggedStats(mode=self.ragged_verify_mode,
-                                              max_draft_len=block_size)
+        self.ragged_stats = DSparkRaggedStats(
+            mode=self.ragged_verify_mode, max_draft_len=block_size
+        )
         # Shared (not copied) so the summary stays live.
         self.ragged_stats.planner_stats = self.verify_planner.stats
         logger.info(
@@ -547,8 +566,7 @@ class DSparkWorker(SpecWorkerBase):
             f"profiled_cost_table={not cost_table.is_flat}, "
             f"ragged_verify_mode={self.ragged_verify_mode.value}"
         )
-        if (self.ragged_verify_mode.trims_submitted_tokens
-                and cost_table.is_flat):
+        if self.ragged_verify_mode.trims_submitted_tokens and cost_table.is_flat:
             logger.warning(
                 "DSpark ragged verify is set to 'compact' but the cost table is "
                 "flat, so the planner's budget degenerates to verify-all and "
@@ -821,10 +839,7 @@ class DSparkWorker(SpecWorkerBase):
         # persistent window state so they are side-effect-free. During the
         # capture pass the stream IS capturing, so skip the save/restore and
         # let the ops be recorded; prefill resets wipe capture-time mutation.
-        is_warmup = (
-            spec_metadata.is_cuda_graph
-            and not torch.cuda.is_current_stream_capturing()
-        )
+        is_warmup = spec_metadata.is_cuda_graph and not torch.cuda.is_current_stream_capturing()
         if is_warmup:
             saved_ctx_len = self._ctx_len.clone()
             saved_valid_len = self._valid_len.clone()
@@ -899,9 +914,9 @@ class DSparkWorker(SpecWorkerBase):
                     )
                 # The context one-hot must match the width the gen scatter just
                 # published to draft_probs, NOT gen_logits.shape[-1]: under TP the
-                  # draft logits are vocab-sharded and sample_draft_tokens gathers
-                  # them to full vocab before scattering, so the pre-gather shard
-                  # width would leave stale columns and corrupt rejection.
+                # draft logits are vocab-sharded and sample_draft_tokens gathers
+                # them to full vocab before scattering, so the pre-gather shard
+                # width would leave stale columns and corrupt rejection.
                 gen_vocab = spec_metadata.draft_probs_last_dim
             else:
                 gen_draft_tokens = torch.zeros((num_gens, K), dtype=torch.int32, device="cuda")
@@ -964,7 +979,9 @@ class DSparkWorker(SpecWorkerBase):
         # with finished contexts) the rows would misalign AND come up short.
         # Mixed steps keep exact windows on py_verify_len, so the sampler's
         # snapshot fallback stays correct there.
-        if (spec_metadata.verify_lens is not None
-                and spec_metadata.verify_lens.shape[0] >= batch_size):
+        if (
+            spec_metadata.verify_lens is not None
+            and spec_metadata.verify_lens.shape[0] >= batch_size
+        ):
             outputs["verify_lens"] = spec_metadata.verify_lens[:batch_size]
         return outputs

@@ -37,14 +37,17 @@ that request), mirroring the host planner's fail-open semantics.
 """
 
 from dataclasses import dataclass
-from typing import Callable, Optional, Tuple
+from typing import Callable, Optional
 
 import torch
 
-from .dspark_ragged import (build_qo_indptr, build_row_maps_device,
-                            fill_bucket_device)
-from .dspark_schedule import (NEUTRAL_CONFIDENCE_LOGIT, DSparkScheduleConfig,
-                              compute_survival, schedule_verify_lens_topk)
+from .dspark_ragged import build_qo_indptr, build_row_maps_device, fill_bucket_device
+from .dspark_schedule import (
+    NEUTRAL_CONFIDENCE_LOGIT,
+    DSparkScheduleConfig,
+    compute_survival,
+    schedule_verify_lens_topk,
+)
 
 __all__ = [
     "DeviceWindowResult",
@@ -94,22 +97,17 @@ def gather_packed_draft_tokens(
     if total_draft_tokens < 0:
         raise ValueError("total_draft_tokens must be non-negative")
     if total_draft_tokens == 0:
-        return next_draft_tokens.new_empty((0, ))
+        return next_draft_tokens.new_empty((0,))
     device = verify_lens.device
     rows = torch.arange(num_real, device=device, dtype=torch.long)
     draft_counts = verify_lens[:num_real].to(torch.long) - 1
-    owners = torch.repeat_interleave(rows,
-                                    draft_counts,
-                                    output_size=total_draft_tokens)
+    owners = torch.repeat_interleave(rows, draft_counts, output_size=total_draft_tokens)
     # Removing one bonus from every preceding request converts the token
     # prefix into a draft-only prefix.
-    draft_qo = (qo_indptr[:num_real + 1].to(torch.long) -
-                torch.arange(num_real + 1,
-                             device=device,
-                             dtype=torch.long))
-    flat = torch.arange(total_draft_tokens,
-                        device=device,
-                        dtype=torch.long)
+    draft_qo = qo_indptr[: num_real + 1].to(torch.long) - torch.arange(
+        num_real + 1, device=device, dtype=torch.long
+    )
+    flat = torch.arange(total_draft_tokens, device=device, dtype=torch.long)
     offsets = flat - draft_qo[owners]
     slots = batch_slots[:num_real].to(torch.long)[owners]
     return next_draft_tokens[slots, offsets]
@@ -163,8 +161,8 @@ def select_windows_device(
     """
     if confidence_logits.dim() != 2:
         raise ValueError(
-            f"confidence_logits must be [num_slots, K], got "
-            f"{tuple(confidence_logits.shape)}")
+            f"confidence_logits must be [num_slots, K], got {tuple(confidence_logits.shape)}"
+        )
     device = confidence_logits.device
     padded_bs = slot_idx.numel()
 
@@ -185,11 +183,9 @@ def select_windows_device(
     # the ranking never selects them and their windows stay at the floor
     # until the fill tops them up.
     is_real = torch.arange(padded_bs, device=device) < num_real
-    survival = torch.where(is_real.unsqueeze(1), survival,
-                           torch.zeros_like(survival))
+    survival = torch.where(is_real.unsqueeze(1), survival, torch.zeros_like(survival))
 
-    scheduled = schedule_verify_lens_topk(survival=survival, budget=budget,
-                                          cfg=cfg)
+    scheduled = schedule_verify_lens_topk(survival=survival, budget=budget, cfg=cfg)
     # The scheduler counts drafted positions; the token window adds the
     # bonus/anchor, matching every host fill_bucket callsite.
     token_lens = scheduled + 1
@@ -201,8 +197,7 @@ def select_windows_device(
         max_verify_len=max_token_len,
         pad_fill=pad_len,
     )
-    req_idx, correction = build_row_maps_device(
-        filled, graph_num_tokens=graph_num_tokens)
+    req_idx, correction = build_row_maps_device(filled, graph_num_tokens=graph_num_tokens)
     return DeviceWindowResult(
         verify_lens=filled,
         qo_indptr=build_qo_indptr(filled),

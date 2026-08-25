@@ -877,8 +877,7 @@ class BaseWorker(GenerationExecutor):
             raise RuntimeError("engine is not initialized")
         return self.engine.get_dspark_ragged_stats()
 
-    def set_dspark_budget_frac(self,
-                               frac: Optional[float]) -> Optional[float]:
+    def set_dspark_budget_frac(self, frac: Optional[float]) -> Optional[float]:
         """Set (or clear) the DSpark verify-budget fraction on this executor.
 
         Same delivery contract as :meth:`set_dspark_verify_len_pin`: a scalar

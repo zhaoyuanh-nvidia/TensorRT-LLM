@@ -3345,7 +3345,8 @@ class PyExecutor:
                 "no initialized DSpark ragged statistics on this executor")
         return stats.summary()
 
-    def set_dspark_verify_len_pin(self, verify_len: Optional[int]) -> Optional[int]:
+    def set_dspark_verify_len_pin(self,
+                                  verify_len: Optional[int]) -> Optional[int]:
         """Queue a DSpark verify-length pin, or ``None`` to clear it.
 
         The pin bypasses the confidence planner so every request verifies the
@@ -3379,8 +3380,7 @@ class PyExecutor:
                 "this engine runs static (uniform) verification; the "
                 "verify-length pin only affects window-computing modes, so "
                 "pinning here would be accepted and silently never applied")
-        if (worker.sts_recorder is not None
-                and verify_len is not None
+        if (worker.sts_recorder is not None and verify_len is not None
                 and int(verify_len) < int(self.model_engine.max_draft_len)):
             # A sub-block pin censors the acceptance label of every STS sample
             # collected after it; the collector's start-time guard cannot see
@@ -3397,8 +3397,7 @@ class PyExecutor:
                 "pin would silently shadow it. Clear the fraction first.")
         return planner.request_verify_len_pin(verify_len)
 
-    def set_dspark_budget_frac(self,
-                               frac: Optional[float]) -> Optional[float]:
+    def set_dspark_budget_frac(self, frac: Optional[float]) -> Optional[float]:
         """Queue a DSpark verify-budget fraction, or ``None`` to clear it.
 
         Replaces the cost-table argmax with ``frac`` of the maximum trimmable
@@ -3485,8 +3484,7 @@ class PyExecutor:
         # Same wiring for STS. The sampler gets the worker's OWN row resolver
         # and pass counter: the recorder joins by (draft pass, buffer row),
         # and both keys must come from the allocator that wrote the buffer.
-        if (self.sampler is not None
-                and self.sampler.sts_recorder is None):
+        if (self.sampler is not None and self.sampler.sts_recorder is None):
             recorder = worker.sts_recorder
             if recorder is not None:
                 self.sampler.sts_recorder = recorder
@@ -3495,8 +3493,7 @@ class PyExecutor:
         mode = worker.ragged_verify_mode
         compute_windows = mode.computes_windows
 
-        is_distributed = (self.dist is not None
-                          and self.dist.tp_size > 1)
+        is_distributed = (self.dist is not None and self.dist.tp_size > 1)
 
         # --- Phase 1: decide locally, issue nothing ---------------------------
         #
@@ -3583,13 +3580,13 @@ class PyExecutor:
             # The pin and the budget fraction ride the allgather so every rank
             # adopts the same value on the same step (the endpoint lands on
             # one rank). -1 means nobody queued anything.
-            agreed_pin = next(
-                (int(payload[5]) for payload in payloads
-                 if len(payload) > 5 and int(payload[5]) >= 0), -1)
+            agreed_pin = next((int(payload[5]) for payload in payloads
+                               if len(payload) > 5 and int(payload[5]) >= 0),
+                              -1)
             planner.adopt_verify_len_pin(agreed_pin)
-            agreed_frac = next(
-                (int(payload[6]) for payload in payloads
-                 if len(payload) > 6 and int(payload[6]) >= 0), -1)
+            agreed_frac = next((int(payload[6]) for payload in payloads
+                                if len(payload) > 6 and int(payload[6]) >= 0),
+                               -1)
             planner.adopt_budget_frac(agreed_frac)
             if not all(int(payload[0]) for payload in payloads):
                 # All-or-nothing across ranks: `all_rank_num_tokens` is frozen
@@ -3649,8 +3646,7 @@ class PyExecutor:
                     # capacity so the pre-replay prologue re-ranks it with
                     # fresh confidence. Published only here: every fallback
                     # leaves it None and the step runs the host windows.
-                    self.model_engine._dspark_device_budget = int(
-                        device_budget)
+                    self.model_engine._dspark_device_budget = int(device_budget)
             else:
                 # No rank can graph this step, so run the windows eagerly. Do
                 # not fit a bucket: the fit sizes pad rows _get_padded_batch
@@ -3684,16 +3680,17 @@ class PyExecutor:
                 ]
                 if len(fitted) != num_gen_requests:
                     fitted = None
-            stats.record_step(num_gen_requests=num_gen_requests,
-                              verify_lens=fitted,
-                              bucket=bucket,
-                              # Only when the fit delivered: otherwise this
-                              # books the LAST fit's row count on steps that
-                              # never entered the fit.
-                              padded_bs=(self.model_engine._dspark_last_padded_bs
-                                         if bucket is not None else None),
-                              fallback=fallback_reason,
-                              delivered=delivered)
+            stats.record_step(
+                num_gen_requests=num_gen_requests,
+                verify_lens=fitted,
+                bucket=bucket,
+                # Only when the fit delivered: otherwise this
+                # books the LAST fit's row count on steps that
+                # never entered the fit.
+                padded_bs=(self.model_engine._dspark_last_padded_bs
+                           if bucket is not None else None),
+                fallback=fallback_reason,
+                delivered=delivered)
 
         if ragged_active and not cap_accept:
             # The block is always drafted in full, so the batch-wide draft
@@ -3727,7 +3724,8 @@ class PyExecutor:
             # can histogram how stale each gathered row was at decision time.
             staged_seq = worker.bump_draft_seq()
             stamps = worker.confidence_stamp_buffer()
-            planner.stage_confidence(buffer, stamps=stamps,
+            planner.stage_confidence(buffer,
+                                     stamps=stamps,
                                      staged_seq=staged_seq)
             # The STS recorder rings its own copy: labels arrive steps later
             # and must pair with the pass that DRAFTED the block, not whatever

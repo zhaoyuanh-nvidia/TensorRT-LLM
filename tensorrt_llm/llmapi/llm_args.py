@@ -5937,8 +5937,8 @@ class TorchLlmArgs(BaseLlmArgs):
             # falls back to is numerically equivalent, and it is the default on
             # DeepSeek-V4 anyway. Still worth saying out loud, since the knob
             # will read as honoured otherwise.
-            if getattr(sparse_attention_config,
-                       "use_cute_dsl_paged_mqa_logits", False):
+            if getattr(sparse_attention_config, "use_cute_dsl_paged_mqa_logits",
+                       False):
                 logger.warning(
                     "sparse_attention_config.use_cute_dsl_paged_mqa_logits=True "
                     "is ignored on ragged-verification steps: the DSL kernel "

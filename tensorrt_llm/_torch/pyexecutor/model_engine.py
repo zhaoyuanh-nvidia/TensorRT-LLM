@@ -2441,7 +2441,8 @@ class PyTorchModelEngine(ModelEngine):
                 request._cached_tokens = cached_tokens
                 request._cached_tokens_set = cached_tokens_set
 
-        def _run_capture_pass(force_non_greedy: bool, label: str,
+        def _run_capture_pass(force_non_greedy: bool,
+                              label: str,
                               force_lora_graph: bool,
                               entries=None) -> None:
             spec_metadata = self.spec_metadata
@@ -4879,10 +4880,7 @@ class PyTorchModelEngine(ModelEngine):
         """
         if self.spec_config is None:
             return []
-        tiers = sorted({
-            int(t)
-            for t in self.spec_config.verify_len_tiers
-        })
+        tiers = sorted({int(t) for t in self.spec_config.verify_len_tiers})
         return [int(padded_bs) * (t + 1) for t in tiers]
 
     def _record_dspark_graph_use(self, *, replayed: bool, shape=None) -> None:
@@ -4933,10 +4931,7 @@ class PyTorchModelEngine(ModelEngine):
                 f"{len(generation_requests)} generation requests; falling back "
                 f"to uniform scheduling")
             return None
-        tiers = sorted({
-            int(t)
-            for t in self.spec_config.verify_len_tiers
-        })
+        tiers = sorted({int(t) for t in self.spec_config.verify_len_tiers})
         if not tiers:
             return None
         max_verify_len = 1 + tiers[-1]
@@ -4952,8 +4947,8 @@ class PyTorchModelEngine(ModelEngine):
         # widest rank's row count. `all_can_graph` (third peer-stat element;
         # absent means single-rank) says whether _get_padded_batch will take
         # the cross-rank row maximum at all -- only when EVERY rank can graph.
-        all_can_graph = (bool(peer_stats[0][2]) if peer_stats
-                         and len(peer_stats[0]) > 2 else True)
+        all_can_graph = (bool(peer_stats[0][2])
+                         if peer_stats and len(peer_stats[0]) > 2 else True)
         if not all_can_graph:
             # No rank will replay a graph this step, and _get_padded_batch
             # pads differently than this fit assumes on such steps, so the
@@ -4963,9 +4958,9 @@ class PyTorchModelEngine(ModelEngine):
                 "DSpark ragged: some rank cannot run a CUDA graph this step, "
                 "so no captured bucket applies; falling back to uniform")
             return None
-        widest_rows = max([int(s[0]) for s in peer_stats],
-                          default=len(token_lens)) if peer_stats else len(
-                              token_lens)
+        widest_rows = max(
+            [int(s[0]) for s in peer_stats],
+            default=len(token_lens)) if peer_stats else len(token_lens)
         padded_bs = runner._round_up_batch_size(widest_rows)
         if padded_bs == 0:
             return None
@@ -5002,6 +4997,22 @@ class PyTorchModelEngine(ModelEngine):
             return None
         padded_bs, bucket = shape.padded_bs, shape.bucket
 
+        full_bucket = int(padded_bs) * (int(tiers[-1]) + 1)
+        worker = self._get_spec_worker()
+        planner = getattr(worker, "verify_planner", None) if worker else None
+        forced_ragged_control = bool(
+            planner is not None and (planner.forced_verify_len is not None
+                                     or planner.forced_budget_frac is not None))
+        if bucket == full_bucket and not forced_ragged_control:
+            # Cross-rank padding can promote locally compact decisions onto
+            # the full-K graph. At that point ragged execution saves no target
+            # work, so preserve the native static path (and its efficient
+            # multi-G tail handling) rather than paying ragged bookkeeping.
+            if planner is not None:
+                planner.stats["fallback_full_k"] = (
+                    planner.stats.get("fallback_full_k", 0) + 1)
+            return None
+
         # Pad rows are appended later as a *single shared dummy object*, so
         # they all carry the same window and their contribution must be
         # decided here, not left to the fill. They take the minimum (one
@@ -5023,7 +5034,7 @@ class PyTorchModelEngine(ModelEngine):
             if lo > hi:
                 # Unreachable when the chooser ran with max_verify_len (it
                 # verified this rank's decomposition from the payload); a hit
-                # here means the two arithmetics diverged -- worth a warning,
+                # here means the two arithmetic paths diverged -- worth a warning,
                 # not a silent debug line.
                 logger.warning(
                     f"DSpark ragged: bucket {bucket} admits no pad-row window "
@@ -5070,8 +5081,7 @@ class PyTorchModelEngine(ModelEngine):
             request.py_verify_len = int(tokens) - 1
         return int(bucket)
 
-    def _apply_device_window_prologue(self, inputs,
-                                      new_tensors_device) -> bool:
+    def _apply_device_window_prologue(self, inputs, new_tensors_device) -> bool:
         """Re-rank this step's verify windows on device, with fresh confidence.
 
         Runs after ``_prepare_inputs`` and before the graph replay, all device
@@ -5136,8 +5146,8 @@ class PyTorchModelEngine(ModelEngine):
         # The scheduler cannot grant more than the real rows can absorb under
         # the published split; the fill tops up any shortfall.
         budget = max(
-            0,
-            min(int(budget), real_tokens - n_real * (cfg.min_verify_len + 1)))
+            0, min(int(budget),
+                   real_tokens - n_real * (cfg.min_verify_len + 1)))
 
         # Snapshot the shape split BEFORE overwriting: past_seen per row is
         # the staged position at each row's first token, and the kv delta
@@ -5204,8 +5214,9 @@ class PyTorchModelEngine(ModelEngine):
         # Overlap corrections gather by each token's OWNER; rebuild both the
         # index and the per-token offset it feeds (mirrors the host staging at
         # the previous_pos_indices block).
-        self.previous_pos_indices_cuda[:real_tokens] = slots_tok[:real_tokens].to(
-            self.previous_pos_indices_cuda.dtype)
+        self.previous_pos_indices_cuda[:
+                                       real_tokens] = slots_tok[:real_tokens].to(
+                                           self.previous_pos_indices_cuda.dtype)
         self.previous_pos_id_offsets_cuda[:real_tokens].copy_(
             new_tokens_lens_device[slots_tok[:real_tokens]])
         # Draft tokens pack compactly, omitting each request's bonus/anchor.
@@ -5224,8 +5235,7 @@ class PyTorchModelEngine(ModelEngine):
                     total_draft_tokens=real_draft,
                 ).to(self.draft_tokens_cuda.dtype))
 
-        apply_device_layout(result.verify_lens, req_idx,
-                            result.kv_correction)
+        apply_device_layout(result.verify_lens, req_idx, result.kv_correction)
         stats = self._dspark_ragged_stats
         if stats is not None:
             stats.record_device_window(
@@ -5372,8 +5382,8 @@ class PyTorchModelEngine(ModelEngine):
                             "carry no verify cap, so caps were dropped for "
                             "the whole batch and this step ran as 'static'. "
                             "The mode is measuring nothing on steps like "
-                            "this one.",
-                            sum(1 for cap in caps if cap is None), len(caps))
+                            "this one.", sum(1 for cap in caps if cap is None),
+                            len(caps))
                 spec_metadata.accept_caps = None
                 spec_metadata.accept_cap_trim = None
                 return
@@ -6288,8 +6298,7 @@ class PyTorchModelEngine(ModelEngine):
                                 request.context_current_position])
                     else:
                         input_ids.append(request.get_last_tokens(0))
-                    input_ids.extend(
-                        request.py_draft_tokens[:num_draft_tokens])
+                    input_ids.extend(request.py_draft_tokens[:num_draft_tokens])
                     draft_tokens.extend(
                         request.py_draft_tokens[:num_draft_tokens])
                 # get other ids and lengths
@@ -6671,9 +6680,8 @@ class PyTorchModelEngine(ModelEngine):
         # batch order when EVERY real generation request did. Recorded here,
         # consumed by _apply_device_window_prologue.
         self._dspark_prev_covers_batch = (
-            previous_batch_len > 0
-            and previous_batch_len == len(extend_requests) -
-            len(extend_dummy_requests))
+            previous_batch_len > 0 and previous_batch_len
+            == len(extend_requests) - len(extend_dummy_requests))
 
         def previous_seq_slots_device():
             previous_batch_indices_host = torch.tensor(
@@ -8346,9 +8354,8 @@ class PyTorchModelEngine(ModelEngine):
             # replay (stream-ordered, no host sync). Graph steps only: eager
             # and capture steps run the host shape split, which is a valid
             # window assignment.
-            if (can_run_graph and not self.is_warmup
-                    and getattr(self, "_dspark_device_budget", None)
-                    is not None):
+            if (can_run_graph and not self.is_warmup and getattr(
+                    self, "_dspark_device_budget", None) is not None):
                 self._apply_device_window_prologue(inputs, new_tensors_device)
 
             with with_shared_pool(self.cuda_graph_runner.get_graph_pool()):

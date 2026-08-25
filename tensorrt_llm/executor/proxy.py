@@ -66,9 +66,10 @@ __all__ = [
 # allgather hands to every rank, so rank-0 receiving it is sufficient and the
 # loop is never paused. get_dspark_ragged_stats() is explicitly rank-local and
 # returns rank 0's diagnostic snapshot without coordinating the worker world.
-_MULTI_RANK_ALLOWED_METHODS: frozenset[str] = frozenset(
-    {"sleep", "wakeup", "get_dspark_ragged_stats",
-     "set_dspark_verify_len_pin", "set_dspark_budget_frac"})
+_MULTI_RANK_ALLOWED_METHODS: frozenset[str] = frozenset({
+    "sleep", "wakeup", "get_dspark_ragged_stats", "set_dspark_verify_len_pin",
+    "set_dspark_budget_frac"
+})
 
 
 def _check_collective_rpc_guard(
