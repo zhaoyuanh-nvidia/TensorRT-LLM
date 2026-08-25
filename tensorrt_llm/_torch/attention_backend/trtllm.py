@@ -2220,8 +2220,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         # passes with seq_len == 1. Keep the presentation scoped around both
         # current-main's library selection and dispatch: support checks read the
         # same runtime metadata as the selected FMHA implementation.
-        token_major_view = (metadata.token_major_gen_view() if
-                            forward_args.attention_input_type
+        token_major_view = (metadata.token_major_gen_view()
+                            if forward_args.attention_input_type
                             == AttentionInputType.generation_only else None)
         with metadata.presented_token_major(token_major_view):
             fmha: Optional[Fmha] = None
@@ -2516,7 +2516,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self._mla_rope_generation_impl(
                 metadata, fused_q, q_pe, latent_cache, cu_q_seqlens,
                 cu_kv_seqlens, fmha_scheduler_counter, mla_bmm1_scale,
-                mla_bmm2_scale, quant_q_buffer, out_scale, helix_tensor_params)
+                mla_bmm2_scale, quant_q_buffer, out_scale, helix_tensor_params,
+                kv_norm_weight, kv_norm_eps, precomputed_cu_seqlens,
+                precomputed_fmha_scheduler, kv_only, kv_done_elsewhere,
+                quant_scale_qkv)
 
     @contextlib.contextmanager
     def presented_token_major_for(self, metadata):
@@ -2527,7 +2530,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                   cu_q_seqlens, cu_kv_seqlens,
                                   fmha_scheduler_counter, mla_bmm1_scale,
                                   mla_bmm2_scale, quant_q_buffer, out_scale,
-                                  helix_tensor_params):
+                                  helix_tensor_params, kv_norm_weight,
+                                  kv_norm_eps, precomputed_cu_seqlens,
+                                  precomputed_fmha_scheduler, kv_only,
+                                  kv_done_elsewhere, quant_scale_qkv):
         torch.ops.trtllm.mla_rope_generation(
             fused_q,
             q_pe,
