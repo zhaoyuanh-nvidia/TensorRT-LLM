@@ -13,8 +13,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from tensorrt_llm._torch.speculative.dspark_observability import (
-    DSparkRaggedStats, RaggedVerifyMode)
+from tensorrt_llm._torch.speculative.dspark_observability import DSparkRaggedStats, RaggedVerifyMode
 from tensorrt_llm._torch.speculative.interface import apply_accept_caps
 
 MAX_DRAFT_LEN = 5
@@ -25,19 +24,16 @@ def _cap_stats(mode=RaggedVerifyMode.CAP_ACCEPT):
 
 
 def _compact_stats(max_draft_len=5):
-    return DSparkRaggedStats(mode=RaggedVerifyMode.COMPACT,
-                             max_draft_len=max_draft_len)
+    return DSparkRaggedStats(mode=RaggedVerifyMode.COMPACT, max_draft_len=max_draft_len)
 
 
 class _Meta:
     """Just the two fields `apply_accept_caps` reads."""
 
     def __init__(self, caps=None, track_trim=True, rows=8):
-        self.accept_caps = (None if caps is None else torch.tensor(
-            caps, dtype=torch.int32))
+        self.accept_caps = None if caps is None else torch.tensor(caps, dtype=torch.int32)
         # Persistent per-request buffer, sized like the engine's.
-        self.accept_cap_trim = (torch.zeros(rows, dtype=torch.int32)
-                                if track_trim else None)
+        self.accept_cap_trim = torch.zeros(rows, dtype=torch.int32) if track_trim else None
 
 
 # --- the cap itself ----------------------------------------------------------
@@ -117,16 +113,14 @@ def test_cap_trim_is_recorded_per_request():
     assert stats.accept_len == pytest.approx(1.5)
     assert stats.accept_loss_per_request == pytest.approx(1.5)
     # accept_len + accept_loss is what a no-trim run would have accepted.
-    assert (stats.accept_len +
-            stats.accept_loss_per_request) == pytest.approx(3.0)
+    assert (stats.accept_len + stats.accept_loss_per_request) == pytest.approx(3.0)
 
     # And the summary carries the measurement.
     summary = stats.summary()
     assert summary["mode"] == "cap-accept"
     assert summary["cap_trim_tokens"] == 3
     assert summary["accept_loss_per_request"] == pytest.approx(1.5)
-    for key in ("requests_cap_trimmed", "cap_trim_max", "cap_trim_hist",
-                "cap_trim_concentration"):
+    for key in ("requests_cap_trimmed", "cap_trim_max", "cap_trim_hist", "cap_trim_concentration"):
         assert key in summary, f"{key} missing from the summary"
 
 
@@ -143,8 +137,7 @@ def test_the_same_total_loss_is_distinguished_by_its_shape():
         concentrated.record_acceptance(accepted=3, window=5, cap_trim=0)
 
     assert spread.cap_trim_tokens == concentrated.cap_trim_tokens == 20
-    assert spread.accept_loss_per_request == pytest.approx(
-        concentrated.accept_loss_per_request)
+    assert spread.accept_loss_per_request == pytest.approx(concentrated.accept_loss_per_request)
 
     # ...and the shape separates them.
     assert spread.cap_trim_concentration == pytest.approx(1.0)
@@ -172,10 +165,9 @@ def test_cap_accept_must_not_be_credited_with_a_compute_saving():
     stats = _cap_stats()
     num_reqs = 4
     full_block = num_reqs * (1 + MAX_DRAFT_LEN)
-    stats.record_step(num_gen_requests=num_reqs,
-                      verify_lens=[5, 3, 2, 1],
-                      bucket=None,
-                      delivered=full_block)
+    stats.record_step(
+        num_gen_requests=num_reqs, verify_lens=[5, 3, 2, 1], bucket=None, delivered=full_block
+    )
 
     assert stats.delivered_tokens == full_block
     assert stats.ceiling_tokens == full_block
@@ -188,9 +180,7 @@ def test_cap_accept_must_not_be_credited_with_a_compute_saving():
 def test_compact_still_derives_delivered_from_the_bucket():
     """The default path is unchanged by the new argument."""
     stats = _cap_stats(mode=RaggedVerifyMode.COMPACT)
-    stats.record_step(num_gen_requests=4,
-                      verify_lens=[5, 3, 2, 1],
-                      bucket=16)
+    stats.record_step(num_gen_requests=4, verify_lens=[5, 3, 2, 1], bucket=16)
     assert stats.delivered_tokens == 16
     assert stats.trim_ratio > 0.0
 
@@ -198,13 +188,8 @@ def test_compact_still_derives_delivered_from_the_bucket():
 def test_device_window_execution_is_reported_separately_from_host_shape():
     """A uniform host split may still be freshly re-ranked before replay."""
     stats = _compact_stats()
-    stats.record_step(num_gen_requests=4,
-                      verify_lens=[3, 3, 3, 3],
-                      bucket=16)
-    stats.record_device_window(forced=True,
-                               num_real=4,
-                               padded_bs=4,
-                               bucket=16)
+    stats.record_step(num_gen_requests=4, verify_lens=[3, 3, 3, 3], bucket=16)
+    stats.record_device_window(forced=True, num_real=4, padded_bs=4, bucket=16)
 
     summary = stats.summary()
     assert summary["steps_uniform_windows"] == 1
@@ -235,12 +220,13 @@ def test_a_slot_left_unwritten_cannot_inherit_the_previous_occupant_s_loss():
     must still zero this batch's slots or recycled slots report stale loss."""
     import inspect
 
-    from tensorrt_llm._torch.speculative.spec_sampler_base import SpecSamplerBase
+    from tensorrt_llm._torch.speculative.spec_sampler_base import SpecSampler
 
-    src = inspect.getsource(SpecSamplerBase.sample_async)
+    src = inspect.getsource(SpecSampler.sample_async)
     assert "zeros_like" in src and "cap_trim_lens" in src, (
         "_process_outputs no longer writes zeros when the step produced no "
-        "cap_trim_lens; recycled slots will report a stale request's loss")
+        "cap_trim_lens; recycled slots will report a stale request's loss"
+    )
 
 
 def test_the_cuda_graph_padding_dummy_carries_a_cap():
@@ -253,12 +239,14 @@ def test_the_cuda_graph_padding_dummy_carries_a_cap():
     src = inspect.getsource(cuda_graph_runner.CUDAGraphRunner._get_padded_batch)
     assert "py_verify_cap" in src, (
         "the padded-batch builder no longer stamps the dummy with a verify "
-        "cap; cap-accept will silently degrade to static on every padded step")
+        "cap; cap-accept will silently degrade to static on every padded step"
+    )
     # And it must be cleared, not left stale: the dummy object is cached
     # across steps and shared between them.
     assert "if cap_accept else None" in src, (
         "the dummy's cap is not cleared for non-cap-accept batches, so a "
-        "stale cap would trim a static step")
+        "stale cap would trim a static step"
+    )
 
 
 def test_the_capture_set_follows_the_mode_not_the_config_flag():
@@ -267,17 +255,17 @@ def test_the_capture_set_follows_the_mode_not_the_config_flag():
     from types import SimpleNamespace
 
     from tensorrt_llm._torch.speculative.dspark_observability import (
-        resolve_ragged_verify_mode, trims_submitted_tokens)
+        resolve_ragged_verify_mode,
+        trims_submitted_tokens,
+    )
 
     ragged_cfg = SimpleNamespace(enable_ragged_verify=True)
 
-    with patch.dict(os.environ,
-                    {"TLLM_DSPARK_RAGGED_VERIFY_MODE": "cap-accept"}):
-        assert resolve_ragged_verify_mode(
-            ragged_cfg) is RaggedVerifyMode.CAP_ACCEPT
+    with patch.dict(os.environ, {"TLLM_DSPARK_RAGGED_VERIFY_MODE": "cap-accept"}):
+        assert resolve_ragged_verify_mode(ragged_cfg) is RaggedVerifyMode.CAP_ACCEPT
         assert not trims_submitted_tokens(ragged_cfg), (
-            "cap-accept submits the full block; a capture set built for it "
-            "must be the uniform one")
+            "cap-accept submits the full block; a capture set built for it must be the uniform one"
+        )
 
     with patch.dict(os.environ, {"TLLM_DSPARK_RAGGED_VERIFY_MODE": "compact"}):
         assert trims_submitted_tokens(ragged_cfg)
@@ -285,8 +273,7 @@ def test_the_capture_set_follows_the_mode_not_the_config_flag():
     # Unset: the config flag decides, which is the pre-existing behaviour.
     with patch.dict(os.environ, {}, clear=True):
         assert trims_submitted_tokens(ragged_cfg)
-        assert not trims_submitted_tokens(
-            SimpleNamespace(enable_ragged_verify=False))
+        assert not trims_submitted_tokens(SimpleNamespace(enable_ragged_verify=False))
     assert not trims_submitted_tokens(None)
 
 
@@ -312,14 +299,14 @@ def test_padding_rows_do_not_make_the_trim_look_negative():
     stats = _compact_stats(max_draft_len=5)
     # 3 real requests, graph padded to 4 rows, every window at the full block.
     # delivered = 4 * 6 = 24. Against a ceiling of 3 * 6 = 18 that is -0.333.
-    stats.record_step(num_gen_requests=3, verify_lens=[5, 5, 5],
-                      bucket=4 * 6, padded_bs=4)
+    stats.record_step(num_gen_requests=3, verify_lens=[5, 5, 5], bucket=4 * 6, padded_bs=4)
     summary = stats.summary()
     assert summary["trim_ratio"] == pytest.approx(0.0), (
         f"a step that verified the full block on every row trimmed nothing, so "
         f"the ratio is 0 -- got {summary['trim_ratio']}, which came from "
         f"comparing {summary['delivered_tokens']} padded-row tokens against a "
-        f"ceiling counted over {3} real requests")
+        f"ceiling counted over {3} real requests"
+    )
     # The padded row count itself must land in the summary: the executor once
     # passed padded_bs=None unconditionally, and an always-empty padded_bs_hist
     # is indistinguishable from "padding never happened".
@@ -331,8 +318,7 @@ def test_a_real_trim_still_reads_as_a_saving():
     stats = _compact_stats(max_draft_len=5)
     # 4 rows, no padding, every window trimmed to 2 -> bucket 4*3 = 12 against a
     # ceiling of 4*6 = 24.
-    stats.record_step(num_gen_requests=4, verify_lens=[2, 2, 2, 2],
-                      bucket=4 * 3, padded_bs=4)
+    stats.record_step(num_gen_requests=4, verify_lens=[2, 2, 2, 2], bucket=4 * 3, padded_bs=4)
     assert stats.summary()["trim_ratio"] == pytest.approx(0.5)
 
 
@@ -345,8 +331,9 @@ def test_paths_without_a_bucket_keep_the_local_row_base():
 
     explicit = _compact_stats(max_draft_len=5)
     # cap-accept: windows are computed but the full block is submitted anyway.
-    explicit.record_step(num_gen_requests=3, verify_lens=[2, 3, 1],
-                         bucket=8 * 6, padded_bs=8, delivered=3 * 6)
+    explicit.record_step(
+        num_gen_requests=3, verify_lens=[2, 3, 1], bucket=8 * 6, padded_bs=8, delivered=3 * 6
+    )
     assert explicit.summary()["trim_ratio"] == pytest.approx(0.0)
 
 
@@ -370,8 +357,7 @@ def test_trim_regret_counts_only_drafts_alive_at_the_cut():
     assert stats.trim_regret_rate == 0.5
     assert stats.accept_len == pytest.approx(2.0)
     summary = stats.summary()
-    for key in ("accept_len", "requests_scored", "requests_trimmed",
-                "trim_regret_rate"):
+    for key in ("accept_len", "requests_scored", "requests_trimmed", "trim_regret_rate"):
         assert key in summary, f"{key} missing from the summary"
 
     # Nothing trimmed: the regret rate is 0/0-safe and stays 0.

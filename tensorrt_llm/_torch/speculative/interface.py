@@ -1967,9 +1967,12 @@ class SpecWorkerBase(nn.Module, ABC):
         # captured; whether it changes anything is decided on device by
         # ``penalty_active``, which the replayed kernel re-reads every step.
         draft_len = draft_tokens.shape[1] if draft_tokens.dim() > 1 else 0
-        mapping = penalty_ops.build_row_mapping(spec_metadata, num_contexts,
-                                                batch_size, draft_len,
-                                                draft_tokens, logits.device,
+        mapping = penalty_ops.build_row_mapping(spec_metadata,
+                                                num_contexts,
+                                                batch_size,
+                                                draft_len,
+                                                draft_tokens,
+                                                logits.device,
                                                 num_logit_rows=logits.shape[0])
         if mapping is None:
             return logits
@@ -2260,8 +2263,7 @@ class SpecWorkerBase(nn.Module, ABC):
             # Fail closed on a half-built ragged layout: the branch below
             # dereferences all three of these.
             total_verify_tokens = spec_metadata.total_verify_tokens
-            if (total_verify_tokens is None
-                    or spec_metadata.verify_lens is None
+            if (total_verify_tokens is None or spec_metadata.verify_lens is None
                     or spec_metadata.qo_indptr is None):
                 return False
             required_gen_rows = int(total_verify_tokens)
@@ -2570,8 +2572,7 @@ class SpecWorkerBase(nn.Module, ABC):
         row segment at offset ``tp_rank * max_num_requests`` -- NOT rows
         ``[:batch]``, which belong to group rank 0.
         """
-        if (mapping_lm_head_tp is not None
-                and mapping_lm_head_tp.tp_size > 1):
+        if (mapping_lm_head_tp is not None and mapping_lm_head_tp.tp_size > 1):
             from ..distributed.ops import allgather
             combined = self._get_local_max_and_combined(logits,
                                                         mapping_lm_head_tp)
@@ -2860,7 +2861,7 @@ class SpecWorkerBase(nn.Module, ABC):
             return
 
         saved_state = prepare_attn_metadata_for_draft_replay(
-              attn_metadata, draft_kv_cache_manager)
+            attn_metadata, draft_kv_cache_manager)
         if saved_state is None:
             yield attn_metadata
             return

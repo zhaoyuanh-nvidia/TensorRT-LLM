@@ -25,7 +25,7 @@ flat cost model the budget degenerates to verify-all.
 import os
 from collections import Counter
 from enum import Enum
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Dict, Optional, Sequence
 
 from ...logger import logger
 
@@ -61,7 +61,7 @@ class RaggedVerifyMode(str, Enum):
 
 
 def read_ragged_verify_mode(
-        default: RaggedVerifyMode = RaggedVerifyMode.STATIC
+    default: RaggedVerifyMode = RaggedVerifyMode.STATIC,
 ) -> RaggedVerifyMode:
     """Resolve the verification mode from the environment.
 
@@ -77,7 +77,8 @@ def read_ragged_verify_mode(
             return mode
     raise ValueError(
         f"invalid {RAGGED_VERIFY_MODE_ENV}={value!r}; expected one of "
-        f"{', '.join(repr(m.value) for m in RaggedVerifyMode)}")
+        f"{', '.join(repr(m.value) for m in RaggedVerifyMode)}"
+    )
 
 
 def resolve_ragged_verify_mode(spec_config) -> RaggedVerifyMode:
@@ -88,8 +89,11 @@ def resolve_ragged_verify_mode(spec_config) -> RaggedVerifyMode:
     key) must ask :attr:`RaggedVerifyMode.trims_submitted_tokens`. Must stay
     identical to the DSpark worker's own resolution.
     """
-    configured = (RaggedVerifyMode.COMPACT if getattr(
-        spec_config, "enable_ragged_verify", False) else RaggedVerifyMode.STATIC)
+    configured = (
+        RaggedVerifyMode.COMPACT
+        if getattr(spec_config, "enable_ragged_verify", False)
+        else RaggedVerifyMode.STATIC
+    )
     return read_ragged_verify_mode(default=configured)
 
 
@@ -230,10 +234,8 @@ class DSparkRaggedStats:
 
         if not verify_lens:
             self.steps_no_windows += 1
-            self.window_tokens += int(num_gen_requests) * (1 +
-                                                           self.max_draft_len)
-            self.delivered_tokens += int(num_gen_requests) * (
-                1 + self.max_draft_len)
+            self.window_tokens += int(num_gen_requests) * (1 + self.max_draft_len)
+            self.delivered_tokens += int(num_gen_requests) * (1 + self.max_draft_len)
             return
 
         lens = [int(v) for v in verify_lens]
@@ -245,9 +247,7 @@ class DSparkRaggedStats:
         if delivered is not None:
             self.delivered_tokens += int(delivered)
         else:
-            self.delivered_tokens += int(bucket) if bucket else sum(1 + v
-                                                                    for v in
-                                                                    lens)
+            self.delivered_tokens += int(bucket) if bucket else sum(1 + v for v in lens)
         if bucket:
             self.bucket_hist[int(bucket)] += 1
         if padded_bs:
@@ -272,12 +272,10 @@ class DSparkRaggedStats:
         self.graph_eager += 1
         if shape is not None:
             reason, key = shape
-            self.graph_miss_reasons[reason] = (
-                self.graph_miss_reasons.get(reason, 0) + 1)
+            self.graph_miss_reasons[reason] = self.graph_miss_reasons.get(reason, 0) + 1
             if key is not None:
                 text = str(key)
-                self.graph_miss_shapes[text] = (
-                    self.graph_miss_shapes.get(text, 0) + 1)
+                self.graph_miss_shapes[text] = self.graph_miss_shapes.get(text, 0) + 1
 
     def record_device_window(
         self,
@@ -319,11 +317,7 @@ class DSparkRaggedStats:
         """How many different window sizes were ever handed out."""
         return len(self.verify_len_hist)
 
-    def record_acceptance(self,
-                          *,
-                          accepted: int,
-                          window: int,
-                          cap_trim: int = 0) -> None:
+    def record_acceptance(self, *, accepted: int, window: int, cap_trim: int = 0) -> None:
         """Record one request's acceptance against the window it was given.
 
         Args:
@@ -423,8 +417,7 @@ class DSparkRaggedStats:
             "device_window_steps": self.device_window_steps,
             "forced_device_window_steps": self.forced_device_window_steps,
             "forced_device_window_trimmed_steps": self.forced_device_window_trimmed_steps,
-            "device_window_shape_hist": dict(
-                sorted(self.device_window_shape_hist.items())),
+            "device_window_shape_hist": dict(sorted(self.device_window_shape_hist.items())),
             "fallbacks": dict(self.fallbacks),
             "planner": dict(self.planner_stats) if self.planner_stats else {},
         }

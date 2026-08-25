@@ -36,13 +36,30 @@ from tensorrt_llm._torch.speculative.dspark_planner import SpsCostTable, total_v
 # resolve annotations through sys.modules[cls.__module__].__dict__.
 _SPEC = importlib.util.spec_from_file_location(
     "dspark_sps_profiler",
-    pathlib.Path(__file__).resolve().parents[4] / "microbenchmarks" /
-    "dspark_sps_profiler.py")
+    pathlib.Path(__file__).resolve().parents[4] / "microbenchmarks" / "dspark_sps_profiler.py",
+)
 _PROFILER = importlib.util.module_from_spec(_SPEC)
 sys.modules[_SPEC.name] = _PROFILER
 _SPEC.loader.exec_module(_PROFILER)
 
-globals().update({name: getattr(_PROFILER, name) for name in ('CellStat', 'FlatCostTableError', 'InertCostTableError', 'InsufficientSamplesError', 'StepSample', 'SweepConfig', 'SweepGeometryError', 'aligned_steps_from_stats', 'build_cost_table_payload', 'check_table_is_informative', 'compress_to_risers', 'fit_additive_cost_model', 'load_cost_table', 'profitability_probe', 'resolve_padded_shape', 'running_max', 'samples_from_iter_log', 'summarize_cells')})
+CellStat = _PROFILER.CellStat
+FlatCostTableError = _PROFILER.FlatCostTableError
+InertCostTableError = _PROFILER.InertCostTableError
+InsufficientSamplesError = _PROFILER.InsufficientSamplesError
+StepSample = _PROFILER.StepSample
+SweepConfig = _PROFILER.SweepConfig
+SweepGeometryError = _PROFILER.SweepGeometryError
+aligned_steps_from_stats = _PROFILER.aligned_steps_from_stats
+build_cost_table_payload = _PROFILER.build_cost_table_payload
+check_table_is_informative = _PROFILER.check_table_is_informative
+compress_to_risers = _PROFILER.compress_to_risers
+fit_additive_cost_model = _PROFILER.fit_additive_cost_model
+load_cost_table = _PROFILER.load_cost_table
+profitability_probe = _PROFILER.profitability_probe
+resolve_padded_shape = _PROFILER.resolve_padded_shape
+running_max = _PROFILER.running_max
+samples_from_iter_log = _PROFILER.samples_from_iter_log
+summarize_cells = _PROFILER.summarize_cells
 
 #: The exact set of keys ``dspark.py::_build_verify_planner`` reads. Anything
 #: else in the file is ignored by the loader, so the profiler must not rely on
@@ -53,6 +70,7 @@ LOADER_KEYS = {
     "fixed_overhead_ms",
     "batch_sizes",
     "batch_overhead_ms",
+    "minimum_predicted_gain",
 }
 
 
@@ -158,14 +176,16 @@ def test_summarize_drops_thin_cells_outside_the_requested_grid():
     REQUESTED cell must still refuse -- with or without a requested grid."""
     grid = [(8, 3)]
     requested = _samples(8, 3, [10.0] * 8)
-    ramp = _samples(2, 3, [30.0])                    # thin, incidental: drop
-    thick_extra = _samples(4, 3, [20.0] * 8)         # thick, incidental: keep
-    cells = summarize_cells(requested + ramp + thick_extra, warmup_steps=0,
-                            min_samples=4, expected_cells=grid)
+    ramp = _samples(2, 3, [30.0])  # thin, incidental: drop
+    thick_extra = _samples(4, 3, [20.0] * 8)  # thick, incidental: keep
+    cells = summarize_cells(
+        requested + ramp + thick_extra, warmup_steps=0, min_samples=4, expected_cells=grid
+    )
     assert [(c.batch_size, c.verify_len) for c in cells] == [(4, 3), (8, 3)]
     with pytest.raises(InsufficientSamplesError, match="steady samples"):
-        summarize_cells(_samples(8, 3, [10.0]) + thick_extra, warmup_steps=0,
-                        min_samples=4, expected_cells=grid)
+        summarize_cells(
+            _samples(8, 3, [10.0]) + thick_extra, warmup_steps=0, min_samples=4, expected_cells=grid
+        )
     # No grid given means every observed cell was requested: same refusal.
     with pytest.raises(InsufficientSamplesError, match="steady samples"):
         summarize_cells(_samples(8, 3, [10.0] * 5), warmup_steps=4, min_samples=8)
@@ -228,7 +248,9 @@ def _staircase(edges_and_costs):
 BATCH_SIZES = [8, 16, 32, 64]
 VERIFY_LENS = [1, 2, 3, 4, 5]
 ALPHA = {8: 20.0, 16: 22.0, 32: 26.0, 64: 34.0}
-THETA = _staircase([(0, 1.0), (64, 2.0), (128, 4.0), (256, 8.0)])
+# Keep the final riser strong enough that the synthetic table remains
+# informative after the production 1% minimum-gain guard is applied.
+THETA = _staircase([(0, 1.0), (64, 2.0), (128, 4.0), (256, 9.0)])
 
 
 def test_fit_recovers_relative_structure_exactly():
@@ -491,8 +513,12 @@ def test_validate_rejects_a_sequence_that_would_be_evicted():
 def test_validate_rejects_a_decode_step_wider_than_max_num_tokens():
     """A split decode step never has the shape its cell is filed under."""
     with pytest.raises(SweepGeometryError, match="widest decode step"):
-        _sweep(batch_sizes=[8, 4096], max_num_tokens=1024, max_seq_len=8192,
-               block_follows_verify_len=True).validate()
+        _sweep(
+            batch_sizes=[8, 4096],
+            max_num_tokens=1024,
+            max_seq_len=8192,
+            block_follows_verify_len=True,
+        ).validate()
 
 
 def test_validate_accepts_a_sane_sweep():
@@ -567,15 +593,17 @@ LADDER = [1, 2, 4, 8, 16, 32, 64, 128, 192, 256]
 
 
 def _line(iteration, bs, step_ms, gen_tokens, rank="0"):
-    return (f"{rank}: [08/04/2026-19:08:13] [TRT-LLM] [I] [_torch][RANK 0] "
-            f"iter = {iteration}, global_rank = 0, rank = 0, "
-            f"num_scheduled_requests = {bs}, kv_cache_util = 0.125, "
-            f"currank_total_requests = 1/8, host_step_time = {step_ms}ms, "
-            f"prev_device_step_time = {step_ms}ms, "
-            f"timestamp = 2026-08-04 19:08:13, "
-            f"states = {{'num_ctx_requests': 0, 'num_ctx_tokens': 0, "
-            f"'num_generation_tokens': {gen_tokens}, "
-            f"'cached_kv_tokens': 63821}}")
+    return (
+        f"{rank}: [08/04/2026-19:08:13] [TRT-LLM] [I] [_torch][RANK 0] "
+        f"iter = {iteration}, global_rank = 0, rank = 0, "
+        f"num_scheduled_requests = {bs}, kv_cache_util = 0.125, "
+        f"currank_total_requests = 1/8, host_step_time = {step_ms}ms, "
+        f"prev_device_step_time = {step_ms}ms, "
+        f"timestamp = 2026-08-04 19:08:13, "
+        f"states = {{'num_ctx_requests': 0, 'num_ctx_tokens': 0, "
+        f"'num_generation_tokens': {gen_tokens}, "
+        f"'cached_kv_tokens': 63821}}"
+    )
 
 
 def _write(lines, name="gen.log"):
@@ -589,18 +617,18 @@ def _write(lines, name="gen.log"):
 def test_verify_length_comes_from_the_padded_token_total():
     """The label is read out of the log, never inferred from step times; steps
     the ladder cannot explain are skipped, not mislabelled."""
-    log = _write([
-        _line(1, 1, 62098.0, 6),        # executor's first step: dropped
-        _line(2, 244, 79.2, 768),       # 244 rows padded to 256 -> rung-2
-        _line(3, 242, 117.1, 1536),     # padded to 256 -> full block
-        _line(4, 128, 61.0, 384),       # exactly 128 rows -> rung-2
-        _line(5, 256, 300.0, 2048),     # L = 7, past the block: skipped
-        _line(6, 300, 400.0, 1800),     # more rows than the ladder holds: skipped
-    ])
-    samples = samples_from_iter_log([log], max_draft_len=5,
-                                    padded_batch_sizes=LADDER)
-    got = sorted((s.batch_size, s.verify_len, s.step_time_ms)
-                 for s in samples)
+    log = _write(
+        [
+            _line(1, 1, 62098.0, 6),  # executor's first step: dropped
+            _line(2, 244, 79.2, 768),  # 244 rows padded to 256 -> rung-2
+            _line(3, 242, 117.1, 1536),  # padded to 256 -> full block
+            _line(4, 128, 61.0, 384),  # exactly 128 rows -> rung-2
+            _line(5, 256, 300.0, 2048),  # L = 7, past the block: skipped
+            _line(6, 300, 400.0, 1800),  # more rows than the ladder holds: skipped
+        ]
+    )
+    samples = samples_from_iter_log([log], max_draft_len=5, padded_batch_sizes=LADDER)
+    got = sorted((s.batch_size, s.verify_len, s.step_time_ms) for s in samples)
     assert got == [(128, 2, 61.0), (256, 2, 79.2), (256, 5, 117.1)]
     # The table is indexed by the padded token total, which each sample exposes.
     assert sorted(s.total_verify_tokens for s in samples) == [384, 768, 1536]
@@ -609,28 +637,49 @@ def test_verify_length_comes_from_the_padded_token_total():
 def test_the_padded_width_is_what_gets_recorded():
     """A padded step is filed under the padded width, the ladder disambiguates
     the verify length, and an unexplainable token total drops the step."""
-    assert resolve_padded_shape(num_rows=244, num_generation_tokens=768,
-                                max_draft_len=5, max_batch_size=256,
-                                padded_batch_sizes=LADDER) == (256, 2)
-    assert resolve_padded_shape(num_rows=128, num_generation_tokens=768,
-                                max_draft_len=5, max_batch_size=256) is None
-    assert resolve_padded_shape(num_rows=128, num_generation_tokens=768,
-                                max_draft_len=5, max_batch_size=256,
-                                padded_batch_sizes=LADDER) == (128, 5)
-    assert resolve_padded_shape(num_rows=200, num_generation_tokens=600,
-                                max_draft_len=5, max_batch_size=256,
-                                padded_batch_sizes=LADDER) is None
+    assert resolve_padded_shape(
+        num_rows=244,
+        num_generation_tokens=768,
+        max_draft_len=5,
+        max_batch_size=256,
+        padded_batch_sizes=LADDER,
+    ) == (256, 2)
+    assert (
+        resolve_padded_shape(
+            num_rows=128, num_generation_tokens=768, max_draft_len=5, max_batch_size=256
+        )
+        is None
+    )
+    assert resolve_padded_shape(
+        num_rows=128,
+        num_generation_tokens=768,
+        max_draft_len=5,
+        max_batch_size=256,
+        padded_batch_sizes=LADDER,
+    ) == (128, 5)
+    assert (
+        resolve_padded_shape(
+            num_rows=200,
+            num_generation_tokens=600,
+            max_draft_len=5,
+            max_batch_size=256,
+            padded_batch_sizes=LADDER,
+        )
+        is None
+    )
 
 
 def test_the_first_step_of_each_executor_is_dropped():
     """Each executor numbers from iter 1 and its first step's host time
     contains the wait for the first request, so it is never a measurement."""
-    log = _write([
-        _line(1, 1, 200.0, 6),          # KV-estimation executor
-        _line(2, 256, 79.0, 768),
-        _line(1, 1, 62098.0, 6),        # real executor starts over
-        _line(2, 256, 79.4, 768),
-    ])
+    log = _write(
+        [
+            _line(1, 1, 200.0, 6),  # KV-estimation executor
+            _line(2, 256, 79.0, 768),
+            _line(1, 1, 62098.0, 6),  # real executor starts over
+            _line(2, 256, 79.4, 768),
+        ]
+    )
     times = [s.step_time_ms for s in samples_from_iter_log([log], max_draft_len=5)]
     assert times == [79.0, 79.4]
 
@@ -638,24 +687,24 @@ def test_the_first_step_of_each_executor_is_dropped():
 def test_only_the_requested_rank_is_read():
     """Every rank logs; counting all of them would multiply every cell.
     Outlier steps are bounded out on the same pass."""
-    log = _write([
-        _line(2, 256, 79.2, 768, rank="0"),
-        _line(2, 256, 79.9, 768, rank="3"),   # another rank's copy: dropped
-        _line(3, 256, 5000.0, 768),           # outlier past max_step_ms
-    ])
-    times = [s.step_time_ms for s in
-             samples_from_iter_log([log], max_draft_len=5, max_step_ms=1000.0)]
+    log = _write(
+        [
+            _line(2, 256, 79.2, 768, rank="0"),
+            _line(2, 256, 79.9, 768, rank="3"),  # another rank's copy: dropped
+            _line(3, 256, 5000.0, 768),  # outlier past max_step_ms
+        ]
+    )
+    times = [
+        s.step_time_ms for s in samples_from_iter_log([log], max_draft_len=5, max_step_ms=1000.0)
+    ]
     assert times == [79.2]
 
 
 def test_several_logs_are_pooled():
     """One arm gives one rung; the table needs the ladder, so pool the runs."""
-    a = _write([_line(1, 1, 100.0, 6), _line(2, 256, 117.1, 1536)],
-               name="a.log")
-    c = _write([_line(1, 1, 100.0, 6), _line(2, 256, 79.2, 768)],
-               name="c.log")
-    got = sorted(s.verify_len for s in
-                 samples_from_iter_log([a, c], max_draft_len=5))
+    a = _write([_line(1, 1, 100.0, 6), _line(2, 256, 117.1, 1536)], name="a.log")
+    c = _write([_line(1, 1, 100.0, 6), _line(2, 256, 79.2, 768)], name="c.log")
+    got = sorted(s.verify_len for s in samples_from_iter_log([a, c], max_draft_len=5))
     assert got == [2, 5]
 
 
@@ -663,6 +712,6 @@ def test_a_log_without_the_states_dict_yields_nothing():
     """enable_iter_perf_stats off: fail loudly upstream, not with a bad table."""
     path = pathlib.Path(tempfile.mkdtemp()) / "bare.log"
     path.write_text(
-        "0: [TRT-LLM] iter = 2, num_scheduled_requests = 256, "
-        "host_step_time = 79.2ms\n")
+        "0: [TRT-LLM] iter = 2, num_scheduled_requests = 256, host_step_time = 79.2ms\n"
+    )
     assert samples_from_iter_log([str(path)], max_draft_len=5) == []

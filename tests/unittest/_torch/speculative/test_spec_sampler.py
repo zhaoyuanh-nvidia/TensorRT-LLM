@@ -745,11 +745,9 @@ def test_group_override_pulls_greedy_rank_onto_advanced_path():
         (False, True, False),
     ]
     for group_value, force_capture, expected in cases:
-        meta = _fake_meta(group_all_greedy_sample=group_value,
-                          force_capture=force_capture)
+        meta = _fake_meta(group_all_greedy_sample=group_value, force_capture=force_capture)
         _scan(meta, [_fake_request(), _fake_request()])
-        assert meta.is_all_greedy_sample is expected, (group_value,
-                                                       force_capture)
+        assert meta.is_all_greedy_sample is expected, (group_value, force_capture)
 
 
 def test_group_override_survives_rescan():

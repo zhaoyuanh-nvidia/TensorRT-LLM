@@ -14,10 +14,17 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.speculative.dspark_planner import (
-    SpsCostTable, budget_argmax_over_uniform_lens, check_table_fingerprint,
-    compute_verify_token_budget, derive_verify_len_tiers)
+    SpsCostTable,
+    budget_argmax_over_uniform_lens,
+    check_table_fingerprint,
+    compute_verify_token_budget,
+    derive_verify_len_tiers,
+)
 from tensorrt_llm._torch.speculative.dspark_schedule import (
-    DSparkScheduleConfig, compute_survival, schedule_verify_lens_topk)
+    DSparkScheduleConfig,
+    compute_survival,
+    schedule_verify_lens_topk,
+)
 from tensorrt_llm._torch.speculative.dspark_verify import DSparkVerifyPlanner
 
 BLOCK = 7
@@ -112,6 +119,29 @@ def test_cost_table_rejects_malformed_input():
         SpsCostTable(token_counts=(0, 1), step_time_ms=(1.0,))
     with pytest.raises(ValueError, match="positive"):
         SpsCostTable(token_counts=(0,), step_time_ms=(0.0,))
+    with pytest.raises(ValueError, match="minimum_predicted_gain"):
+        SpsCostTable(token_counts=(0,), step_time_ms=(1.0,), minimum_predicted_gain=-0.01)
+
+
+def test_minimum_gain_guard_falls_back_to_full_budget():
+    """A noise-sized compact advantage must preserve ordinary full K."""
+    bs, block = 4, 5
+    survival = np.ones((bs, block), dtype=np.float64)
+    full_tokens = bs * (block + 1)
+    table = SpsCostTable(
+        token_counts=(2 * bs, full_tokens),
+        step_time_ms=(3.3, 10.0),
+        minimum_predicted_gain=0.02,
+    )
+    budget = compute_verify_token_budget(
+        survival=survival,
+        num_gen_requests=bs,
+        cost_table=table,
+        min_verify_len=1,
+        max_verify_len=block,
+        allowed_lens=[1, block],
+    )
+    assert budget == bs * (block - 1)
 
 
 # --------------------------------------------------------------------------
@@ -132,16 +162,19 @@ def test_allocation_is_a_prefix_and_respects_bounds():
     # Zero budget degenerates to the floor for everyone.
     cfg_floor = _cfg(min_verify_len=2)
     lens = schedule_verify_lens_topk(
-        survival=compute_survival(torch.rand(5, BLOCK)), budget=0, cfg=cfg_floor)
+        survival=compute_survival(torch.rand(5, BLOCK)), budget=0, cfg=cfg_floor
+    )
     assert torch.equal(lens, torch.full((5,), 2, dtype=torch.int32))
     # A huge budget saturates at the cap.
     cfg_cap = _cfg(min_verify_len=1, max_verify_len=4)
     lens = schedule_verify_lens_topk(
-        survival=compute_survival(torch.full((5, BLOCK), 0.99)), budget=10**6, cfg=cfg_cap)
+        survival=compute_survival(torch.full((5, BLOCK), 0.99)), budget=10**6, cfg=cfg_cap
+    )
     assert torch.equal(lens, torch.full((5,), 4, dtype=torch.int32))
     # An empty batch allocates nothing.
-    assert schedule_verify_lens_topk(
-        survival=torch.zeros(0, BLOCK), budget=5, cfg=_cfg()).numel() == 0
+    assert (
+        schedule_verify_lens_topk(survival=torch.zeros(0, BLOCK), budget=5, cfg=_cfg()).numel() == 0
+    )
 
 
 def test_survival_eps_excludes_hopeless_positions():
@@ -324,6 +357,56 @@ def test_planner_rejects_a_row_list_that_does_not_match_the_batch():
     assert p.stats["fallback_short_snapshot"] == 1
 
 
+def test_planner_routes_a_selected_full_budget_to_native_static_k():
+    """Full K is a fallback decision, not a reason to pack a ragged graph."""
+    bs, block = 4, 5
+    planner = DSparkVerifyPlanner(
+        cfg=DSparkScheduleConfig(block_size=block, min_verify_len=1),
+        cost_table=SpsCostTable(
+            token_counts=(0, bs * (block + 1)),
+            step_time_ms=(10.0, 10.01),
+            minimum_predicted_gain=0.01,
+        ),
+        tiers=[1, 3, block],
+    )
+    planner._gather_rows = lambda **_: torch.full((bs, block), 8.0)
+    assert planner.decide_verify_lens(num_gen_requests=bs, reduce_across_ranks=False) is None
+    assert planner.stats["fallback_full_k"] == 1
+
+
+def test_cross_rank_full_bucket_routes_to_native_static_k():
+    """A compact local choice promoted to full GxK must skip ragged work."""
+    import types
+
+    from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
+
+    planner = types.SimpleNamespace(
+        forced_verify_len=None,
+        forced_budget_frac=None,
+        stats={},
+    )
+    runner = types.SimpleNamespace(
+        enabled=True,
+        agreed_ragged_bucket=999,
+        supported_batch_sizes=[4],
+        _round_up_batch_size=lambda _: 4,
+        will_pad_to=lambda *_: True,
+    )
+    engine = types.SimpleNamespace(
+        cuda_graph_runner=runner,
+        spec_config=types.SimpleNamespace(verify_len_tiers=[1, 3, 5]),
+        _dspark_last_padded_bs=999,
+        ragged_verify_token_buckets=lambda _: [8, 16, 24],
+        _get_spec_worker=lambda: types.SimpleNamespace(verify_planner=planner),
+    )
+
+    bucket = PyTorchModelEngine.fit_ragged_verify_lens(engine, [object()] * 4, [5] * 4)
+    assert bucket is None
+    assert runner.agreed_ragged_bucket is None
+    assert engine._dspark_last_padded_bs is None
+    assert planner.stats["fallback_full_k"] == 1
+
+
 def _capture_set(batch_sizes, tiers, max_draft_len=BLOCK):
     """Invoke PyTorchModelEngine._get_graphs_to_capture with a stub engine."""
     import types
@@ -349,7 +432,7 @@ def _capture_set(batch_sizes, tiers, max_draft_len=BLOCK):
         _dynamic_draft_len_mapping=None,
         _cuda_graph_batch_sizes=list(batch_sizes),
     )
-    return PyTorchModelEngine._get_graphs_to_capture(engine, list(batch_sizes), None)
+    return PyTorchModelEngine._get_graphs_to_capture(engine, list(batch_sizes))
 
 
 def test_capture_pins_the_draft_length_to_the_top_tier():
@@ -359,7 +442,8 @@ def test_capture_pins_the_draft_length_to_the_top_tier():
     graphs = _capture_set(bss, tiers)
     assert set(graphs) == {(bs, BLOCK) for bs in bss}
     assert len(graphs) == len(bss), (
-        f"expected one graph per batch size, got {len(graphs)}: {graphs}")
+        f"expected one graph per batch size, got {len(graphs)}: {graphs}"
+    )
 
 
 # --------------------------------------------------------------------------
@@ -374,18 +458,20 @@ def _block5_cfg() -> DSparkScheduleConfig:
 def test_topk_hands_longer_windows_to_more_confident_requests():
     """The budget must follow survival, not batch position."""
     # survival[r, k] = P(the first k+1 drafted tokens all get accepted)
-    survival = torch.tensor([
-        [0.99, 0.98, 0.97, 0.96, 0.95],  # confident
-        [0.90, 0.70, 0.50, 0.30, 0.10],  # middling
-        [0.20, 0.04, 0.01, 0.00, 0.00],  # collapses
-    ])
-    lens = schedule_verify_lens_topk(survival=survival, budget=6,
-                                     cfg=_block5_cfg()).tolist()
+    survival = torch.tensor(
+        [
+            [0.99, 0.98, 0.97, 0.96, 0.95],  # confident
+            [0.90, 0.70, 0.50, 0.30, 0.10],  # middling
+            [0.20, 0.04, 0.01, 0.00, 0.00],  # collapses
+        ]
+    )
+    lens = schedule_verify_lens_topk(survival=survival, budget=6, cfg=_block5_cfg()).tolist()
 
     assert len(lens) == 3
     assert lens[0] > lens[2], (
         f"confident request got {lens[0]}, collapsing request got {lens[2]}; "
-        f"the budget must follow survival, not batch position")
+        f"the budget must follow survival, not batch position"
+    )
     assert lens[0] >= lens[1] >= lens[2]
     # Every request keeps at least the floor, and the budget is respected.
     assert min(lens) >= 1
@@ -397,8 +483,7 @@ def test_a_full_budget_degenerates_to_the_uniform_full_window():
     num_reqs, max_len = 4, 5
     survival = torch.full((num_reqs, max_len), 0.99)
     budget = num_reqs * (max_len - 1)
-    lens = schedule_verify_lens_topk(survival=survival, budget=budget,
-                                     cfg=_block5_cfg()).tolist()
+    lens = schedule_verify_lens_topk(survival=survival, budget=budget, cfg=_block5_cfg()).tolist()
     assert lens == [max_len] * num_reqs
 
 
@@ -407,11 +492,13 @@ def test_a_full_budget_degenerates_to_the_uniform_full_window():
 # --------------------------------------------------------------------------
 
 # The certified GB300 table's shape, abbreviated to two breakpoints.
-TABLE = SpsCostTable(token_counts=(512, 768, 1536),
-                     step_time_ms=(23.85, 35.61, 105.64),
-                     fixed_overhead_ms=25.244,
-                     batch_sizes=(128, 256),
-                     batch_overhead_ms=(11.462, 19.343))
+TABLE = SpsCostTable(
+    token_counts=(512, 768, 1536),
+    step_time_ms=(23.85, 35.61, 105.64),
+    fixed_overhead_ms=25.244,
+    batch_sizes=(128, 256),
+    batch_overhead_ms=(11.462, 19.343),
+)
 
 
 def test_theta_interpolates_between_breakpoints():
@@ -430,15 +517,15 @@ def test_theta_interpolates_between_breakpoints():
 def test_alpha_interpolates_and_clamps():
     assert TABLE.batch_overhead(128) == pytest.approx(11.462)
     assert TABLE.batch_overhead(192) == pytest.approx((11.462 + 19.343) / 2)
-    assert TABLE.batch_overhead(64) == pytest.approx(11.462)   # clamp low
+    assert TABLE.batch_overhead(64) == pytest.approx(11.462)  # clamp low
     assert TABLE.batch_overhead(512) == pytest.approx(19.343)  # clamp high
 
 
 def test_theta_clamps_outside_the_measured_range():
     """Theta clamps to the end values; a table without a batch axis adds no alpha."""
-    plain = SpsCostTable(token_counts=(512, 768, 1536),
-                         step_time_ms=(23.85, 35.61, 105.64),
-                         fixed_overhead_ms=25.244)
+    plain = SpsCostTable(
+        token_counts=(512, 768, 1536), step_time_ms=(23.85, 35.61, 105.64), fixed_overhead_ms=25.244
+    )
     assert plain.step_time(100, 0) == pytest.approx(25.244 + 23.85)
     assert plain.step_time(4096, 0) == pytest.approx(25.244 + 105.64)
 
@@ -465,11 +552,13 @@ def _sgl_interp_clamped(xs, ys, x: float) -> float:
 
 def _sgl_additive_step_time(table, num_requests: int, num_budgets: int):
     floor = table["bias_seconds"] + _sgl_interp_clamped(
-        table["bs_probes"], table["alpha_seconds"], float(num_requests))
+        table["bs_probes"], table["alpha_seconds"], float(num_requests)
+    )
     m_probes = torch.tensor(table["m_probes"], dtype=torch.float64)
     theta_vals = torch.tensor(table["theta_seconds"], dtype=torch.float64)
     m = (num_requests + torch.arange(num_budgets, dtype=torch.float64)).clamp_(
-        min=float(table["m_probes"][0]), max=float(table["m_probes"][-1]))
+        min=float(table["m_probes"][0]), max=float(table["m_probes"][-1])
+    )
     hi = torch.bucketize(m, m_probes, right=True).clamp_(1, m_probes.numel() - 1)
     lo = hi - 1
     span = (m_probes[hi] - m_probes[lo]).clamp_(min=1e-9)
@@ -478,17 +567,16 @@ def _sgl_additive_step_time(table, num_requests: int, num_budgets: int):
     return floor + theta_at_m
 
 
-def _sgl_compute_verify_token_budget(*, history_survival_probs, table,
-                                     max_verify_len, survival_eps):
+def _sgl_compute_verify_token_budget(
+    *, history_survival_probs, table, max_verify_len, survival_eps
+):
     num_requests = history_survival_probs.shape[0]
     candidates = history_survival_probs[:, :max_verify_len].flatten()
     candidates = candidates[candidates >= survival_eps].to(torch.float64)
     candidates_sorted = torch.sort(candidates, descending=True).values
     prefix_sum = torch.cumsum(candidates_sorted, dim=0)
-    tau_star = num_requests + torch.cat(
-        [torch.zeros(1, dtype=torch.float64), prefix_sum])
-    step_time = _sgl_additive_step_time(table, int(num_requests),
-                                        int(tau_star.numel()))
+    tau_star = num_requests + torch.cat([torch.zeros(1, dtype=torch.float64), prefix_sum])
+    step_time = _sgl_additive_step_time(table, int(num_requests), int(tau_star.numel()))
     theta = tau_star / step_time
     return int(torch.argmax(theta))
 
@@ -504,9 +592,13 @@ BS_PROBES = (32, 64, 128, 256)
 ALPHA_MS = (0.0, 2.177477, 11.462212, 19.342661)
 SGL_BLOCK = 5
 
-TRT_TABLE = SpsCostTable(token_counts=M_PROBES, step_time_ms=THETA_MS,
-                         fixed_overhead_ms=BIAS_MS, batch_sizes=BS_PROBES,
-                         batch_overhead_ms=ALPHA_MS)
+TRT_TABLE = SpsCostTable(
+    token_counts=M_PROBES,
+    step_time_ms=THETA_MS,
+    fixed_overhead_ms=BIAS_MS,
+    batch_sizes=BS_PROBES,
+    batch_overhead_ms=ALPHA_MS,
+)
 SGL_TABLE = {
     "m_probes": M_PROBES,
     "theta_seconds": tuple(v / 1e3 for v in THETA_MS),
@@ -532,14 +624,18 @@ def test_budget_argmax_matches_sglang_up_to_the_floor_shift(bs):
         surv = _inversion_free_survival(rng, bs)
         sgl_n = _sgl_compute_verify_token_budget(
             history_survival_probs=torch.tensor(surv, dtype=torch.float32),
-            table=SGL_TABLE, max_verify_len=SGL_BLOCK, survival_eps=0.0)
+            table=SGL_TABLE,
+            max_verify_len=SGL_BLOCK,
+            survival_eps=0.0,
+        )
         trt_m = compute_verify_token_budget(
-            survival=surv, num_gen_requests=bs, cost_table=TRT_TABLE,
-            min_verify_len=1)
+            survival=surv, num_gen_requests=bs, cost_table=TRT_TABLE, min_verify_len=1
+        )
         if sgl_n >= bs:
             assert trt_m == sgl_n - bs, (
                 f"bs={bs}: SGLang admits {sgl_n} candidates "
-                f"(= floor {bs} + {sgl_n - bs}), TRT-LLM budget {trt_m}")
+                f"(= floor {bs} + {sgl_n - bs}), TRT-LLM budget {trt_m}"
+            )
         else:
             # SGLang went below the one-draft floor; the closest budget
             # TensorRT-LLM can express under min_verify_len=1 is zero.
@@ -553,15 +649,22 @@ def test_live_pooled_survivals_park_on_the_breakpoint_together():
     surv = np.tile([0.771, 0.693, 0.502, 0.360, 0.315], (bs, 1))
     sgl_n = _sgl_compute_verify_token_budget(
         history_survival_probs=torch.tensor(surv, dtype=torch.float32),
-        table=SGL_TABLE, max_verify_len=SGL_BLOCK, survival_eps=0.0)
+        table=SGL_TABLE,
+        max_verify_len=SGL_BLOCK,
+        survival_eps=0.0,
+    )
     trt_m = compute_verify_token_budget(
-        survival=surv, num_gen_requests=bs, cost_table=TRT_TABLE,
-        min_verify_len=1)
+        survival=surv, num_gen_requests=bs, cost_table=TRT_TABLE, min_verify_len=1
+    )
     assert trt_m == 768 - 2 * bs
     assert sgl_n - bs == trt_m
     tiered = compute_verify_token_budget(
-        survival=surv, num_gen_requests=bs, cost_table=TRT_TABLE,
-        min_verify_len=1, allowed_lens=[1, 2, 5])
+        survival=surv,
+        num_gen_requests=bs,
+        cost_table=TRT_TABLE,
+        min_verify_len=1,
+        allowed_lens=[1, 2, 5],
+    )
     assert tiered == bs * 1  # rung-2: one scheduled position past the floor
 
 
@@ -578,10 +681,13 @@ def test_starving_weak_rows_is_a_known_gap():
     surv = np.concatenate([strong, dead], axis=0)
     sgl_n = _sgl_compute_verify_token_budget(
         history_survival_probs=torch.tensor(surv, dtype=torch.float32),
-        table=SGL_TABLE, max_verify_len=SGL_BLOCK, survival_eps=0.0)
+        table=SGL_TABLE,
+        max_verify_len=SGL_BLOCK,
+        survival_eps=0.0,
+    )
     trt_m = compute_verify_token_budget(
-        survival=surv, num_gen_requests=bs, cost_table=TRT_TABLE,
-        min_verify_len=1)
+        survival=surv, num_gen_requests=bs, cost_table=TRT_TABLE, min_verify_len=1
+    )
 
     def theta_at(tau, tokens):
         return tau / float(TRT_TABLE.step_times(np.asarray([tokens]), bs)[0])
@@ -589,8 +695,7 @@ def test_starving_weak_rows_is_a_known_gap():
     cand = np.sort(surv.reshape(-1))[::-1]
     sgl_theta = theta_at(bs + cand[:sgl_n].sum(), bs + sgl_n)
     deeper = np.sort(surv[:, 1:].reshape(-1))[::-1]
-    trt_theta = theta_at(bs + surv[:, 0].sum() + deeper[:trt_m].sum(),
-                         2 * bs + trt_m)
+    trt_theta = theta_at(bs + surv[:, 0].sum() + deeper[:trt_m].sum(), 2 * bs + trt_m)
     assert sgl_theta > trt_theta
 
 
@@ -601,10 +706,13 @@ def test_eps_filtering_is_a_known_divergence():
     surv = np.tile([0.9, 0.4, 0.008, 0.004, 0.002], (bs, 1))
     sgl_n = _sgl_compute_verify_token_budget(
         history_survival_probs=torch.tensor(surv, dtype=torch.float32),
-        table=SGL_TABLE, max_verify_len=SGL_BLOCK, survival_eps=0.01)
+        table=SGL_TABLE,
+        max_verify_len=SGL_BLOCK,
+        survival_eps=0.01,
+    )
     trt_m = compute_verify_token_budget(
-        survival=surv, num_gen_requests=bs, cost_table=TRT_TABLE,
-        min_verify_len=1)
+        survival=surv, num_gen_requests=bs, cost_table=TRT_TABLE, min_verify_len=1
+    )
     assert sgl_n - bs <= trt_m
 
 
@@ -616,10 +724,8 @@ def test_eps_filtering_is_a_known_divergence():
 def _table() -> SpsCostTable:
     """A staircase with genuine risers, so trimming is worth something."""
     token_counts = tuple(range(0, 400, 16))
-    step_time_ms = tuple(4.0 + 0.6 * (tok // 96) + 0.004 * tok
-                         for tok in token_counts)
-    return SpsCostTable(token_counts=token_counts, step_time_ms=step_time_ms,
-                        fixed_overhead_ms=1.0)
+    step_time_ms = tuple(4.0 + 0.6 * (tok // 96) + 0.004 * tok for tok in token_counts)
+    return SpsCostTable(token_counts=token_counts, step_time_ms=step_time_ms, fixed_overhead_ms=1.0)
 
 
 @pytest.mark.parametrize("tiers", [[1, 2, 5], [1, 3, 5], [1, 5]])
@@ -631,12 +737,14 @@ def test_restricted_answer_is_always_realisable(tiers):
         bs = int(rng.integers(2, 17))
         survival = np.sort(rng.random((bs, 5)), axis=1)[:, ::-1]
         n = compute_verify_token_budget(
-            survival=survival, num_gen_requests=bs, cost_table=table,
-            min_verify_len=1, allowed_lens=tiers)
-        assert n % bs == 0, (
-            f"budget {n} for {bs} requests is not n*(t-min) for any tier")
-        assert (n // bs) + 1 in tiers, (
-            f"budget {n} implies tier {(n // bs) + 1}, not in {tiers}")
+            survival=survival,
+            num_gen_requests=bs,
+            cost_table=table,
+            min_verify_len=1,
+            allowed_lens=tiers,
+        )
+        assert n % bs == 0, f"budget {n} for {bs} requests is not n*(t-min) for any tier"
+        assert (n // bs) + 1 in tiers, f"budget {n} implies tier {(n // bs) + 1}, not in {tiers}"
 
 
 def test_restricted_never_scores_worse_than_the_uniform_choice():
@@ -652,25 +760,34 @@ def test_restricted_never_scores_worse_than_the_uniform_choice():
         def realised_theta(tier: int) -> float:
             budget = bs * (tier - 1)
             cand = np.sort(survival[:, 1:].reshape(-1))[::-1]
-            tau = float(bs) + float(survival[:, :1].sum()) + float(
-                cand[:budget].sum())
+            tau = float(bs) + float(survival[:, :1].sum()) + float(cand[:budget].sum())
             tokens = np.array([bs * (tier + 1)])
             return tau / float(table.step_times(tokens, bs)[0])
 
         n = compute_verify_token_budget(
-            survival=survival, num_gen_requests=bs, cost_table=table,
-            min_verify_len=1, allowed_lens=tiers)
+            survival=survival,
+            num_gen_requests=bs,
+            cost_table=table,
+            min_verify_len=1,
+            allowed_lens=tiers,
+        )
         chosen = (n // bs) + 1
         uniform = budget_argmax_over_uniform_lens(
-            survival=survival, num_gen_requests=bs, cost_table=table,
-            allowed_lens=tiers, min_verify_len=1)
+            survival=survival,
+            num_gen_requests=bs,
+            cost_table=table,
+            allowed_lens=tiers,
+            min_verify_len=1,
+        )
         assert realised_theta(chosen) >= realised_theta(uniform) - 1e-12, (
             f"restricted picked tier {chosen} whose realised theta is below "
-            f"the uniform scorer's tier {uniform}")
+            f"the uniform scorer's tier {uniform}"
+        )
         if bs == 1:
             assert chosen == uniform, (
                 "at bs=1 the uniform and top-k allocations are the same set; "
-                "the two scorers must pick the same rung")
+                "the two scorers must pick the same rung"
+            )
 
 
 # --------------------------------------------------------------------------
@@ -679,9 +796,11 @@ def test_restricted_never_scores_worse_than_the_uniform_choice():
 
 
 def _pin_planner(tiers=(1, 2, 5)):
-    table = SpsCostTable(token_counts=(0, 512, 768, 1536),
-                         step_time_ms=(5.0, 68.4, 80.2, 150.5),
-                         fixed_overhead_ms=1.0)
+    table = SpsCostTable(
+        token_counts=(0, 512, 768, 1536),
+        step_time_ms=(5.0, 68.4, 80.2, 150.5),
+        fixed_overhead_ms=1.0,
+    )
     cfg = DSparkScheduleConfig(block_size=5, min_verify_len=1)
     return DSparkVerifyPlanner(cfg=cfg, cost_table=table, tiers=list(tiers))
 
@@ -738,11 +857,9 @@ def test_pinned_steps_hand_every_request_the_same_window():
     bs = 8
     rng = np.random.default_rng(5)
     survival = np.sort(rng.random((bs, 5)), axis=1)[:, ::-1].copy()
-    planner._gather_rows = lambda **_: torch.tensor(survival,
-                                                    dtype=torch.float32)
+    planner._gather_rows = lambda **_: torch.tensor(survival, dtype=torch.float32)
     planner.adopt_verify_len_pin(2)
-    lens = planner.decide_verify_lens(num_gen_requests=bs,
-                                      reduce_across_ranks=False)
+    lens = planner.decide_verify_lens(num_gen_requests=bs, reduce_across_ranks=False)
     assert lens == [2] * bs
     assert planner.stats["forced_steps"] == 1
 
@@ -811,10 +928,8 @@ def test_decide_path_feeds_the_instruments():
     bs = 8
     rng = np.random.default_rng(3)
     survival = np.sort(rng.random((bs, 5)), axis=1)[:, ::-1].copy()
-    planner._gather_rows = lambda **_: torch.tensor(survival,
-                                                    dtype=torch.float32)
-    lens = planner.decide_verify_lens(num_gen_requests=bs,
-                                      reduce_across_ranks=False)
+    planner._gather_rows = lambda **_: torch.tensor(survival, dtype=torch.float32)
+    lens = planner.decide_verify_lens(num_gen_requests=bs, reduce_across_ranks=False)
     assert lens is not None
     assert planner.stats["snap_rows"] == bs
     assert planner.stats["snap_neutral_rows"] == 0
@@ -836,13 +951,15 @@ def test_decide_path_feeds_the_instruments():
 # reconciliation guards: engine fingerprint and price prediction
 # --------------------------------------------------------------------------
 
-LIVE = {"tp": 8, "ep": 8, "attention_dp": True, "block": 5,
-        "max_batch_size": 256}
+LIVE = {"tp": 8, "ep": 8, "attention_dp": True, "block": 5, "max_batch_size": 256}
 
 
 def _payload(engine):
-    return {"token_counts": [512, 1536], "step_time_ms": [60.0, 150.0],
-            "_meta": {"engine": engine} if engine is not None else {}}
+    return {
+        "token_counts": [512, 1536],
+        "step_time_ms": [60.0, 150.0],
+        "_meta": {"engine": engine} if engine is not None else {},
+    }
 
 
 def test_mismatched_engine_is_refused():
@@ -858,20 +975,22 @@ def test_fingerprints_that_must_load():
     check_table_fingerprint(payload=_payload(dict(LIVE)), live=dict(LIVE))
     check_table_fingerprint(
         payload=_payload(dict(LIVE, moe_backend="megamoe_cutedsl")),
-        live=dict(LIVE, moe_backend="MEGAMOE_CUTEDSL"))
+        live=dict(LIVE, moe_backend="MEGAMOE_CUTEDSL"),
+    )
     check_table_fingerprint(
-        payload=_payload(dict(LIVE, image="faf2c60935",
-                              geometry="constant_block")),
-        live=dict(LIVE))
+        payload=_payload(dict(LIVE, image="faf2c60935", geometry="constant_block")), live=dict(LIVE)
+    )
     check_table_fingerprint(payload=_payload(None), live=dict(LIVE))
 
 
 def test_planner_records_the_price_it_paid():
     """Every budget decision must leave behind the step time it assumed, so a
     gap against measured hostStepTimeMS can contradict a wrong table."""
-    table = SpsCostTable(token_counts=(0, 512, 768, 1536),
-                         step_time_ms=(5.0, 68.4, 80.2, 150.5),
-                         fixed_overhead_ms=1.0)
+    table = SpsCostTable(
+        token_counts=(0, 512, 768, 1536),
+        step_time_ms=(5.0, 68.4, 80.2, 150.5),
+        fixed_overhead_ms=1.0,
+    )
     cfg = DSparkScheduleConfig(block_size=5, min_verify_len=1)
     planner = DSparkVerifyPlanner(cfg=cfg, cost_table=table, tiers=[1, 2, 5])
 
@@ -882,11 +1001,9 @@ def test_planner_records_the_price_it_paid():
     # Only the snapshot is faked; calibration stays the constructor's default
     # sigmoid (setting it to None post-construction would bypass the
     # `apply_calibration or torch.sigmoid` fallback and crash the decide path).
-    planner._gather_rows = lambda **_: torch.tensor(survival,
-                                                    dtype=torch.float32)
+    planner._gather_rows = lambda **_: torch.tensor(survival, dtype=torch.float32)
 
-    lens = planner.decide_verify_lens(num_gen_requests=bs,
-                                      reduce_across_ranks=False)
+    lens = planner.decide_verify_lens(num_gen_requests=bs, reduce_across_ranks=False)
     assert lens is not None
 
     steps = planner.stats.get("predicted_steps", 0)

@@ -571,8 +571,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             # native DSA metadata contract.
             nc, ns = self.num_contexts, self.num_seqs
             kv_lens = kv_lens.clone()
-            kv_lens[nc:ns] += ((1 + self.max_draft_tokens) -
-                               self.seq_lens_kv[nc:ns])
+            kv_lens[nc:ns] += (1 + self.max_draft_tokens) - self.seq_lens_kv[nc:ns]
             self.kv_lens[nc:ns] = kv_lens[nc:ns]
 
         self.cached_token_lens_cuda[:num_requests].copy_(
@@ -680,17 +679,11 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             num_contexts = self.num_contexts
             num_generations = self.num_generations
             gen_new_tokens = self.gen_new_tokens_per_seq_cuda[:num_generations]
-            gen_new_tokens.copy_(
-                self._seq_lens_cuda[
-                    num_contexts : num_contexts + num_generations
-                ]
-            )
+            gen_new_tokens.copy_(self._seq_lens_cuda[num_contexts : num_contexts + num_generations])
             self.gen_new_tokens_per_seq = gen_new_tokens
         else:
             self.num_gen_tokens_per_seq = (
-                num_gen_tokens // self.num_generations
-                if self.num_generations > 0
-                else 0
+                num_gen_tokens // self.num_generations if self.num_generations > 0 else 0
             )
             self.gen_new_tokens_per_seq = None
         return self.num_gen_tokens_per_seq
