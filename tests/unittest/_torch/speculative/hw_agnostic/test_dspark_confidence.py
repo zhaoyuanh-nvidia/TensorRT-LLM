@@ -30,6 +30,7 @@ from tensorrt_llm._torch.speculative.dspark_confidence import (
     plan_fixed_verifier_budget,
     plan_masked_fixed_verifier_draft_lens,
     plan_uniform_floor_two_tier_verifier_budget,
+    resolve_tail_protected_ragged_two_tier,
     resolve_uniform_floor_two_tier,
     verify_packed_greedy,
 )
@@ -453,12 +454,142 @@ def test_dynamic_common_floor_cuda_graph_v512_v704_v512_replay() -> None:
     assert plan.retained_lens.tolist() == [3] * 128
 
 
+def test_dynamic_tail_protected_ragged_compact_preserves_laggard() -> None:
+    plan = plan_dynamic_verifier_budget(
+        torch.zeros((4, 3)),
+        torch.tensor([12, 16], dtype=torch.int64),
+        torch.tensor([1.0, 100.0], dtype=torch.float32),
+        minimum_predicted_gain=0.0,
+        temperatures=torch.full((3,), 1.0e30, dtype=torch.float32),
+        request_progress=torch.tensor([0, 4, 4, 4], dtype=torch.int64),
+        compact_floor_override=1,
+    )
+
+    assert int(plan.verifier_token_budget) == 12
+    assert plan.retained_lens.tolist() == [3, 2, 2, 1]
+    assert sum(plan.retained_lens.tolist()) == 8
+
+
+def test_dynamic_tail_protected_ragged_zero_floor_prioritizes_nonlaggards() -> None:
+    plan = plan_dynamic_verifier_budget(
+        torch.tensor(
+            [
+                [-20.0, -20.0, -20.0],
+                [20.0, 20.0, 20.0],
+                [20.0, 20.0, -20.0],
+                [-20.0, -20.0, -20.0],
+            ]
+        ),
+        torch.tensor([12, 16], dtype=torch.int64),
+        torch.tensor([1.0, 100.0], dtype=torch.float32),
+        minimum_predicted_gain=0.0,
+        request_progress=torch.tensor([0, 4, 4, 4], dtype=torch.int64),
+        compact_floor_override=0,
+    )
+
+    assert int(plan.verifier_token_budget) == 12
+    assert plan.retained_lens.tolist() == [3, 3, 2, 0]
+    assert sum(plan.retained_lens.tolist()) == 8
+
+
+def test_dynamic_tail_protected_ragged_requires_dense_occupancy() -> None:
+    logits = torch.full((4, 3), 20.0)
+    budgets = torch.tensor([12, 16], dtype=torch.int64)
+    times = torch.tensor([1.0, 100.0], dtype=torch.float32)
+
+    dense = plan_dynamic_verifier_budget(
+        logits,
+        budgets,
+        times,
+        minimum_predicted_gain=0.0,
+        request_progress=torch.tensor([0, 4, 4, 4], dtype=torch.int64),
+        compact_floor_override=0,
+        compact_requires_full_occupancy=True,
+    )
+    padded = plan_dynamic_verifier_budget(
+        logits,
+        budgets,
+        times,
+        minimum_predicted_gain=0.0,
+        real_request_mask=torch.tensor([True, True, True, False]),
+        request_progress=torch.tensor([0, 4, 4, 0], dtype=torch.int64),
+        compact_floor_override=0,
+        compact_requires_full_occupancy=True,
+    )
+
+    assert int(dense.verifier_token_budget) == 12
+    assert dense.retained_lens.tolist() == [3, 2, 2, 1]
+    assert int(padded.verifier_token_budget) == 16
+    assert padded.retained_lens.tolist() == [3, 3, 3, 0]
+
+
+def test_dynamic_tail_protected_ragged_equal_progress_falls_back_to_full() -> None:
+    plan = plan_dynamic_verifier_budget(
+        torch.full((4, 3), -20.0),
+        torch.tensor([12, 16], dtype=torch.int64),
+        torch.tensor([1.0, 100.0], dtype=torch.float32),
+        minimum_predicted_gain=0.0,
+        request_progress=torch.zeros(4, dtype=torch.int32),
+        compact_floor_override=1,
+    )
+
+    assert int(plan.verifier_token_budget) == 16
+    assert plan.retained_lens.tolist() == [3, 3, 3, 3]
+
+
+def test_dynamic_tail_protected_ragged_too_many_laggards_falls_back_to_full() -> None:
+    plan = plan_dynamic_verifier_budget(
+        torch.full((4, 3), -20.0),
+        torch.tensor([12, 16], dtype=torch.int64),
+        torch.tensor([1.0, 100.0], dtype=torch.float32),
+        minimum_predicted_gain=0.0,
+        request_progress=torch.tensor([0, 0, 0, 4], dtype=torch.int64),
+        compact_floor_override=1,
+    )
+
+    assert int(plan.verifier_token_budget) == 16
+    assert plan.retained_lens.tolist() == [3, 3, 3, 3]
+
+
+@pytest.mark.parametrize(
+    ("request_progress", "compact_floor_override"),
+    [
+        (torch.zeros((2, 2), dtype=torch.int64), 1),
+        (torch.zeros(3, dtype=torch.int64), 1),
+        (torch.zeros(4, dtype=torch.float32), 1),
+        (torch.zeros(4, dtype=torch.int64), -1),
+        (torch.zeros(4, dtype=torch.int64), 3),
+    ],
+)
+def test_dynamic_tail_protected_ragged_arguments_fail_closed(
+    request_progress: torch.Tensor, compact_floor_override: int
+) -> None:
+    with pytest.raises(ValueError, match="request_progress|compact_floor_override"):
+        plan_dynamic_verifier_budget(
+            torch.zeros((4, 3)),
+            torch.tensor([12, 16]),
+            torch.tensor([1.0, 2.0]),
+            request_progress=request_progress,
+            compact_floor_override=compact_floor_override,
+        )
+
+
 def test_resolve_uniform_floor_two_tier_is_fail_closed() -> None:
     assert resolve_uniform_floor_two_tier(128, 5, [512, 768]) == 3
     assert resolve_uniform_floor_two_tier(128, 5, [512, 704, 768]) is None
     assert resolve_uniform_floor_two_tier(128, 5, [513, 768]) is None
     assert resolve_uniform_floor_two_tier(128, 5, [512, 767]) is None
     assert resolve_uniform_floor_two_tier(128, 5, [768, 768]) is None
+
+
+def test_resolve_tail_protected_ragged_two_tier_is_near_full_only() -> None:
+    assert resolve_tail_protected_ragged_two_tier(128, 5, [640, 768], False)
+    assert resolve_tail_protected_ragged_two_tier(128, 5, [672, 768], False)
+    assert resolve_tail_protected_ragged_two_tier(128, 5, [704, 768], False)
+    assert not resolve_tail_protected_ragged_two_tier(128, 5, [512, 768], False)
+    assert not resolve_tail_protected_ragged_two_tier(128, 5, [640, 704, 768], False)
+    assert not resolve_tail_protected_ragged_two_tier(128, 5, [640, 768], True)
+    assert not resolve_tail_protected_ragged_two_tier(0, 5, [640, 768], False)
 
 
 def test_uniform_floor_two_tier_fast_path_avoids_global_ranking(monkeypatch) -> None:

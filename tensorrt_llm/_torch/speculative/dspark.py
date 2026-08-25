@@ -38,6 +38,7 @@ from .dspark_confidence import (
     plan_dynamic_verifier_budget,
     plan_masked_fixed_verifier_draft_lens,
     plan_uniform_floor_two_tier_verifier_budget,
+    resolve_tail_protected_ragged_two_tier,
     resolve_uniform_floor_two_tier,
     verify_packed_greedy,
 )
@@ -1063,7 +1064,32 @@ class DSparkWorker(SpecWorkerBase):
                         candidate_yield_reducer=yield_reducer,
                         real_request_mask=real_request_mask,
                     )
-                    if uniform_floor is None:
+                    native_uniform = bool(
+                        getattr(
+                            self.spec_config,
+                            "is_native_uniform_confidence_enabled",
+                            False,
+                        )
+                    )
+                    use_tail_protected_ragged = resolve_tail_protected_ragged_two_tier(
+                        num_gens,
+                        self.max_draft_len,
+                        candidates,
+                        native_uniform,
+                    )
+                    if use_tail_protected_ragged:
+                        confidence_plan = plan_dynamic_verifier_budget(
+                            confidence_logits,
+                            candidate_budgets,
+                            candidate_step_times,
+                            request_progress=(
+                                self._ctx_len[slots] - self._generation_start_len[slots]
+                            ),
+                            compact_floor_override=0,
+                            compact_requires_full_occupancy=True,
+                            **plan_kwargs,
+                        )
+                    elif uniform_floor is None:
                         confidence_plan = plan_dynamic_verifier_budget(
                             confidence_logits,
                             candidate_budgets,
@@ -1081,12 +1107,7 @@ class DSparkWorker(SpecWorkerBase):
                             candidate_budgets,
                             candidate_step_times,
                             uniform_floor,
-                            allow_padded_uniform_compact=bool(
-                                getattr(
-                                    self.spec_config,
-                                    "is_native_uniform_confidence_enabled",
-                                    False,
-                                )),
+                            allow_padded_uniform_compact=native_uniform,
                             request_progress=request_progress,
                             **plan_kwargs,
                         )
@@ -1097,9 +1118,9 @@ class DSparkWorker(SpecWorkerBase):
                         self._confidence_recorder is not None
                         and self._confidence_recorder.dynamic_diagnostic
                     ):
-                        if uniform_floor is None:
+                        if uniform_floor is None or use_tail_protected_ragged:
                             raise RuntimeError(
-                                "Dynamic-policy diagnostics require the validated "
+                                "Dynamic-policy diagnostics require the native "
                                 "two-tier uniform-floor planner"
                             )
                         survival = torch.cumprod(

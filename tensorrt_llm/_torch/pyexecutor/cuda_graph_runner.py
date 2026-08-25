@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import bisect
 import contextlib
 import os
@@ -1487,7 +1490,34 @@ class CUDAGraphRunner:
                             "stale, or asymmetric across ADP peers: "
                             f"{rank_routes}")
                 else:
+                    # The carried plan itself is full-K, but a rank whose
+                    # roster did not change can still have request-local
+                    # effective lengths from the preceding compact step.  A
+                    # V0 fallback must clear that stale compact state on every
+                    # peer before graph keying; otherwise only the unchanged
+                    # rank appears to own compact inputs and ADP cannot choose
+                    # one safe common route.
+                    self.confidence_discarded_device_layout = True
+                    for request in generation_requests:
+                        if not request.is_dummy:
+                            request.py_draft_tokens_effective_len = len(
+                                request.py_draft_tokens)
+                            request.py_dspark_confidence_route_epoch = None
+                            request.py_dspark_confidence_execution_batch_size = None
+                            request.py_dspark_confidence_verifier_token_budget = None
                     self.confidence_force_full_k_route = True
+                    full_k_info = list(
+                        self.config.dist.tp_allgather(
+                            [physical_block_recoverable, real_count]))
+                    if (full_k_info
+                            and all(bool(info[0]) for info in full_k_info)
+                            and carried_g >= max(int(info[1])
+                                                 for info in full_k_info)):
+                        # Keep every ADP peer on the same padded graph.  G=0
+                        # would drop into unequal rank-local eager shapes and
+                        # violate the sparse-attention group shape contract.
+                        self.confidence_adp_execution_batch_size = carried_g
+                        return carried_g
                     return 0
             else:
                 self.confidence_device_layout = carried_layout

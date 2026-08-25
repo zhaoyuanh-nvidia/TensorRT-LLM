@@ -31,6 +31,7 @@ __all__ = [
     "plan_dynamic_verifier_budget",
     "plan_fixed_verifier_budget",
     "plan_uniform_floor_two_tier_verifier_budget",
+    "resolve_tail_protected_ragged_two_tier",
     "resolve_uniform_floor_two_tier",
     "verify_packed_greedy",
 ]
@@ -449,6 +450,30 @@ def resolve_uniform_floor_two_tier(
     return floor if 0 <= floor < max_draft_len else None
 
 
+def resolve_tail_protected_ragged_two_tier(
+    num_requests: int,
+    max_draft_len: int,
+    candidate_budgets: Sequence[int],
+    native_uniform: bool,
+) -> bool:
+    """Return whether a near-full ragged ladder should protect tail progress.
+
+    The progress-aware planner is intentionally limited to a two-tier ladder
+    whose compact tier can retain at least K-1 drafts per execution row and
+    whose final tier is physical full K. Lower-budget and multi-tier policies
+    preserve the generic confidence allocator, while native-uniform routing
+    retains its dedicated K-1/K implementation.
+    """
+    if native_uniform or num_requests <= 0 or max_draft_len <= 0:
+        return False
+    if len(candidate_budgets) != 2:
+        return False
+    compact, full = (int(value) for value in candidate_budgets)
+    dense_capacity = num_requests * (max_draft_len + 1)
+    near_full_minimum = num_requests * max_draft_len
+    return near_full_minimum <= compact < full and full == dense_capacity
+
+
 def plan_uniform_floor_two_tier_verifier_budget(
     confidence_logits: torch.Tensor,
     candidate_budgets: torch.Tensor,
@@ -593,6 +618,9 @@ def plan_dynamic_verifier_budget(
     temperatures: torch.Tensor | None = None,
     candidate_yield_reducer: Callable[[torch.Tensor], torch.Tensor] | None = None,
     real_request_mask: torch.Tensor | None = None,
+    request_progress: torch.Tensor | None = None,
+    compact_floor_override: int | None = None,
+    compact_requires_full_occupancy: bool = False,
 ) -> DynamicBudgetPlan:
     """Select and allocate one captured verifier-token budget on device.
 
@@ -621,11 +649,14 @@ def plan_dynamic_verifier_budget(
     redundant captured collective without changing the allocation.
 
     Compact tiers share a fairness floor derived from the smallest configured
-    tier. Every real row keeps that many leading drafts before confidence can
-    allocate any additional drafts. The one stable confidence sort therefore
-    covers only positions above the floor. Candidate yield includes anchors,
-    mandatory-floor survival, and the best eligible extra survival, matching
-    the allocation used when that candidate is selected.
+    tier, or from ``compact_floor_override`` when supplied by a validated
+    runtime route. Every real row keeps that many leading drafts before
+    confidence can allocate any additional drafts. When ``request_progress`` is
+    supplied, every real row at the local minimum progress also keeps physical
+    full K. This protects tail laggards while the remaining compact budget is
+    allocated by confidence. A compact tier that cannot cover all mandatory
+    drafts is ineligible. The one stable confidence sort covers only positions
+    above the mandatory set, and candidate yield matches the selected layout.
 
     real_request_mask excludes CUDA-graph padding rows from confidence
     ranking and expected yield. A compact candidate whose V-G drafts exceed
@@ -633,6 +664,12 @@ def plan_dynamic_verifier_budget(
     optional cross-rank reduction, so one ineligible attention-DP rank forces
     the shared planner to choose another tier. The final full-K tier remains
     valid and gives K drafts to real rows and zero to padding rows.
+
+    ``compact_requires_full_occupancy`` additionally makes every compact tier
+    ineligible while the captured execution bucket contains padding rows. This
+    is used by the near-full ragged route, whose measured compact cost applies
+    to a dense G bucket and whose partially occupied tail can otherwise be much
+    slower than the ordinary full-K graph.
     """
     if confidence_logits.ndim != 2:
         raise ValueError("confidence_logits must have shape [num_requests, max_draft_len]")
@@ -661,6 +698,18 @@ def plan_dynamic_verifier_budget(
         raise ValueError("real_request_mask must be a boolean vector matching num_requests")
     elif real_request_mask.device != confidence_logits.device:
         raise ValueError("real_request_mask must be on the confidence-logit device")
+    if request_progress is not None and (
+        request_progress.shape != (num_requests,)
+        or request_progress.device != confidence_logits.device
+        or request_progress.dtype not in (torch.int32, torch.int64)
+    ):
+        raise ValueError("request_progress must be a same-device integer [num_requests] vector")
+    if compact_floor_override is not None and not (
+        0 <= compact_floor_override < max_draft_len
+    ):
+        raise ValueError("compact_floor_override must be in [0, max_draft_len)")
+    if not isinstance(compact_requires_full_occupancy, bool):
+        raise ValueError("compact_requires_full_occupancy must be a boolean")
 
     dense_capacity = num_requests * (max_draft_len + 1)
     if candidate_budgets.device != confidence_logits.device:
@@ -693,12 +742,38 @@ def plan_dynamic_verifier_budget(
         .contiguous()
         .view(-1)
     )
-    compact_floor = torch.clamp(
-        torch.div(retained_candidates[0], num_requests, rounding_mode="floor"),
-        min=0,
-        max=max_draft_len,
+    compact_floor = (
+        torch.full(
+            (),
+            compact_floor_override,
+            dtype=torch.long,
+            device=confidence_logits.device,
+        )
+        if compact_floor_override is not None
+        else torch.clamp(
+            torch.div(retained_candidates[0], num_requests, rounding_mode="floor"),
+            min=0,
+            max=max_draft_len,
+        )
     )
     mandatory_position_major_mask = position_major_mask & (draft_positions < compact_floor)
+    progress_valid = torch.ones((), dtype=torch.bool, device=confidence_logits.device)
+    if request_progress is not None:
+        progress_valid = torch.all(torch.where(real_request_mask, request_progress >= 0, True))
+        padding_sentinel = torch.full(
+            (),
+            torch.iinfo(request_progress.dtype).max,
+            dtype=request_progress.dtype,
+            device=request_progress.device,
+        )
+        masked_progress = torch.where(real_request_mask, request_progress, padding_sentinel)
+        protected = real_request_mask & (request_progress == masked_progress.min())
+        protected_position_major_mask = (
+            protected.unsqueeze(0).expand(max_draft_len, -1).contiguous().view(-1)
+        )
+        mandatory_position_major_mask = (
+            mandatory_position_major_mask | protected_position_major_mask
+        )
     eligible_position_major_mask = position_major_mask & ~mandatory_position_major_mask
     ranking_scores = torch.where(
         eligible_position_major_mask,
@@ -721,7 +796,7 @@ def plan_dynamic_verifier_budget(
 
     real_request_count = real_request_mask.sum(dtype=torch.long)
     real_draft_capacity = real_request_count * max_draft_len
-    mandatory_retained = compact_floor * real_request_count
+    mandatory_retained = mandatory_position_major_mask.sum(dtype=torch.long)
     extra_retained_candidates = torch.clamp(retained_candidates - mandatory_retained, min=0)
     mandatory_yield = torch.where(
         mandatory_position_major_mask,
@@ -736,7 +811,16 @@ def plan_dynamic_verifier_budget(
         device=confidence_logits.device,
     )
     candidate_is_full = candidate_indices == full_candidate_index
-    candidate_is_executable = (retained_candidates <= real_draft_capacity) | candidate_is_full
+    compact_candidate_is_executable = (
+        progress_valid
+        & (retained_candidates >= mandatory_retained)
+        & (retained_candidates <= real_draft_capacity)
+    )
+    if compact_requires_full_occupancy:
+        compact_candidate_is_executable = compact_candidate_is_executable & (
+            real_request_count == num_requests
+        )
+    candidate_is_executable = compact_candidate_is_executable | candidate_is_full
     expected_yield = real_request_count.to(torch.float32) + mandatory_yield + torch.gather(
         cumulative_yield, 0, extra_retained_candidates
     )

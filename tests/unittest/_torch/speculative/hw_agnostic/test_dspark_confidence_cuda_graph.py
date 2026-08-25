@@ -3653,6 +3653,57 @@ def test_carried_physical_full_k_layout_ignores_stale_host_compact_lengths():
     assert carrier.dspark_confidence_layout.query_lens.tolist() == [6] * 128
 
 
+def test_full_k_carrier_roster_asymmetry_clears_stale_compact_request_state():
+    config = DSparkDecodingConfig(
+        max_draft_len=5,
+        speculative_model="/tmp/dummy_model",
+        confidence_mode="fixed_budget",
+        confidence_verifier_token_budget_schedule={16: 96},
+    )
+    requests = [request_stub(index, 5, index) for index in range(16)]
+    for request in requests:
+        request.py_draft_tokens_effective_len = 1
+        request.py_dspark_confidence_route_epoch = 1
+        request.py_dspark_confidence_execution_batch_size = 16
+        request.py_dspark_confidence_verifier_token_budget = 32
+    carrier = _layout_carrier(
+        requests,
+        [5] * 16,
+        execution_g=16,
+        verifier_budget=96,
+        route_epoch=2,
+    )
+    batch = ScheduledRequests()
+    batch.generation_requests = requests
+    runner = _iteration_route_runner(config)
+
+    def peer_completed_one_request(payload):
+        if len(payload) == 2:
+            return [payload, [True, 15]]
+        peer = list(payload)
+        peer[0] = False
+        peer[1] = False
+        peer[7] = 15
+        peer[13] = 15
+        return [payload, peer]
+
+    runner.config.dist.tp_allgather.side_effect = peer_completed_one_request
+    assert CUDAGraphRunner._get_confidence_adp_common_batch_size(
+        runner, batch, carrier
+    ) == 16
+    assert runner.confidence_force_full_k_route
+    assert runner.confidence_discarded_device_layout
+    assert runner.confidence_device_layout is None
+    assert runner.confidence_adp_execution_batch_size == 16
+    assert all(request.py_draft_tokens_effective_len == 5 for request in requests)
+    assert all(
+        request.py_dspark_confidence_route_epoch is None
+        and request.py_dspark_confidence_execution_batch_size is None
+        and request.py_dspark_confidence_verifier_token_budget is None
+        for request in requests
+    )
+
+
 def test_context_batch_has_no_compact_route_or_plan():
     config = DSparkDecodingConfig(
         max_draft_len=5,
