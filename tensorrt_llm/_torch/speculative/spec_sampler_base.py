@@ -53,6 +53,13 @@ class SampleStateTensorsSpec(SampleStateTensors):
 
     new_tokens_lens: torch.Tensor
     next_draft_tokens: torch.Tensor
+    #: cap-accept only; None on every other path.
+    cap_trim_lens: Optional[torch.Tensor] = None
+    #: ragged verification only; None on every other path. The TOKEN windows
+    #: the step actually verified (bonus included), slot-indexed. Under
+    #: device-window selection this D2H is the host's only source of the true
+    #: windows; zero marks "no window this step".
+    verify_lens: Optional[torch.Tensor] = None
 
 
 @dataclass(kw_only=True)
@@ -68,6 +75,26 @@ class SampleStateSpec(SampleState):
     # instead would see the NEXT step's buffer, which update_requests itself
     # installs.
     draft_lens: Optional[list[int]] = None
+    #: This step's per-request verify windows, keyed by request id. Snapshotted
+    #: because ``update_requests`` for step N-1 runs *after* the scheduler has
+    #: already stamped step N's windows onto the same LlmRequest objects, so
+    #: reading ``request.py_verify_len`` live rewinds by the wrong amount under
+    #: the overlap scheduler. None on every uniform path.
+    verify_lens_snapshot: Optional[dict] = None
+    #: Same idea, for ``cap-accept``: the window the scheduler chose, which
+    #: bounds *commitment* only -- the target still scored the full block, so
+    #: the KV rewind must use the full block and not this. Kept in a separate
+    #: field from ``verify_lens_snapshot`` for exactly that reason: the two
+    #: never coexist, and conflating them would rewind by the window after
+    #: verifying the block, silently leaking KV.
+    verify_caps_snapshot: Optional[dict] = None
+    #: The draft pass that produced the block THIS state's tokens verified;
+    #: the STS recorder joins its acceptance label to a logits snapshot by
+    #: this key. Snapshotted at sampling time for the same reason
+    #: ``verify_lens_snapshot`` is: by the time ``update_requests`` runs, the
+    #: live counter already belongs to a later pass. None unless STS
+    #: collection is on.
+    sts_target_seq: Optional[int] = None
 
 
 class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
@@ -191,6 +218,15 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         next_new_tokens: torch.Tensor
         next_draft_tokens: torch.Tensor
         new_tokens_lens: torch.Tensor
+        #: cap-accept: per-request positions the verify window discarded.
+        #: Slot-indexed like new_tokens_lens, and rewritten for every slot in
+        #: the batch each step -- a slot left alone would hand the previous
+        #: occupant's loss to whoever holds it now.
+        cap_trim_lens: torch.Tensor
+        #: ragged verification: the TOKEN windows the step actually verified,
+        #: slot-indexed; zeroed for every batch slot on non-ragged steps (the
+        #: same stale-slot discipline as cap_trim_lens).
+        verify_lens: torch.Tensor
 
     def __init__(
         self,
@@ -255,6 +291,8 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             ),
             next_draft_tokens=int_tensor((seq_slots, args.max_total_draft_tokens)),
             new_tokens_lens=int_tensor((seq_slots,)),
+            cap_trim_lens=int_tensor((seq_slots,)),
+            verify_lens=int_tensor((seq_slots,)),
         )
 
     def _request_common_handling(
@@ -284,6 +322,56 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         request.py_draft_tokens = next_draft_tokens[request.py_seq_slot][:runtime_draft_len]
         request.py_decoding_iter += 1
 
+    #: Optional observability sink, attached by the DSpark worker. Left None
+    #: everywhere else so this costs one attribute read per request.
+    acceptance_stats = None
+    #: STS calibration collection; attached alongside `acceptance_stats` and
+    #: None everywhere else. `sts_row_for` resolves a py_request_id to its row
+    #: in the worker's confidence buffer through the worker's OWN allocator --
+    #: `py_seq_slot` comes from a different allocator whose numbering only
+    #: coincides until the first request completes. `sts_seq_provider` names
+    #: the draft pass the current step's verification targets.
+    sts_recorder = None
+    sts_row_for = None
+    sts_seq_provider = None
+
+    @staticmethod
+    def _verified_len(request: LlmRequest, runtime_draft_len: int,
+                      verify_lens_snapshot: Optional[dict] = None,
+                      ridden_verify_lens: Optional[list] = None) -> int:
+        """How many draft positions THIS request was given to verify.
+
+        Uniform scheduling gives every request the batch-wide
+        ``runtime_draft_len``; ragged (per-request) verification does not, and
+        the KV rewind below is computed per request:
+
+            rewind = verified_positions - accepted_positions
+
+        Using the batch-wide value under ragged verification rewinds the wrong
+        amount for every request that got a shorter window -- silently dropping
+        or keeping KV entries, i.e. wrong output with no error anywhere.
+
+        ``py_verify_len`` is set only by the ragged path, so this is exactly
+        today's behavior for every other speculation mode.
+        """
+        # First preference: the windows the device layout actually verified,
+        # ridden back on this step's sampler D2H (slot-indexed TOKEN windows;
+        # zero = no window). Under device-window selection the host attribute
+        # holds only a shape split, so this is the only correct source; under
+        # host windows the two agree.
+        if ridden_verify_lens is not None:
+            token_window = ridden_verify_lens[request.py_seq_slot]
+            if token_window > 0:
+                return int(token_window) - 1
+        # Second: the snapshot taken when this step's tokens were sampled. The
+        # live attribute already belongs to the NEXT step by the time the
+        # overlap scheduler rewinds this one.
+        if verify_lens_snapshot is not None:
+            per_request = verify_lens_snapshot.get(request.py_request_id)
+        else:
+            per_request = getattr(request, "py_verify_len", None)
+        return runtime_draft_len if per_request is None else int(per_request)
+
     def update_requests(
         self,
         state: SampleStateSpec,
@@ -302,10 +390,15 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         state.sampler_event.synchronize()
         new_tokens = state.host.new_tokens.tolist()
         new_tokens_lens_list = state.host.new_tokens_lens.tolist()
+        cap_trim_list = (state.host.cap_trim_lens.tolist()
+                         if state.host.cap_trim_lens is not None else None)
+        ridden_verify_lens = (state.host.verify_lens.tolist()
+                              if state.host.verify_lens is not None else None)
         next_draft_tokens_list = state.host.next_draft_tokens.tolist()
         beam_idx = DEFAULT_BEAM_IDX
         runtime_draft_len = getattr(state, "runtime_draft_len", self.draft_len)
 
+        caps = state.verify_caps_snapshot
         for req_idx, req in enumerate(state.requests):
             if req.state == LlmRequestState.GENERATION_COMPLETE:
                 continue
@@ -317,6 +410,12 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
                 f"accepted {num_new_tokens} tokens in one step, but new_tokens is "
                 f"sized for {self.max_accepted_path_len}"
             )
+            # cap-accept: `num_new_tokens` has ALREADY been capped, on device,
+            # inside acceptance (`interface.apply_accept_caps`) -- it has to be,
+            # because the drafter reads the same count later in that forward to
+            # advance its own state. The cap is read here only to report the
+            # window the request was actually given.
+            cap = None if caps is None else caps.get(req.py_request_id)
             for i in range(num_new_tokens):
                 new_token = add_token(req, new_tokens, beam_idx=beam_idx, step=i)
                 if handle_stop_criteria(
@@ -324,16 +423,51 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
                 ):
                     break
             req.py_num_accepted_draft_tokens = num_new_tokens - 1
-            # Pair the acceptance count with the draft count of the SAME step,
-            # snapshotted at sample_async time: _request_common_handling below
-            # replaces py_draft_tokens with the next step's buffer, so its
-            # length must not be used as the denominator (0 for the request's
-            # prefill step, where nothing was verified).
-            req.py_num_draft_tokens_verified = (
-                state.draft_lens[req_idx] if state.draft_lens is not None else 0
-            )
-            req.py_rewind_len = runtime_draft_len - req.py_num_accepted_draft_tokens
+            verified_len = self._verified_len(req, runtime_draft_len,
+                                              state.verify_lens_snapshot,
+                                              ridden_verify_lens)
+            # Pair acceptance with the same step's actual draft count. Ragged
+            # verification may score only a prefix of the drafted block, while
+            # finished-context requests score no drafts at all.
+            drafted_len = state.draft_lens[req_idx] if state.draft_lens is not None else 0
+            req.py_num_draft_tokens_verified = min(drafted_len, verified_len)
+            req.py_rewind_len = verified_len - req.py_num_accepted_draft_tokens
+            # Acceptance against the window the request was actually given.
+            # Recorded here because this is the only place both numbers are
+            # host-side and belong to the same step -- the live py_verify_len
+            # has already moved on by now, which is why the snapshot exists.
+            # `acceptance_stats` is attached by the DSpark worker and is None
+            # for every other path.
+            #
+            # Under cap-accept the window is the cap, NOT `verified_len`: the
+            # target verified the whole block (which is what makes the rewind
+            # above correct), but the scheduler only granted `cap`. Reporting
+            # the block here would count every request as untrimmed and hide
+            # the mode's entire measurement.
+            if self.acceptance_stats is not None:
+                self.acceptance_stats.record_acceptance(
+                    accepted=req.py_num_accepted_draft_tokens,
+                    window=verified_len if cap is None else int(cap),
+                    cap_trim=(0 if cap_trim_list is None else
+                              cap_trim_list[req.py_seq_slot]))
+            # STS calibration pairs this request's drafted-block logits with
+            # how much of that block was accepted. The logits come from the
+            # recorder's snapshot ring, selected by the draft pass snapshotted
+            # into this state at sampling time and checked against the row's
+            # own stamp -- reading the live buffer here paired the label with
+            # whatever a LATER pass had written over it.
+            if self.sts_recorder is not None:
+                self.sts_recorder.record(
+                    row=(self.sts_row_for(req.py_request_id)
+                         if self.sts_row_for is not None else None),
+                    accepted=req.py_num_accepted_draft_tokens,
+                    target_seq=state.sts_target_seq)
             self._request_common_handling(req, next_draft_tokens_list, runtime_draft_len)
+
+        if self.sts_recorder is not None:
+            # Periodic flush, so a run killed mid-collection still leaves usable
+            # shards rather than everything living in a list that dies with it.
+            self.sts_recorder.end_step()
 
     def sample_async(
         self,
@@ -418,6 +552,29 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         self.store.next_new_tokens.squeeze(-1).T.index_copy_(0, slots, o_next_new_tokens)
         self.store.new_tokens_lens.index_copy_(0, slots, o_new_tokens_lens)
         self.store.next_draft_tokens.index_copy_(0, slots, o_next_draft_tokens)
+        # cap-accept: absent on every other path, and written as ZEROS then
+        # rather than skipped. The buffer is persistent and slot-indexed, so a
+        # slot left untouched would keep whatever the previous occupant lost
+        # and hand it to the current one.
+        o_cap_trim = outputs.get("cap_trim_lens")
+        if o_cap_trim is None:
+            o_cap_trim = torch.zeros_like(o_new_tokens_lens)
+        else:
+            o_cap_trim = o_cap_trim[num_skip:num_skip + num_sampling_requests]
+        self.store.cap_trim_lens.index_copy_(
+            0, slots, o_cap_trim.to(self.store.cap_trim_lens.dtype))
+        # Ragged verification: the true token windows, same zero-then-write
+        # slot discipline as cap_trim_lens. Under device-window selection the
+        # host py_verify_len holds only a shape split, so the rewind
+        # arithmetic in update_requests must read THIS.
+        o_verify_lens = outputs.get("verify_lens")
+        if o_verify_lens is None:
+            o_verify_lens = torch.zeros_like(o_new_tokens_lens)
+        else:
+            o_verify_lens = o_verify_lens[num_skip:num_skip +
+                                          num_sampling_requests]
+        self.store.verify_lens.index_copy_(
+            0, slots, o_verify_lens.to(self.store.verify_lens.dtype))
 
         # Create sample state with async D2H copy
         device_tensors = SampleStateTensorsSpec(
@@ -430,12 +587,31 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             new_tokens=self._copy_to_host(self.store.new_tokens),
             new_tokens_lens=self._copy_to_host(self.store.new_tokens_lens),
             next_draft_tokens=self._copy_to_host(self.store.next_draft_tokens),
+            # [max_num_sequences] int32 -- kilobytes next to new_tokens above,
+            # and it rides the same event, so no extra synchronization.
+            cap_trim_lens=self._copy_to_host(self.store.cap_trim_lens),
+            verify_lens=self._copy_to_host(self.store.verify_lens),
         )
         sampler_event = self._record_sampler_event()
 
         # Add dummy draft tokens to context requests for KV cache preparation
         for request in finished_context_requests:
             request.py_draft_tokens = [1] * self.draft_len
+
+        # Cheap (a few ints) and only populated when the ragged path is live.
+        verify_lens_snapshot = None
+        verify_caps_snapshot = None
+        for request in sampling_requests:
+            window = getattr(request, "py_verify_len", None)
+            if window is not None:
+                if verify_lens_snapshot is None:
+                    verify_lens_snapshot = {}
+                verify_lens_snapshot[request.py_request_id] = int(window)
+            cap = getattr(request, "py_verify_cap", None)
+            if cap is not None:
+                if verify_caps_snapshot is None:
+                    verify_caps_snapshot = {}
+                verify_caps_snapshot[request.py_request_id] = int(cap)
 
         return SampleStateSpec(
             requests=sampling_requests,
@@ -444,4 +620,8 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             sampler_event=sampler_event,
             runtime_draft_len=runtime_draft_len,
             draft_lens=draft_lens,
+            verify_lens_snapshot=verify_lens_snapshot,
+            verify_caps_snapshot=verify_caps_snapshot,
+            sts_target_seq=(self.sts_seq_provider()
+                            if self.sts_seq_provider is not None else None),
         )

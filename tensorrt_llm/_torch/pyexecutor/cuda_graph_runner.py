@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 import bisect
 import contextlib
 from dataclasses import dataclass
@@ -50,6 +52,9 @@ class KeyType(NamedTuple):
     num_encoder_tokens: int = 0
     peft_cache_data_type: Optional[torch.dtype] = None
     use_lora_graph: bool = False
+    # Total submitted verifier tokens for a ragged generation graph. ``None``
+    # retains the existing uniform graph family.
+    ragged_verify_bucket: Optional[int] = None
 
 
 def _save_spec_decode_capture_state(
@@ -151,6 +156,13 @@ class CUDAGraphRunner:
         self.is_encoder_decoder = config.is_encoder_decoder
         self.enable_encoder_decoder_mixed_cuda_graph = (
             config.enable_encoder_decoder_mixed_cuda_graph)
+        # Window each ragged padding row carries, in py_verify_len units. Set
+        # by ModelEngine.fit_ragged_verify_lens when it picks the token bucket;
+        # the padding rows are one shared dummy object so they all share it.
+        self.ragged_pad_verify_len = 0
+        # Published by ModelEngine when the ragged fit picks a token bucket;
+        # None is the resting value (no ragged step in flight).
+        self.agreed_ragged_bucket: Optional[int] = None
 
         self.graphs: Dict[KeyType, torch.cuda.CUDAGraph] = {}
         self.graph_outputs: Dict[KeyType,
@@ -367,6 +379,7 @@ class CUDAGraphRunner:
             num_encoder_tokens = sum(
                 int(request.encoder_output_len) for request in context_requests
                 if not request.py_skip_cross_kv_projection)
+            verify_bucket = self._ragged_verify_bucket(batch)
             key = KeyType(batch_size=batch_size,
                           draft_len=draft_len,
                           is_first_draft=False,
@@ -376,7 +389,8 @@ class CUDAGraphRunner:
                           context_query_len=context_query_len,
                           num_encoder_tokens=num_encoder_tokens,
                           peft_cache_data_type=peft_cache_data_type,
-                          use_lora_graph=use_lora_graph)
+                          use_lora_graph=use_lora_graph,
+                          ragged_verify_bucket=verify_bucket)
         return key
 
     def _get_compatible_mixed_encoder_decoder_key(self,
@@ -397,6 +411,43 @@ class CUDAGraphRunner:
             return key
         return min(compatible_keys,
                    key=lambda captured_key: captured_key.num_encoder_tokens)
+
+    def _ragged_verify_bucket(self, batch: ScheduledRequests) -> Optional[int]:
+        """Total verified token count when the batch uses ragged windows.
+
+        None unless *every* generation request carries a window; None keeps
+        the original (uniform) key. Config-gated before touching the batch:
+        this runs on every graph-key build for every model.
+        """
+        # Keyed on the MODE: `cap-accept` shares this config flag but never
+        # shrinks the token axis, so it must keep the ordinary uniform key.
+        from ..speculative.dspark_observability import trims_submitted_tokens
+        if not trims_submitted_tokens(self.spec_config):
+            return None
+        # Windows can vanish between the fit and key derivation; a ragged key
+        # over a window-less batch replays stale token-major row maps (IMA).
+        if any(
+                getattr(request, "py_verify_len", None) is None
+                for request in batch.generation_requests):
+            return None
+        # Return the fitted bucket, never a fresh sum over the batch: every
+        # attention-DP rank must key on the same value, and the fit's
+        # allgathered arithmetic agrees by construction where a local sum only
+        # agrees by accident.
+        return self.agreed_ragged_bucket
+
+    @staticmethod
+    def _local_draft_len(batch: ScheduledRequests) -> int:
+        """This rank's draft length, for the attention-DP shape comparison.
+
+        Tolerant where :meth:`get_graph_key` asserts: a malformed batch
+        reports its max, differs from well-formed peers, and the gate
+        declines the graph.
+        """
+        return max(
+            (len(request.py_draft_tokens)
+             for request in batch.generation_requests),
+            default=0)
 
     @staticmethod
     def _get_mrope_position_delta(request: Any) -> Optional[Any]:
@@ -452,25 +503,47 @@ class CUDAGraphRunner:
         not change request state or type and is used only to build a graph key
         consistent with the final-context token that will be executed.
         """
+        # Why the last call declined, for the DSpark ragged counters; the call
+        # site that counts the miss cannot see the reason.
+        self.last_miss_reason = None
+        self.last_miss_key = None
+
         # disable when doing statistic
         if ExpertStatistic.should_record():
+            self.last_miss_reason = "expert_statistic"
             return None, None, None
 
         is_mixed_encoder_decoder = self._is_mixed_encoder_decoder_batch(batch)
         can_run_cuda_graph = self._can_run_cuda_graph_batch(batch)
         batch_size = batch.batch_size
         if self.enabled and self.config.enable_attention_dp and self.config.mapping.tp_size > 1:
-            graph_batch_info = self.config.dist.tp_allgather(
-                [can_run_cuda_graph, batch_size])
-            all_can_run_cuda_graph = all(rank_info[0]
-                                         for rank_info in graph_batch_info)
-            all_batch_sizes_equal = all(rank_info[1] == graph_batch_info[0][1]
-                                        for rank_info in graph_batch_info)
+            # Compare every key component a rank can decide for itself: replay
+            # freezes all_rank_num_tokens, so a shape mismatch is invisible at
+            # replay time. draft_len is settable rank-locally (acceptance-rate
+            # gate), so it is compared rather than assumed. -1 = "not
+            # applicable" so the payload is plain ints on every rank.
+            local_bucket = self._ragged_verify_bucket(
+                batch) if can_run_cuda_graph else None
+            all_can_graph_batch = self.config.dist.tp_allgather([
+                can_run_cuda_graph, batch_size,
+                -1 if local_bucket is None else int(local_bucket),
+                self._local_draft_len(batch) if can_run_cuda_graph else -1
+            ])
+            is_all_gen_only = all(all_can_graph[0]
+                                  for all_can_graph in all_can_graph_batch)
+            all_shapes_equal = all(
+                peer[1:] == all_can_graph_batch[0][1:]
+                for peer in all_can_graph_batch)
 
-            if not all_can_run_cuda_graph or not all_batch_sizes_equal:
+            if not is_all_gen_only or not all_shapes_equal:
+                self.last_miss_reason = ("peer_not_gen_only"
+                                         if not is_all_gen_only else
+                                         "peer_shape_mismatch")
                 return None, None, None
 
         if not self.enabled or not can_run_cuda_graph:
+            self.last_miss_reason = ("disabled" if not self.enabled else
+                                     "local_not_gen_only")
             return None, None, None
         if self.config.use_mrope and any(
                 self._needs_mrope_delta_cache_update(request)
@@ -479,6 +552,7 @@ class CUDAGraphRunner:
             # Qwen3.5 configs normalized to text-only decoding). Requests that
             # do carry a delta must first populate the model-side cache for their
             # current seq slot before graph replay.
+            self.last_miss_reason = "mrope_delta_cache"
             return None, None, None
         # Propagate the execution-view identity through graph lookup. Existing
         # callers pass the empty default and retain generation-only behavior.
@@ -500,9 +574,13 @@ class CUDAGraphRunner:
         # workspace after older graph pointers have been fixed. Only shapes
         # captured by the two-pass startup warmup may replay.
         if not self._capture_allowed:
+            self.last_miss_reason = "key_not_captured"
+            self.last_miss_key = key
             return None, None, None
 
         if batch_size not in self.supported_batch_sizes:
+            self.last_miss_reason = "bs_not_supported"
+            self.last_miss_key = key
             return None, None, None
 
         num_sequences_in_batch = batch_size * self.max_beam_width
@@ -556,6 +634,12 @@ class CUDAGraphRunner:
         return self.memory_pool
 
     def _get_num_tokens_for_key(self, key: KeyType) -> int:
+        if key.ragged_verify_bucket is not None:
+            if key.num_contexts:
+                raise ValueError(
+                    "Ragged verifier graphs do not support mixed context batches."
+                )
+            return int(key.ragged_verify_bucket)
         token_per_generation = key.draft_len + 1
         return (key.num_contexts * key.context_query_len +
                 (key.batch_size * self.max_beam_width - key.num_contexts) *
@@ -729,6 +813,25 @@ class CUDAGraphRunner:
 
         return output_ref
 
+    def will_pad_to(self, padded_bs: int, num_requests: int) -> bool:
+        """Whether a batch of ``num_requests`` can actually reach ``padded_bs``.
+
+        Mirrors the SIZE guards in :meth:`_get_padded_batch` only; the
+        resource-dependent bails (dummy KV capacity, encoder-decoder state)
+        are deliberately not predicted. The ragged fit sizes its bucket grid
+        from the padded row count, so a wrong yes strands the fitted total in
+        no captured bucket.
+        """
+        if padded_bs <= 0 or num_requests <= 0:
+            return False
+        if padded_bs not in self.supported_batch_sizes:
+            return False
+        if padded_bs == num_requests:
+            return True          # already at a captured size, nothing to add
+        # _get_padded_batch bails when padding_size + batch_size exceeds the
+        # configured batch size; that sum is just padded_bs.
+        return padded_bs <= self.config.batch_size
+
     def _get_padded_batch(self, batch: ScheduledRequests,
                           resource_manager: ResourceManager,
                           runtime_draft_len: int) -> int:
@@ -779,6 +882,21 @@ class CUDAGraphRunner:
                 "falling back to eager mode for padded batches.",
                 key=f"cuda_graph_padding_dummy_fallback_{runtime_draft_len}")
             return 0
+
+        # The ragged fit decides the padding rows' shared window before the
+        # generic mainline padding path appends its cached dummy request. Clear
+        # it on uniform steps so a previous ragged graph cannot leak its shape.
+        if getattr(self.spec_config, "enable_ragged_verify", False):
+            ragged = any(
+                getattr(request, "py_verify_len", None) is not None
+                for request in batch.generation_requests)
+            padding_dummy_request.py_verify_len = (
+                self.ragged_pad_verify_len if ragged else None)
+            cap_accept = any(
+                getattr(request, "py_verify_cap", None) is not None
+                for request in batch.generation_requests)
+            padding_dummy_request.py_verify_cap = (
+                self.spec_config.max_draft_len if cap_accept else None)
 
         batch.generation_requests.extend([padding_dummy_request] * padding_size)
         return padding_size

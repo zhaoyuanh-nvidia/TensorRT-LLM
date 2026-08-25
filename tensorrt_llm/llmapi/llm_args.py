@@ -2912,13 +2912,13 @@ class DSparkDecodingConfig(DecodingBaseConfig):
     layers as cross-attention context and drafts a whole block in a single
     backbone forward, but it additionally refines the per-position draft logits
     with a lightweight sequential head (a low-rank Markov head, optionally an RNN
-    head) and predicts an acceptance-confidence per position to truncate the
-    proposed prefix.
+    head) and predicts a per-position acceptance confidence used to budget how
+    much verification the batch is worth.
 
     Key features:
     - Target-dependent: captures hidden states from ``target_layer_ids``.
     - Semi-parallel: one block backbone forward + cheap sequential head refine.
-    - Confidence head: truncates the proposed draft length (NOT the accept rule;
+    - Confidence head: sizes the *verification* budget (NOT the accept rule;
       acceptance stays standard target verification, preserving greedy parity).
 
     Reference: DeepSeek DeepSpec (https://github.com/deepseek-ai/DeepSpec).
@@ -2955,13 +2955,61 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         "read from the draft model config (dspark_markov_head_type), "
         "defaulting to \"vanilla\".")
 
-    # NOTE: confidence-based dynamic drafting (the draft model's confidence head
-    # that truncates the proposed block) is NOT enabled in this PR. The user-facing
-    # ``enable_confidence_head`` / ``confidence_threshold`` knobs are intentionally
-    # omitted and will be added when the feature is actually wired into the
-    # speculative scheduling/verification path. The confidence head module and its
-    # internal plumbing remain as scaffolding (see DSparkConfidenceHead /
-    # dspark_propose).
+    enable_confidence_scheduling: bool = Field(
+        default=False,
+        description=
+        "Score each drafted position with the draft's confidence head and let "
+        "the verification scheduler size the batch's verify budget from those "
+        "scores. The block is always drafted in full; only the number of tokens "
+        "sent to the target for verification changes, so acceptance (and hence "
+        "output distribution) is unaffected. Requires a checkpoint with trained "
+        "confidence-head weights. Gains only appear at high concurrency -- at "
+        "small batch sizes the step cost is nearly flat in the verified token "
+        "count, so trimming saves nothing and costs acceptance length.",
+        status="prototype")
+
+    confidence_sts_path: Optional[str] = Field(
+        default=None,
+        description=
+        "Path to a JSON file with per-position sequential-temperature-scaling "
+        "(STS) values used to calibrate the confidence head. The scheduler "
+        "consumes a cumulative product of per-position probabilities, so a "
+        "per-position calibration error compounds geometrically along the "
+        "block. If None, the raw sigmoid is used (identity calibration).",
+        status="prototype")
+
+    confidence_sps_table_path: Optional[str] = Field(
+        default=None,
+        description=
+        "Path to a JSON file with the profiled decode step cost as a function of "
+        "the total verified token count. Without it the planner has a flat cost "
+        "model, under which every extra verified token looks free and the budget "
+        "degenerates to verify-all (no scheduling gain).",
+        status="prototype")
+
+    confidence_verify_len_tiers: Optional[List[PositiveInt]] = Field(
+        default=None,
+        description=
+        "Draft lengths to capture CUDA graphs for. The scheduler may only pick "
+        "from this ladder: a length with no captured graph does not raise, it "
+        "silently drops the step out of graph replay into eager execution, which "
+        "costs far more than the trimmed tokens save. Each extra tier is another "
+        "captured graph, and captured graphs consume memory that would otherwise "
+        "be KV cache, so keep the ladder short. If None, defaults to "
+        "[1, ceil(max_draft_len/2), max_draft_len].",
+        status="prototype")
+
+    enable_ragged_verify: bool = Field(
+        default=False,
+        description=
+        "Give each request its own verify length instead of one length for the "
+        "whole batch. The batch's verify budget is then allocated by global "
+        "survival rank, so a request whose draft is still likely alive at depth "
+        "5 can take positions from one whose draft already died at depth 1. "
+        "Requires enable_confidence_scheduling. The packed batch is padded to a "
+        "captured (batch size, token count) pair, so this captures a second "
+        "graph axis and costs more graph memory than uniform scheduling.",
+        status="prototype")
 
     decoding_type: Literal["DSpark"] = Field(default="DSpark")
 
@@ -2977,6 +3025,88 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         "Blackwell GPU with SM100 or SM103, and uses generated FMHA kernels "
         "with a private paged context cache; VANILLA uses FlashAttention with "
         "a contiguous cache.")
+
+    @model_validator(mode="after")
+    def validate_ragged_verify(self):
+        if self.enable_ragged_verify and not self.enable_confidence_scheduling:
+            raise ValueError(
+                "enable_ragged_verify requires enable_confidence_scheduling=True: "
+                "per-request verify lengths are chosen from confidence-head "
+                "survival, which is only computed when scheduling is on")
+        if self.enable_confidence_scheduling and not self.enable_ragged_verify:
+            # The two flags describe one feature. Scheduling without ragged used
+            # to mean a uniform tier ladder -- one window chosen for the whole
+            # batch -- which is a middle ground that does not earn its keep:
+            # it cannot give a confident request a longer window than a
+            # collapsing one, which is the entire point of scheduling against
+            # per-request confidence, and it degenerates to the full block
+            # whenever acceptance is high (every workload measured on
+            # DeepSeek-V4-Pro-DSpark). SGLang has no equivalent either: its
+            # scheduler always produces per-request windows via top-k, and
+            # uniform appears only as the verify-all degenerate case.
+            #
+            # So there are two states, not three: schedule per request, or
+            # verify the full block. Declining the feature is
+            # enable_confidence_scheduling=False.
+            raise ValueError(
+                "enable_confidence_scheduling requires enable_ragged_verify=True. "
+                "Scheduling a single window for the whole batch cannot act on "
+                "per-request confidence, and collapses to verifying the full "
+                "block whenever acceptance is high. To turn the feature off, "
+                "set enable_confidence_scheduling=False -- that verifies the "
+                "full drafted block, which is the only fallback.")
+        if (self.enable_ragged_verify and not self.confidence_sps_table_path
+                and not self.confidence_sts_path):
+            # Without a profiled cost table the planner's budget degenerates to
+            # verify-all -- correctly, since a flat model makes every extra
+            # token look free -- so the ragged path silently never runs.
+            raise ValueError(
+                "enable_ragged_verify=True requires a profiled cost table: pass "
+                "confidence_sps_table_path (produced by "
+                "`python tests/microbenchmarks/dspark_sps_profiler.py`) "
+                "or confidence_sts_path. Without one the planner cannot compare "
+                "the cost of extra verify tokens against their expected "
+                "acceptance, so it declines to trim and every request receives "
+                "the full window -- the ragged path runs but changes nothing. "
+                "Collecting a table does NOT require this flag: the profiler "
+                "pins static mode and sweeps the verify length by rebuilding "
+                "the engine, so run it with ragged verification off.")
+        return self
+
+    @model_validator(mode="after")
+    def validate_confidence_scheduling(self):
+        if not self.enable_confidence_scheduling:
+            if (self.confidence_sts_path or self.confidence_sps_table_path
+                    or self.confidence_verify_len_tiers):
+                raise ValueError(
+                    "confidence_sts_path / confidence_sps_table_path / "
+                    "confidence_verify_len_tiers require "
+                    "enable_confidence_scheduling=True")
+            return self
+
+        if self.max_draft_len is not None:
+            tiers = self.confidence_verify_len_tiers or [
+                1, max(1, (self.max_draft_len + 1) // 2), self.max_draft_len
+            ]
+            tiers = sorted({int(t) for t in tiers})
+            if tiers[-1] > self.max_draft_len:
+                raise ValueError(
+                    f"confidence_verify_len_tiers {tiers} exceeds max_draft_len "
+                    f"({self.max_draft_len}); a request cannot verify more tokens "
+                    f"than the draft proposes")
+            # The full block must stay reachable: it is the fallback used whenever
+            # the confidence snapshot is stale or the cost model is unprofiled.
+            if tiers[-1] != self.max_draft_len:
+                tiers.append(self.max_draft_len)
+            self.confidence_verify_len_tiers = tiers
+        return self
+
+    @property
+    def verify_len_tiers(self) -> List[int]:
+        """Captured draft-length ladder; ``[max_draft_len]`` when scheduling is off."""
+        if not self.enable_confidence_scheduling:
+            return [self.max_draft_len]
+        return list(self.confidence_verify_len_tiers or [self.max_draft_len])
 
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):
@@ -5823,6 +5953,73 @@ class TorchLlmArgs(BaseLlmArgs):
                 "graphs or disable enable_piecewise_cuda_graph.")
         return self
 
+    def _validate_dspark_ragged_verify_environment(self) -> None:
+        """Reject the configurations ragged verification cannot honour.
+
+        Every check here guards a path that would otherwise degrade *silently*:
+        the run comes up, produces plausible text, and either never takes the
+        ragged path at all or takes it with a kernel that mis-attributes rows.
+        A hard error at construction is the only signal that survives.
+        """
+        cuda_graph_config = self.cuda_graph_config
+        # `fit_ragged_verify_lens` plans against the padded row count and
+        # reserves tokens for the CUDA-graph padding rows, so it presumes those
+        # rows exist. With padding off, `_get_padded_batch` adds none: the batch
+        # then carries a token total that keys into a graph nobody captured and
+        # drops to eager on every ragged step -- which costs far more than the
+        # trimmed tokens save -- while real requests were still shrunk to leave
+        # room for padding that never arrived.
+        if cuda_graph_config is None:
+            raise ValueError(
+                "speculative_config.enable_ragged_verify=True requires "
+                "cuda_graph_config to be set with enable_padding=True. Ragged "
+                "verification fits each step's token total onto a captured "
+                "CUDA-graph bucket; with no graphs there is no bucket to fit "
+                "and every step would silently run eager.")
+        if not cuda_graph_config.enable_padding:
+            raise ValueError(
+                "speculative_config.enable_ragged_verify=True requires "
+                "cuda_graph_config.enable_padding=True (it defaults to False). "
+                "The ragged token budget is planned against the padded batch "
+                "size and reserves tokens for the padding rows; without padding "
+                "those rows never appear, so the step's token total misses its "
+                "captured bucket and falls out of graph replay.")
+
+        sparse_attention_config = self.sparse_attention_config
+        if sparse_attention_config is not None:
+            # Both recover "which request is this row" from a fixed next_n --
+            # GVR indexes its previous-step top-k hint by request and strides it
+            # by next_n, and the CuTe-DSL kernel takes next_n as a compile-time
+            # constant and JIT cache key. Neither can express per-request
+            # windows. The C++ launcher already refuses the combination
+            # (indexerTopK.cu, "ragged rowKvLens is incompatible with the GVR
+            # preIdx hint"), but that fires deep in a decode step; say so here.
+            incompatible = [
+                name for name in ("enable_heuristic_topk", "use_cute_dsl_topk")
+                if getattr(sparse_attention_config, name, False)
+            ]
+            if incompatible:
+                raise ValueError(
+                    "speculative_config.enable_ragged_verify=True is "
+                    "incompatible with sparse_attention_config."
+                    f"{' / '.join(incompatible)}=True: those top-k paths "
+                    "reconstruct each row's request and window position from a "
+                    "single batch-wide next_n, which a ragged batch does not "
+                    "have. Disable them, or disable ragged verification.")
+            # Not an error: the DSL paged-MQA-logits path is structurally
+            # uniform too, but the expanded (one row per query token) path it
+            # falls back to is numerically equivalent, and it is the default on
+            # DeepSeek-V4 anyway. Still worth saying out loud, since the knob
+            # will read as honoured otherwise.
+            if getattr(sparse_attention_config,
+                       "use_cute_dsl_paged_mqa_logits", False):
+                logger.warning(
+                    "sparse_attention_config.use_cute_dsl_paged_mqa_logits=True "
+                    "is ignored on ragged-verification steps: the DSL kernel "
+                    "broadcasts one KV length per request across a fixed next_n. "
+                    "Those steps use the expanded DeepGEMM path instead, which "
+                    "is numerically equivalent.")
+
     @model_validator(mode="after")
     def normalize_prefill_cuda_graph_config(self) -> 'TorchLlmArgs':
         """Normalize legacy piecewise CUDA graph options into prefill fields."""
@@ -6161,6 +6358,8 @@ class TorchLlmArgs(BaseLlmArgs):
                         "DSpark block_size must equal max_draft_len; got "
                         f"block_size={spec_cfg.block_size} and "
                         f"max_draft_len={spec_cfg.max_draft_len}")
+                if spec_cfg.enable_ragged_verify:
+                    self._validate_dspark_ragged_verify_environment()
 
             if isinstance(self.speculative_config, SADecodingConfig):
                 pool_size = self.speculative_config.global_pool_size
