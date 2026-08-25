@@ -715,11 +715,9 @@ class PyTorchModelEngine(ModelEngine):
         self._dspark_sps_cost_table = None
         self._dspark_sps_payload = None
         if (self.spec_config is not None and getattr(
-                self.spec_config, "enable_confidence_scheduling", False)
-                and getattr(self.spec_config, "confidence_sps_table_path",
-                            None)):
-            from ..speculative.dspark_planner import \
-                load_runtime_sps_cost_table
+                self.spec_config, "enable_confidence_scheduling", False) and
+                getattr(self.spec_config, "confidence_sps_table_path", None)):
+            from ..speculative.dspark_planner import load_runtime_sps_cost_table
             top_verify_len = max(
                 int(t) for t in self.spec_config.verify_len_tiers)
             (self._dspark_sps_cost_table,
@@ -728,8 +726,8 @@ class PyTorchModelEngine(ModelEngine):
                  graph_batch_sizes=self._cuda_graph_batch_sizes,
                  max_draft_len=top_verify_len,
                  live_engine_fingerprint_path=getattr(
-                     self.spec_config,
-                     "confidence_sps_live_fingerprint_path", None),
+                     self.spec_config, "confidence_sps_live_fingerprint_path",
+                     None),
              )
 
         self._encoder_cuda_graph_padding_enabled = (
@@ -2247,16 +2245,14 @@ class PyTorchModelEngine(ModelEngine):
                 if isinstance(exact_table, ExactSpsCostTable):
                     ragged_graphs = [
                         (bs, top_tier, verifier_budget)
-                        for bs in cuda_graph_batch_sizes
-                        for verifier_budget in
+                        for bs in cuda_graph_batch_sizes for verifier_budget in
                         exact_table.production_candidate_budgets(bs)
                     ]
                     bucket_description = "exact measured (G,V) cells"
                 else:
-                    ragged_graphs = [
-                        (bs, top_tier, bs * (t + 1))
-                        for bs in cuda_graph_batch_sizes for t in tiers
-                    ]
+                    ragged_graphs = [(bs, top_tier, bs * (t + 1))
+                                     for bs in cuda_graph_batch_sizes
+                                     for t in tiers]
                     bucket_description = f"token buckets from tiers {tiers}"
                 graphs = native_graphs + ragged_graphs
                 logger.info(
@@ -4931,8 +4927,8 @@ class PyTorchModelEngine(ModelEngine):
         from ..speculative.dspark_planner import ExactSpsCostTable
         exact_table = getattr(self, "_dspark_sps_cost_table", None)
         if isinstance(exact_table, ExactSpsCostTable):
-            return list(
-                exact_table.production_candidate_budgets(int(padded_bs)))
+            return list(exact_table.production_candidate_budgets(
+                int(padded_bs)))
         tiers = sorted({int(t) for t in self.spec_config.verify_len_tiers})
         return [int(padded_bs) * (t + 1) for t in tiers]
 
@@ -5050,7 +5046,8 @@ class PyTorchModelEngine(ModelEngine):
             bucket = int(exact_shape[1])
             if bucket not in buckets:
                 logger.warning(
-                    f"DSpark exact V={bucket} was not captured for G={padded_bs}")
+                    f"DSpark exact V={bucket} was not captured for G={padded_bs}"
+                )
                 return None
         else:
             try:
@@ -5103,9 +5100,8 @@ class PyTorchModelEngine(ModelEngine):
         elif exact_shape is not None:
             pad_len = int(exact_shape[2])
             if not 1 <= pad_len <= max_verify_len:
-                logger.warning(
-                    f"DSpark exact pad window {pad_len} is outside "
-                    f"[1, {max_verify_len}]")
+                logger.warning(f"DSpark exact pad window {pad_len} is outside "
+                               f"[1, {max_verify_len}]")
                 return None
         else:
             # pad_len has to leave the real rows a target they can actually
@@ -5127,8 +5123,7 @@ class PyTorchModelEngine(ModelEngine):
                 return None
             pad_len = lo
         real_target = bucket - n_pad * pad_len
-        if (exact_shape is not None
-                and real_target != sum(token_lens)):
+        if (exact_shape is not None and real_target != sum(token_lens)):
             logger.warning(
                 "DSpark exact layout changed between policy and fit: "
                 f"real tokens={sum(token_lens)}, target={real_target}, "

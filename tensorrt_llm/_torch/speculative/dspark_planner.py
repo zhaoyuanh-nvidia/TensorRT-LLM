@@ -190,107 +190,134 @@ class ExactSpsCostTable:
     tables: dict[int, SpsCostTable]
     max_draft_len: int
     minimum_predicted_gain: float = 0.01
+    identity_sha256: str = field(init=False)
 
     def __post_init__(self) -> None:
-        max_draft_len = _require_exact_int(
-            self.max_draft_len, field="max_draft_len", minimum=1)
+        max_draft_len = _require_exact_int(self.max_draft_len, field="max_draft_len", minimum=1)
         normalized: dict[int, SpsCostTable] = {}
         for graph_batch_size, table in self.tables.items():
             canonical_graph_batch_size = _require_exact_int(
-                graph_batch_size, field="graph batch size", minimum=1)
+                graph_batch_size, field="graph batch size", minimum=1
+            )
             if canonical_graph_batch_size in normalized:
-                raise ValueError(
-                    "ExactSpsCostTable contains duplicate canonical graph "
-                    "batch sizes")
+                raise ValueError("ExactSpsCostTable contains duplicate canonical graph batch sizes")
             normalized[canonical_graph_batch_size] = table
         if not normalized:
-            raise ValueError(
-                "ExactSpsCostTable requires at least one graph batch size")
-        if any(not isinstance(table, SpsCostTable)
-               for table in normalized.values()):
-            raise TypeError(
-                "ExactSpsCostTable values must be SpsCostTable instances")
+            raise ValueError("ExactSpsCostTable requires at least one graph batch size")
+        if any(not isinstance(table, SpsCostTable) for table in normalized.values()):
+            raise TypeError("ExactSpsCostTable values must be SpsCostTable instances")
         for graph_batch_size, table in normalized.items():
             budgets = tuple(
-                _require_exact_int(value,
-                                   field="measured verifier budget",
-                                   minimum=0) for value in table.token_counts)
+                _require_exact_int(value, field="measured verifier budget", minimum=0)
+                for value in table.token_counts
+            )
             if budgets[0] != 0:
                 raise ValueError(
                     "Every exact SPS G requires V=0 native static K5 "
-                    f"fallback; missing for G={graph_batch_size}")
+                    f"fallback; missing for G={graph_batch_size}"
+                )
             max_verifier_budget = graph_batch_size * (max_draft_len + 1)
             invalid_positive_budgets = [
-                verifier_budget for verifier_budget in budgets[1:]
-                if (verifier_budget < graph_batch_size
-                    or verifier_budget > max_verifier_budget)
+                verifier_budget
+                for verifier_budget in budgets[1:]
+                if (verifier_budget < graph_batch_size or verifier_budget > max_verifier_budget)
             ]
             if invalid_positive_budgets:
                 raise ValueError(
                     "Exact SPS positive verifier budgets must satisfy "
                     "G <= V <= G*(K+1); "
                     f"G={graph_batch_size}, K={max_draft_len}, "
-                    f"invalid V={invalid_positive_budgets}")
+                    f"invalid V={invalid_positive_budgets}"
+                )
             production_budgets = [
-                verifier_budget for verifier_budget in budgets[1:]
+                verifier_budget
+                for verifier_budget in budgets[1:]
                 if verifier_budget < max_verifier_budget
             ]
             if len(production_budgets) > _MAX_EXACT_COMPACT_CELLS_PER_G:
                 raise ValueError(
                     "Exact SPS graph budget exceeds the production limit of "
                     f"{_MAX_EXACT_COMPACT_CELLS_PER_G} compact V cells per G; "
-                    f"G={graph_batch_size} has {len(production_budgets)}")
+                    f"G={graph_batch_size} has {len(production_budgets)}"
+                )
         production_cell_count = sum(
-            len([
-                verifier_budget for verifier_budget in table.token_counts[1:]
-                if verifier_budget < graph_batch_size * (max_draft_len + 1)
-            ]) for graph_batch_size, table in normalized.items())
+            len(
+                [
+                    verifier_budget
+                    for verifier_budget in table.token_counts[1:]
+                    if verifier_budget < graph_batch_size * (max_draft_len + 1)
+                ]
+            )
+            for graph_batch_size, table in normalized.items()
+        )
         if production_cell_count > _MAX_EXACT_COMPACT_CELLS_TOTAL:
             raise ValueError(
                 "Exact SPS graph budget exceeds the production limit of "
                 f"{_MAX_EXACT_COMPACT_CELLS_TOTAL} compact (G,V) cells; "
-                f"artifact has {production_cell_count}")
+                f"artifact has {production_cell_count}"
+            )
         object.__setattr__(self, "tables", normalized)
         object.__setattr__(self, "max_draft_len", max_draft_len)
-        object.__setattr__(
-            self, "minimum_predicted_gain",
-            _require_nonnegative_finite_number(
-                self.minimum_predicted_gain,
-                field="minimum_predicted_gain"))
+        minimum_predicted_gain = _require_nonnegative_finite_number(
+            self.minimum_predicted_gain, field="minimum_predicted_gain"
+        )
+        object.__setattr__(self, "minimum_predicted_gain", minimum_predicted_gain)
+        # This is the rank-agreement identity used on every exact scheduling
+        # step. It covers the canonical ordered grid, every measured cost, K,
+        # and the minimum-gain policy. Two artifacts that merely have the same
+        # number of cells must not be allowed to index each other's yields.
+        identity_payload = {
+            "schema": "exact-sps-runtime-v1",
+            "max_draft_len": max_draft_len,
+            "minimum_predicted_gain": minimum_predicted_gain,
+            "tables": [
+                {
+                    "graph_batch_size": graph_batch_size,
+                    "token_counts": [int(value) for value in table.token_counts],
+                    "step_time_ms": [float(value) for value in table.step_time_ms],
+                }
+                for graph_batch_size, table in sorted(normalized.items())
+            ],
+        }
+        object.__setattr__(self, "identity_sha256", _canonical_json_sha256(identity_payload))
+
+    @property
+    def collective_identity_words(self) -> tuple[int, ...]:
+        """Full SHA256 as eight transport-safe unsigned 32-bit integers."""
+        return tuple(
+            int(self.identity_sha256[offset : offset + 8], 16)
+            for offset in range(0, len(self.identity_sha256), 8)
+        )
 
     def for_graph_batch_size(self, num_requests: int) -> SpsCostTable:
         """Return the directly measured V cells for one exact G."""
-        graph_batch_size = _require_exact_int(
-            num_requests, field="graph batch size", minimum=1)
+        graph_batch_size = _require_exact_int(num_requests, field="graph batch size", minimum=1)
         try:
             return self.tables[graph_batch_size]
         except KeyError as error:
             raise ValueError(
-                f"SPS cost artifact has no direct measurements for "
-                f"G={graph_batch_size}") from error
+                f"SPS cost artifact has no direct measurements for G={graph_batch_size}"
+            ) from error
 
-    def step_times(self, num_tokens: np.ndarray,
-                   num_requests: int) -> np.ndarray:
+    def step_times(self, num_tokens: np.ndarray, num_requests: int) -> np.ndarray:
         """Return direct whole-step measurements without interpolation."""
         table = self.for_graph_batch_size(num_requests)
         measured = {
-            _require_exact_int(token_count,
-                               field="measured verifier budget",
-                               minimum=0): float(step_time)
-            for token_count, step_time in zip(table.token_counts,
-                                               table.step_time_ms)
+            _require_exact_int(token_count, field="measured verifier budget", minimum=0): float(
+                step_time
+            )
+            for token_count, step_time in zip(table.token_counts, table.step_time_ms)
         }
         requested = np.asarray(num_tokens)
         requested_budgets = [
-            _require_exact_int(value,
-                               field="requested verifier budget",
-                               minimum=0) for value in requested.reshape(-1)
+            _require_exact_int(value, field="requested verifier budget", minimum=0)
+            for value in requested.reshape(-1)
         ]
         missing = sorted(set(requested_budgets) - measured.keys())
         if missing:
             raise ValueError(
-                f"SPS cost artifact has no direct measurements for "
-                f"G={num_requests}, V={missing}")
+                f"SPS cost artifact has no direct measurements for G={num_requests}, V={missing}"
+            )
         return np.asarray(
             [measured[value] for value in requested_budgets],
             dtype=np.float64,
@@ -298,39 +325,37 @@ class ExactSpsCostTable:
 
     def step_time(self, num_tokens: int, num_requests: int) -> float:
         """Return one directly measured ``T(G, V)`` value."""
-        return float(
-            self.step_times(np.asarray([num_tokens]), num_requests)[0])
+        return float(self.step_times(np.asarray([num_tokens]), num_requests)[0])
 
-    def candidate_budgets(self,
-                          num_requests: int,
-                          *,
-                          include_native: bool = False) -> tuple[int, ...]:
+    def candidate_budgets(
+        self, num_requests: int, *, include_native: bool = False
+    ) -> tuple[int, ...]:
         """Return exact per-G V candidates, excluding native by default."""
         budgets = tuple(
-            _require_exact_int(value,
-                               field="measured verifier budget",
-                               minimum=0)
-            for value in self.for_graph_batch_size(num_requests).token_counts)
+            _require_exact_int(value, field="measured verifier budget", minimum=0)
+            for value in self.for_graph_batch_size(num_requests).token_counts
+        )
         if include_native:
             return budgets
         return tuple(value for value in budgets if value != 0)
 
     def candidate_cells(self) -> tuple[tuple[int, int], ...]:
         """Stable positive ``(G,V)`` ordering for collective payloads."""
-        return tuple((graph_batch_size, verifier_budget)
-                     for graph_batch_size in sorted(self.tables)
-                     for verifier_budget in self.production_candidate_budgets(
-                         graph_batch_size))
+        return tuple(
+            (graph_batch_size, verifier_budget)
+            for graph_batch_size in sorted(self.tables)
+            for verifier_budget in self.production_candidate_budgets(graph_batch_size)
+        )
 
-    def production_candidate_budgets(
-            self, num_requests: int) -> tuple[int, ...]:
+    def production_candidate_budgets(self, num_requests: int) -> tuple[int, ...]:
         """Compact serving cells, excluding native and full-token controls."""
-        graph_batch_size = _require_exact_int(
-            num_requests, field="graph batch size", minimum=1)
+        graph_batch_size = _require_exact_int(num_requests, field="graph batch size", minimum=1)
         full_budget = graph_batch_size * (self.max_draft_len + 1)
         return tuple(
-            verifier_budget for verifier_budget in self.candidate_budgets(
-                graph_batch_size) if verifier_budget < full_budget)
+            verifier_budget
+            for verifier_budget in self.candidate_budgets(graph_batch_size)
+            if verifier_budget < full_budget
+        )
 
     @property
     def is_flat(self) -> bool:
@@ -361,9 +386,7 @@ def load_sps_cost_table(
     """
     payload = _read_sps_cost_payload(path)
     if _is_exact_sps_payload(payload):
-        raise ValueError(
-            "Schema-v2 exact SPS artifacts require "
-            "load_validated_sps_cost_table")
+        raise ValueError("Schema-v2 exact SPS artifacts require load_validated_sps_cost_table")
     return _build_legacy_sps_cost_table(payload), payload
 
 
@@ -374,12 +397,9 @@ def _build_legacy_sps_cost_table(
         token_counts=tuple(int(value) for value in payload["token_counts"]),
         step_time_ms=tuple(float(value) for value in payload["step_time_ms"]),
         fixed_overhead_ms=float(payload.get("fixed_overhead_ms", 0.0)),
-        batch_sizes=tuple(int(value)
-                          for value in payload.get("batch_sizes", ())),
-        batch_overhead_ms=tuple(
-            float(value) for value in payload.get("batch_overhead_ms", ())),
-        minimum_predicted_gain=float(
-            payload.get("minimum_predicted_gain", 0.01)),
+        batch_sizes=tuple(int(value) for value in payload.get("batch_sizes", ())),
+        batch_overhead_ms=tuple(float(value) for value in payload.get("batch_overhead_ms", ())),
+        minimum_predicted_gain=float(payload.get("minimum_predicted_gain", 0.01)),
     )
 
 
@@ -403,17 +423,16 @@ def load_runtime_sps_cost_table(
     if live_engine_fingerprint_path is None:
         raise ValueError(
             "Schema-v2 exact SPS artifacts require an independently generated "
-            "live engine fingerprint path")
-    live_engine_fingerprint = _read_sps_cost_payload(
-        live_engine_fingerprint_path)
+            "live engine fingerprint path"
+        )
+    live_engine_fingerprint = _read_sps_cost_payload(live_engine_fingerprint_path)
     validate_sps_cost_table_payload(
         payload,
         graph_batch_sizes=graph_batch_sizes,
         max_draft_len=max_draft_len,
         live_engine_fingerprint=live_engine_fingerprint,
     )
-    return _build_exact_sps_cost_table(
-        payload, max_draft_len=max_draft_len), payload
+    return _build_exact_sps_cost_table(payload, max_draft_len=max_draft_len), payload
 
 
 def load_validated_sps_cost_table(
@@ -426,16 +445,14 @@ def load_validated_sps_cost_table(
     """Atomically validate and load one exact schema-v2 SPS artifact."""
     payload = _read_sps_cost_payload(path)
     if not _is_exact_sps_payload(payload):
-        raise ValueError(
-            "Validated exact SPS loading requires a schema-v2 artifact")
+        raise ValueError("Validated exact SPS loading requires a schema-v2 artifact")
     validate_sps_cost_table_payload(
         payload,
         graph_batch_sizes=graph_batch_sizes,
         max_draft_len=max_draft_len,
         live_engine_fingerprint=live_engine_fingerprint,
     )
-    return _build_exact_sps_cost_table(
-        payload, max_draft_len=max_draft_len), payload
+    return _build_exact_sps_cost_table(payload, max_draft_len=max_draft_len), payload
 
 
 def _build_exact_sps_cost_table(
@@ -447,32 +464,29 @@ def _build_exact_sps_cost_table(
     assert isinstance(exact_tables, dict)
     parsed_tables: dict[int, SpsCostTable] = {}
     for graph_batch_size, exact_payload in exact_tables.items():
-        canonical_graph_batch_size = _parse_graph_batch_size_key(
-            graph_batch_size)
+        canonical_graph_batch_size = _parse_graph_batch_size_key(graph_batch_size)
         assert isinstance(exact_payload, dict)
         parsed_tables[canonical_graph_batch_size] = SpsCostTable(
             token_counts=tuple(
-                _require_json_int(value,
-                                  field="rank-local verifier budget",
-                                  minimum=0)
-                for value in exact_payload["token_counts"]),
+                _require_json_int(value, field="rank-local verifier budget", minimum=0)
+                for value in exact_payload["token_counts"]
+            ),
             step_time_ms=tuple(
-                _require_positive_finite_number(
-                    value, field="SPS step time")
-                for value in exact_payload["step_time_ms"]),
+                _require_positive_finite_number(value, field="SPS step time")
+                for value in exact_payload["step_time_ms"]
+            ),
         )
     return ExactSpsCostTable(
         tables=parsed_tables,
         max_draft_len=max_draft_len,
         minimum_predicted_gain=_require_nonnegative_finite_number(
-            payload["minimum_predicted_gain"],
-            field="minimum_predicted_gain"),
+            payload["minimum_predicted_gain"], field="minimum_predicted_gain"
+        ),
     )
 
 
 def _canonical_json_sha256(value: object) -> str:
-    encoded = json.dumps(value, sort_keys=True,
-                         separators=(",", ":")).encode()
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
 
 
@@ -512,8 +526,7 @@ _V2_FINGERPRINT_FIELDS = {
 }
 
 
-def _validate_exact_fields(value: object, *, name: str,
-                           fields: set[str]) -> dict[str, object]:
+def _validate_exact_fields(value: object, *, name: str, fields: set[str]) -> dict[str, object]:
     if not isinstance(value, dict):
         raise TypeError(f"{name} must be a JSON object")
     non_string_keys = [key for key in value if not isinstance(key, str)]
@@ -521,52 +534,40 @@ def _validate_exact_fields(value: object, *, name: str,
         raise TypeError(f"{name} field names must be strings")
     missing = sorted(fields - value.keys())
     if missing:
-        raise ValueError(f"{name} is missing required fields: "
-                         + ", ".join(missing))
+        raise ValueError(f"{name} is missing required fields: " + ", ".join(missing))
     unknown = sorted(value.keys() - fields)
     if unknown:
-        raise ValueError(f"{name} has unknown fields: "
-                         + ", ".join(unknown))
+        raise ValueError(f"{name} has unknown fields: " + ", ".join(unknown))
     null_fields = sorted(key for key, item in value.items() if item is None)
     if null_fields:
-        raise ValueError(f"{name} has null fields: "
-                         + ", ".join(null_fields))
+        raise ValueError(f"{name} has null fields: " + ", ".join(null_fields))
     return value
 
 
 def _validate_v2_shape(payload: dict[str, object]) -> None:
-    _validate_exact_fields(payload,
-                           name="schema-v2 SPS artifact",
-                           fields=_V2_TOP_LEVEL_FIELDS)
+    _validate_exact_fields(payload, name="schema-v2 SPS artifact", fields=_V2_TOP_LEVEL_FIELDS)
     exact_tables = payload["cost_tables"]
     if not isinstance(exact_tables, dict) or not exact_tables:
-        raise TypeError(
-            "SPS cost_tables must be a non-empty object keyed by graph batch size"
-        )
+        raise TypeError("SPS cost_tables must be a non-empty object keyed by graph batch size")
     for graph_batch_size, table_payload in exact_tables.items():
         _parse_graph_batch_size_key(graph_batch_size)
         table_payload = _validate_exact_fields(
-            table_payload,
-            name=f"SPS cost table for G={graph_batch_size}",
-            fields=_V2_TABLE_FIELDS)
+            table_payload, name=f"SPS cost table for G={graph_batch_size}", fields=_V2_TABLE_FIELDS
+        )
         token_counts = table_payload["token_counts"]
         step_time_ms = table_payload["step_time_ms"]
         if not isinstance(token_counts, list) or not token_counts:
             raise TypeError(
-                f"SPS cost table for G={graph_batch_size} token_counts must "
-                "be a non-empty list")
+                f"SPS cost table for G={graph_batch_size} token_counts must be a non-empty list"
+            )
         if not isinstance(step_time_ms, list) or not step_time_ms:
             raise TypeError(
-                f"SPS cost table for G={graph_batch_size} step_time_ms must "
-                "be a non-empty list")
-        if len(token_counts) != len(step_time_ms):
-            raise ValueError(
-                f"SPS cost table for G={graph_batch_size} has mismatched cells"
+                f"SPS cost table for G={graph_batch_size} step_time_ms must be a non-empty list"
             )
+        if len(token_counts) != len(step_time_ms):
+            raise ValueError(f"SPS cost table for G={graph_batch_size} has mismatched cells")
         for value in token_counts:
-            _require_json_int(value,
-                              field="rank-local verifier budget",
-                              minimum=0)
+            _require_json_int(value, field="rank-local verifier budget", minimum=0)
         for value in step_time_ms:
             _require_positive_finite_number(value, field="SPS step time")
     fingerprint = _validate_exact_fields(
@@ -576,31 +577,25 @@ def _validate_v2_shape(payload: dict[str, object]) -> None:
     )
     for key in ("gpu", "runtime_snapshot", "source_head", "topology"):
         if not isinstance(fingerprint[key], str) or not fingerprint[key]:
-            raise TypeError(
-                f"SPS engine_fingerprint {key} must be a non-empty string")
+            raise TypeError(f"SPS engine_fingerprint {key} must be a non-empty string")
     for key in ("gpu_snapshot_sha256", "source_diff_sha256"):
         _require_sha256(fingerprint[key], field=f"engine_fingerprint {key}")
-    _require_json_int(fingerprint["gpu_count"],
-                      field="engine_fingerprint gpu_count",
-                      minimum=1)
-    _require_json_int(fingerprint["max_draft_len"],
-                      field="engine_fingerprint max_draft_len",
-                      minimum=1)
+    _require_json_int(fingerprint["gpu_count"], field="engine_fingerprint gpu_count", minimum=1)
+    _require_json_int(
+        fingerprint["max_draft_len"], field="engine_fingerprint max_draft_len", minimum=1
+    )
     for key in ("rank_local_graph_batch_sizes", "global_graph_batch_sizes"):
         values = fingerprint[key]
         if not isinstance(values, list) or not values:
             raise TypeError(f"engine_fingerprint {key} must be a non-empty list")
         for value in values:
-            _require_json_int(value,
-                              field=f"engine_fingerprint {key}",
-                              minimum=1)
+            _require_json_int(value, field=f"engine_fingerprint {key}", minimum=1)
         if len(set(values)) != len(values):
-            raise ValueError(
-                f"engine_fingerprint {key} must not contain duplicates")
-    _require_sha256(payload["engine_fingerprint_sha256"],
-                    field="engine_fingerprint_sha256")
-    _require_nonnegative_finite_number(payload["minimum_predicted_gain"],
-                                       field="minimum_predicted_gain")
+            raise ValueError(f"engine_fingerprint {key} must not contain duplicates")
+    _require_sha256(payload["engine_fingerprint_sha256"], field="engine_fingerprint_sha256")
+    _require_nonnegative_finite_number(
+        payload["minimum_predicted_gain"], field="minimum_predicted_gain"
+    )
     measurements = payload["measurements"]
     if not isinstance(measurements, list) or not measurements:
         raise TypeError("SPS measurements must be a non-empty list")
@@ -610,29 +605,35 @@ def _validate_v2_shape(payload: dict[str, object]) -> None:
             name=f"SPS measurement {index}",
             fields=_V2_MEASUREMENT_FIELDS,
         )
-        _require_json_int(measurement["rank_local_graph_batch_size"],
-                          field="measurement graph batch size",
-                          minimum=1)
-        _require_json_int(measurement["rank_local_verifier_budget"],
-                          field="measurement verifier budget",
-                          minimum=0)
-        _require_positive_finite_number(measurement["step_time_ms"],
-                                        field="measurement step time")
-        _require_sha256(measurement["source_result_sha256"],
-                        field="measurement source_result_sha256")
+        _require_json_int(
+            measurement["rank_local_graph_batch_size"],
+            field="measurement graph batch size",
+            minimum=1,
+        )
+        _require_json_int(
+            measurement["rank_local_verifier_budget"],
+            field="measurement verifier budget",
+            minimum=0,
+        )
+        _require_positive_finite_number(measurement["step_time_ms"], field="measurement step time")
+        _require_sha256(
+            measurement["source_result_sha256"], field="measurement source_result_sha256"
+        )
 
 
 def _parse_graph_batch_size_key(value: object) -> int:
-    if (not isinstance(value, str) or not value.isascii()
-            or not value.isdecimal() or value.startswith("0")):
+    if (
+        not isinstance(value, str)
+        or not value.isascii()
+        or not value.isdecimal()
+        or value.startswith("0")
+    ):
         raise TypeError(
             f"SPS graph batch size key {value!r} must be a canonical positive integer string"
         )
     parsed = int(value)
     if parsed < 1 or str(parsed) != value:
-        raise ValueError(
-            f"SPS graph batch size key {value!r} must be positive and canonical"
-        )
+        raise ValueError(f"SPS graph batch size key {value!r} must be positive and canonical")
     return parsed
 
 
@@ -667,14 +668,16 @@ def _require_nonnegative_finite_number(value: object, *, field: str) -> float:
         raise TypeError(f"{field} must be a JSON number, got {value!r}")
     parsed = float(value)
     if not math.isfinite(parsed) or parsed < 0.0:
-        raise ValueError(
-            f"{field} must be non-negative and finite, got {value!r}")
+        raise ValueError(f"{field} must be non-negative and finite, got {value!r}")
     return parsed
 
 
 def _require_sha256(value: object, *, field: str) -> str:
-    if (not isinstance(value, str) or len(value) != 64
-            or any(char not in "0123456789abcdef" for char in value)):
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(char not in "0123456789abcdef" for char in value)
+    ):
         raise ValueError(f"{field} must be a lowercase SHA256 digest")
     return value
 
@@ -784,20 +787,18 @@ def validate_sps_cost_table_payload(
     )
     _validate_live_fingerprint_values(live_engine_fingerprint)
 
-    if payload["engine_fingerprint_sha256"] != _canonical_json_sha256(
-            fingerprint):
+    if payload["engine_fingerprint_sha256"] != _canonical_json_sha256(fingerprint):
         raise ValueError("SPS engine_fingerprint SHA256 does not match payload")
-    mismatches = sorted(key for key in _V2_FINGERPRINT_FIELDS
-                        if fingerprint[key] != live_engine_fingerprint[key])
+    mismatches = sorted(
+        key for key in _V2_FINGERPRINT_FIELDS if fingerprint[key] != live_engine_fingerprint[key]
+    )
     if mismatches:
         raise ValueError(
-            "SPS engine_fingerprint does not match active runtime: "
-            + ", ".join(mismatches))
+            "SPS engine_fingerprint does not match active runtime: " + ", ".join(mismatches)
+        )
 
     configured_graph_batch_sizes = {
-        _require_json_int(value,
-                          field="runtime graph batch size",
-                          minimum=1)
+        _require_json_int(value, field="runtime graph batch size", minimum=1)
         for value in graph_batch_sizes
     }
     if not configured_graph_batch_sizes:
@@ -808,28 +809,28 @@ def validate_sps_cost_table_payload(
         _parse_graph_batch_size_key(graph_batch_size): table_payload
         for graph_batch_size, table_payload in exact_tables.items()
     }
-    fingerprint_graph_batch_sizes = set(
-        fingerprint["rank_local_graph_batch_sizes"])
-    if (configured_graph_batch_sizes != set(measured_tables)
-            or configured_graph_batch_sizes !=
-            fingerprint_graph_batch_sizes):
+    fingerprint_graph_batch_sizes = set(fingerprint["rank_local_graph_batch_sizes"])
+    if (
+        configured_graph_batch_sizes != set(measured_tables)
+        or configured_graph_batch_sizes != fingerprint_graph_batch_sizes
+    ):
         raise ValueError(
             "Multi-G SPS graph batch sizes must match exactly across runtime "
-            "graphs, cost_tables, and engine_fingerprint")
+            "graphs, cost_tables, and engine_fingerprint"
+        )
     runtime_max_draft_len = _require_json_int(
-        max_draft_len, field="runtime max_draft_len", minimum=1)
+        max_draft_len, field="runtime max_draft_len", minimum=1
+    )
     if fingerprint["max_draft_len"] != runtime_max_draft_len:
         raise ValueError(
-            "SPS engine_fingerprint max_draft_len does not match runtime "
-            f"K={max_draft_len}")
+            f"SPS engine_fingerprint max_draft_len does not match runtime K={max_draft_len}"
+        )
 
     table_cells: dict[tuple[int, int], float] = {}
     for graph_batch_size, table_payload in measured_tables.items():
         assert isinstance(table_payload, dict)
         token_counts = [
-            _require_json_int(value,
-                              field="rank-local verifier budget",
-                              minimum=0)
+            _require_json_int(value, field="rank-local verifier budget", minimum=0)
             for value in table_payload["token_counts"]
         ]
         step_times = [
@@ -837,31 +838,31 @@ def validate_sps_cost_table_payload(
             for value in table_payload["step_time_ms"]
         ]
         if len(token_counts) != len(step_times):
-            raise ValueError(
-                f"SPS cost table for G={graph_batch_size} has mismatched cells"
-            )
+            raise ValueError(f"SPS cost table for G={graph_batch_size} has mismatched cells")
         if not token_counts or any(
-                right <= left
-                for left, right in zip(token_counts, token_counts[1:])):
+            right <= left for left, right in zip(token_counts, token_counts[1:])
+        ):
             raise ValueError(
                 f"SPS cost table for G={graph_batch_size} budgets must be strictly increasing"
             )
         if token_counts[0] != 0:
             raise ValueError(
                 "Every schema-v2 G requires V=0 native static K5 fallback; "
-                f"missing for G={graph_batch_size}")
+                f"missing for G={graph_batch_size}"
+            )
         max_verifier_budget = graph_batch_size * (runtime_max_draft_len + 1)
         invalid_positive_budgets = [
-            verifier_tokens for verifier_tokens in token_counts[1:]
-            if (verifier_tokens < graph_batch_size
-                or verifier_tokens > max_verifier_budget)
+            verifier_tokens
+            for verifier_tokens in token_counts[1:]
+            if (verifier_tokens < graph_batch_size or verifier_tokens > max_verifier_budget)
         ]
         if invalid_positive_budgets:
             raise ValueError(
                 "Schema-v2 positive verifier budgets must satisfy "
                 "G <= V <= G*(K+1); "
                 f"G={graph_batch_size}, K={runtime_max_draft_len}, "
-                f"invalid V={invalid_positive_budgets}")
+                f"invalid V={invalid_positive_budgets}"
+            )
         for verifier_tokens, step_time in zip(token_counts, step_times):
             table_cells[(graph_batch_size, verifier_tokens)] = step_time
 
@@ -871,70 +872,65 @@ def validate_sps_cost_table_payload(
     for item in measurements:
         assert isinstance(item, dict)
         pair = (
-            _require_json_int(item["rank_local_graph_batch_size"],
-                              field="measurement graph batch size",
-                              minimum=1),
-            _require_json_int(item["rank_local_verifier_budget"],
-                              field="measurement verifier budget",
-                              minimum=0),
+            _require_json_int(
+                item["rank_local_graph_batch_size"], field="measurement graph batch size", minimum=1
+            ),
+            _require_json_int(
+                item["rank_local_verifier_budget"], field="measurement verifier budget", minimum=0
+            ),
         )
         if pair in measurement_cells:
-            raise ValueError(
-                f"duplicate SPS measurement provenance for {pair}")
+            raise ValueError(f"duplicate SPS measurement provenance for {pair}")
         measurement_cells[pair] = _require_positive_finite_number(
-            item["step_time_ms"], field="measurement step time")
+            item["step_time_ms"], field="measurement step time"
+        )
     if set(measurement_cells) != set(table_cells):
         missing = sorted(set(table_cells) - set(measurement_cells))
         extras = sorted(set(measurement_cells) - set(table_cells))
         raise ValueError(
             "SPS cost table and measurement provenance cells must match exactly; "
-            f"missing={missing}, extras={extras}")
+            f"missing={missing}, extras={extras}"
+        )
     mismatched_cells = sorted(
-        pair for pair, step_time in table_cells.items()
-        if measurement_cells[pair] != step_time)
+        pair for pair, step_time in table_cells.items() if measurement_cells[pair] != step_time
+    )
     if mismatched_cells:
         raise ValueError(
-            "SPS cost table cells do not match measurement provenance: "
-            f"{mismatched_cells}")
+            f"SPS cost table cells do not match measurement provenance: {mismatched_cells}"
+        )
 
     gpu_count = fingerprint["gpu_count"]
     global_graph_batch_sizes = set(fingerprint["global_graph_batch_sizes"])
     if global_graph_batch_sizes != {
-            graph_batch_size * gpu_count
-            for graph_batch_size in configured_graph_batch_sizes
+        graph_batch_size * gpu_count for graph_batch_size in configured_graph_batch_sizes
     }:
         raise ValueError(
             "SPS engine_fingerprint global_graph_batch_sizes are inconsistent "
-            "with rank-local G values and gpu_count")
+            "with rank-local G values and gpu_count"
+        )
     return fingerprint
 
 
 def _validate_live_fingerprint_values(fingerprint: dict[str, object]) -> None:
     for key in ("gpu", "runtime_snapshot", "source_head", "topology"):
         if not isinstance(fingerprint[key], str) or not fingerprint[key]:
-            raise TypeError(
-                f"Live engine fingerprint {key} must be a non-empty string")
+            raise TypeError(f"Live engine fingerprint {key} must be a non-empty string")
     for key in ("gpu_snapshot_sha256", "source_diff_sha256"):
-        _require_sha256(fingerprint[key],
-                        field=f"live engine fingerprint {key}")
-    _require_json_int(fingerprint["gpu_count"],
-                      field="live engine fingerprint gpu_count",
-                      minimum=1)
-    _require_json_int(fingerprint["max_draft_len"],
-                      field="live engine fingerprint max_draft_len",
-                      minimum=1)
+        _require_sha256(fingerprint[key], field=f"live engine fingerprint {key}")
+    _require_json_int(
+        fingerprint["gpu_count"], field="live engine fingerprint gpu_count", minimum=1
+    )
+    _require_json_int(
+        fingerprint["max_draft_len"], field="live engine fingerprint max_draft_len", minimum=1
+    )
     for key in ("rank_local_graph_batch_sizes", "global_graph_batch_sizes"):
         values = fingerprint[key]
         if not isinstance(values, list) or not values:
-            raise TypeError(
-                f"live engine fingerprint {key} must be a non-empty list")
+            raise TypeError(f"live engine fingerprint {key} must be a non-empty list")
         for value in values:
-            _require_json_int(value,
-                              field=f"live engine fingerprint {key}",
-                              minimum=1)
+            _require_json_int(value, field=f"live engine fingerprint {key}", minimum=1)
         if len(set(values)) != len(values):
-            raise ValueError(
-                f"live engine fingerprint {key} must not contain duplicates")
+            raise ValueError(f"live engine fingerprint {key} must not contain duplicates")
 
 
 def select_exact_sps_candidate(
@@ -950,47 +946,38 @@ def select_exact_sps_candidate(
     allgather. This pure layer only compares exact measured cells; it cannot
     create a ragged budget or synchronize ranks.
     """
-    graph_batch_size = _require_exact_int(graph_batch_size,
-                                          field="graph_batch_size",
-                                          minimum=1)
-    measured_budgets = cost_table.production_candidate_budgets(
-        graph_batch_size)
-    native_budgets = cost_table.candidate_budgets(
-        graph_batch_size, include_native=True)
+    graph_batch_size = _require_exact_int(graph_batch_size, field="graph_batch_size", minimum=1)
+    measured_budgets = cost_table.production_candidate_budgets(graph_batch_size)
+    native_budgets = cost_table.candidate_budgets(graph_batch_size, include_native=True)
     if not native_budgets or native_budgets[0] != 0:
-        raise ValueError(
-            f"Exact SPS G={graph_batch_size} has no V=0 native fallback")
+        raise ValueError(f"Exact SPS G={graph_batch_size} has no V=0 native fallback")
     if any(type(value) is not int for value in compact_expected_yields):
-        raise TypeError(
-            "compact_expected_yields keys must be integer V values")
+        raise TypeError("compact_expected_yields keys must be integer V values")
     if 0 in compact_expected_yields:
-        raise ValueError(
-            "compact_expected_yields must not include native V=0")
+        raise ValueError("compact_expected_yields must not include native V=0")
     if set(compact_expected_yields) != set(measured_budgets):
         raise ValueError(
-            "compact_expected_yields must cover every positive measured V for "
-            f"G={graph_batch_size}")
+            f"compact_expected_yields must cover every positive measured V for G={graph_batch_size}"
+        )
     compact_yields = {
         budget: _require_nonnegative_finite_number(
-            compact_expected_yields[budget],
-            field=f"expected yield for compact V={budget}")
+            compact_expected_yields[budget], field=f"expected yield for compact V={budget}"
+        )
         for budget in measured_budgets
     }
     native_yield = _require_nonnegative_finite_number(
-        native_expected_yield, field="native_expected_yield")
+        native_expected_yield, field="native_expected_yield"
+    )
     native_score = native_yield / cost_table.step_time(0, graph_batch_size)
     compact_scores = {
-        budget: compact_yields[budget]
-        / cost_table.step_time(budget, graph_batch_size)
+        budget: compact_yields[budget] / cost_table.step_time(budget, graph_batch_size)
         for budget in measured_budgets
     }
     if not compact_scores:
         return 0
-    best_budget = max(compact_scores,
-                      key=lambda budget: (compact_scores[budget], budget))
+    best_budget = max(compact_scores, key=lambda budget: (compact_scores[budget], budget))
     best_score = compact_scores[best_budget]
-    required_score = native_score * (1.0
-                                     + cost_table.minimum_predicted_gain)
+    required_score = native_score * (1.0 + cost_table.minimum_predicted_gain)
     if best_score <= native_score or best_score < required_score:
         return 0
     return int(best_budget)

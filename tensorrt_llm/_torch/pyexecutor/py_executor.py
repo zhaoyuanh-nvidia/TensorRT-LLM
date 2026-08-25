@@ -3464,7 +3464,7 @@ class PyExecutor:
             return max_draft_len
         runtime_cost_table = getattr(self.model_engine,
                                      "_dspark_sps_cost_table", None)
-        if runtime_cost_table is not None and planner.cost_table is None:
+        if runtime_cost_table is not None:
             planner.install_runtime_cost_table(runtime_cost_table)
 
         gen_requests = scheduled_batch.generation_requests
@@ -3511,10 +3511,9 @@ class PyExecutor:
         exact_table = planner.exact_cost_table
         exact_cells = (exact_table.candidate_cells()
                        if exact_table is not None else ())
-        exact_policy = bool(
-            exact_table is not None
-            and planner.forced_verify_len is None
-            and planner.forced_budget_frac is None)
+        exact_policy = bool(exact_table is not None
+                            and planner.forced_verify_len is None
+                            and planner.forced_budget_frac is None)
         # Cleared unconditionally: a budget left over from a previous step
         # would re-rank a batch it was never computed for.
         self.model_engine._dspark_device_budget = None
@@ -3529,8 +3528,7 @@ class PyExecutor:
                 # and winning V are resolved from the existing attention-DP
                 # allgather below, so exact scheduling adds no synchronization.
                 exact_local = planner.prepare_exact_sps_decision(
-                    num_gen_requests=num_gen_requests,
-                    rows=confidence_rows)
+                    num_gen_requests=num_gen_requests, rows=confidence_rows)
                 if exact_local is None:
                     fallback_reason = "planner_declined"
             elif planner.device_windows and mode.trims_submitted_tokens:
@@ -3576,8 +3574,12 @@ class PyExecutor:
         # --- Phase 2: one collective, same shape on every rank, every step ----
         #
         # Payload prefix: [wants_ragged, num_rows, total_verify_tokens,
-        # max_window, can_graph, pending_pin, pending_frac]. Exact tables append
-        # [exact_ready, native_yield, yield_for_each_stable_(G,V)_cell].
+        # max_window, can_graph, pending_pin, pending_frac]. Every rank then
+        # appends [has_exact_table, exact_ready, exact_cell_count,
+        # table_sha256_as_8_u32, native_yield,
+        # yield_for_each_stable_(G,V)_cell]. Carrying the authenticated table
+        # identity is mandatory: equal vector lengths do not prove that ranks
+        # assign the same (G,V) or T(G,V) to each position.
         # `can_graph` rides along because the ragged
         # fit runs before the graph runner's own allgather and must know
         # whether row padding will happen: _get_padded_batch only takes the
@@ -3601,23 +3603,24 @@ class PyExecutor:
             planner.pending_verify_len_pin(),
             planner.pending_budget_frac(),
         ]
-        if exact_table is not None:
-            exact_yield_scale = 1_000_000
-            native_yield_wire = (
-                int(math.ceil(exact_local.native_expected_yield
-                              * exact_yield_scale))
-                if exact_local is not None else 0)
-            compact_yields_wire = (
-                tuple(-1 if value < 0.0 else int(
-                    math.floor(value * exact_yield_scale))
-                      for value in exact_local.compact_expected_yields)
-                if exact_local is not None else
-                tuple(-1 for _ in exact_cells))
-            local_payload.extend([
-                1 if exact_local is not None else 0,
-                native_yield_wire,
-                *compact_yields_wire,
-            ])
+        exact_yield_scale = 1_000_000
+        exact_identity_words = ((exact_table.collective_identity_words)
+                                if exact_table is not None else (0, ) * 8)
+        native_yield_wire = (int(
+            math.ceil(exact_local.native_expected_yield *
+                      exact_yield_scale)) if exact_local is not None else 0)
+        compact_yields_wire = (tuple(
+            -1 if value < 0.0 else int(math.floor(value * exact_yield_scale))
+            for value in exact_local.compact_expected_yields) if exact_local
+                               is not None else tuple(-1 for _ in exact_cells))
+        local_payload.extend([
+            1 if exact_table is not None else 0,
+            1 if exact_local is not None else 0,
+            len(exact_cells),
+            *exact_identity_words,
+            native_yield_wire,
+            *compact_yields_wire,
+        ])
         if is_distributed:
             payloads = self.dist.tp_allgather(local_payload)
             # The pin and the budget fraction ride the allgather so every rank
@@ -3631,6 +3634,25 @@ class PyExecutor:
                                 if len(payload) > 6 and int(payload[6]) >= 0),
                                -1)
             planner.adopt_budget_frac(agreed_frac)
+            exact_table_flags = [int(payload[7]) for payload in payloads]
+            if len(set(exact_table_flags)) != 1:
+                raise RuntimeError(
+                    "DSpark ranks disagree on whether an exact SPS table is "
+                    "installed")
+            if exact_table_flags[0]:
+                exact_cell_counts = [int(payload[9]) for payload in payloads]
+                exact_identities = [
+                    tuple(int(value) for value in payload[10:18])
+                    for payload in payloads
+                ]
+                payload_shapes_valid = all(
+                    len(payload) == 19 + int(payload[9])
+                    for payload in payloads)
+                if (not payload_shapes_valid or len(set(exact_cell_counts)) != 1
+                        or len(set(exact_identities)) != 1):
+                    raise RuntimeError(
+                        "DSpark exact SPS ranks disagree on the authenticated "
+                        "(G,V), T(G,V), or minimum-gain table identity")
             if not all(int(payload[0]) for payload in payloads):
                 # All-or-nothing across ranks: `all_rank_num_tokens` is frozen
                 # into the captured graph, so a mixed step's mismatch would
@@ -3665,9 +3687,10 @@ class PyExecutor:
                 fallback_reason = "peer_not_graphable"
                 exact_local = None
             else:
-                expected_payload_len = 9 + len(exact_cells)
-                if any(len(payload) != expected_payload_len
-                       or not int(payload[7]) for payload in payloads):
+                expected_payload_len = 19 + len(exact_cells)
+                if any(
+                        len(payload) != expected_payload_len
+                        or not int(payload[8]) for payload in payloads):
                     raise RuntimeError(
                         "DSpark exact SPS collective payloads disagree on the "
                         "measured (G,V) grid")
@@ -3686,17 +3709,19 @@ class PyExecutor:
                                      verifier_budget) in enumerate(exact_cells):
                         if graph_batch_size != common_graph_batch_size:
                             continue
-                        rank_yields = [float(payload[9 + cell_index])
-                                       for payload in payloads]
+                        rank_yields = [
+                            float(payload[19 + cell_index])
+                            for payload in payloads
+                        ]
                         # A negative local value marks a cell that cannot fit
                         # that rank's mandatory real-row floor. Giving it zero
                         # aggregate yield makes it ineligible without changing
                         # the exact selector's total measured-cell contract.
-                        compact_expected_yields[verifier_budget] = (
-                            0.0 if any(value < 0.0 for value in rank_yields)
-                            else sum(rank_yields))
+                        compact_expected_yields[verifier_budget] = (0.0 if any(
+                            value < 0.0
+                            for value in rank_yields) else sum(rank_yields))
                     native_expected_yield = sum(
-                        float(payload[8]) for payload in payloads)
+                        float(payload[18]) for payload in payloads)
                     selected_verifier_budget = select_exact_sps_candidate(
                         graph_batch_size=common_graph_batch_size,
                         native_expected_yield=native_expected_yield,
@@ -3708,8 +3733,7 @@ class PyExecutor:
                         fallback_reason = "exact_native_k"
                         exact_local = None
                     else:
-                        (ragged_lens, local_exact_budget,
-                         exact_pad_tokens) = (
+                        (ragged_lens, local_exact_budget, exact_pad_tokens) = (
                             planner.allocate_exact_sps_candidate(
                                 exact_local,
                                 graph_batch_size=common_graph_batch_size,

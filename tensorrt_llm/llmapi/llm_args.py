@@ -3085,9 +3085,8 @@ class DSparkDecodingConfig(DecodingBaseConfig):
 
         if (self.confidence_sps_live_fingerprint_path
                 and not self.confidence_sps_table_path):
-            raise ValueError(
-                "confidence_sps_live_fingerprint_path requires "
-                "confidence_sps_table_path")
+            raise ValueError("confidence_sps_live_fingerprint_path requires "
+                             "confidence_sps_table_path")
 
         if self.max_draft_len is not None:
             tiers = self.confidence_verify_len_tiers or [
