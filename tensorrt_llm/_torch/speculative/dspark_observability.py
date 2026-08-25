@@ -168,6 +168,17 @@ class DSparkRaggedStats:
         #: An eager step costs far more than the tokens the trim saved.
         self.graph_replays = 0
         self.graph_eager = 0
+        #: Replayed steps whose shape-only host split was re-ranked on device
+        #: from fresh confidence immediately before graph launch.
+        self.device_window_steps = 0
+        #: Profiling-fraction steps among ``device_window_steps``. Kept
+        #: correlated here so an integration test cannot accidentally combine
+        #: a natural device rerank with a forced decision from another step.
+        self.forced_device_window_steps = 0
+        #: Forced device reranks whose captured token bucket was smaller than
+        #: the full-K bucket for the same padded row count.
+        self.forced_device_window_trimmed_steps = 0
+        self.device_window_shape_hist: Counter = Counter()
 
         #: Reasons the step declined to go ragged, keyed by a short slug.
         self.fallbacks: Counter = Counter()
@@ -267,6 +278,24 @@ class DSparkRaggedStats:
                 text = str(key)
                 self.graph_miss_shapes[text] = (
                     self.graph_miss_shapes.get(text, 0) + 1)
+
+    def record_device_window(
+        self,
+        *,
+        forced: bool,
+        num_real: int,
+        padded_bs: int,
+        bucket: int,
+    ) -> None:
+        """Record one successful fresh-confidence device window selection."""
+        self.device_window_steps += 1
+        shape = f"{int(num_real)}/{int(padded_bs)}/{int(bucket)}"
+        self.device_window_shape_hist[shape] += 1
+        if forced:
+            self.forced_device_window_steps += 1
+            full_bucket = int(padded_bs) * (1 + self.max_draft_len)
+            if int(bucket) < full_bucket:
+                self.forced_device_window_trimmed_steps += 1
 
     def merge_planner_stats(self, planner_stats: Dict[str, int]) -> None:
         """Fold in the planner's own fallback counters."""
@@ -391,6 +420,11 @@ class DSparkRaggedStats:
             "cap_trim_concentration": round(self.cap_trim_concentration, 4),
             "graph_replays": self.graph_replays,
             "graph_eager": self.graph_eager,
+            "device_window_steps": self.device_window_steps,
+            "forced_device_window_steps": self.forced_device_window_steps,
+            "forced_device_window_trimmed_steps": self.forced_device_window_trimmed_steps,
+            "device_window_shape_hist": dict(
+                sorted(self.device_window_shape_hist.items())),
             "fallbacks": dict(self.fallbacks),
             "planner": dict(self.planner_stats) if self.planner_stats else {},
         }

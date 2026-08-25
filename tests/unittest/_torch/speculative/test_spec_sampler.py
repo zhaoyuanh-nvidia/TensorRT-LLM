@@ -27,6 +27,7 @@ import torch
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
+from tensorrt_llm._torch.pyexecutor.sampler import penalties as penalty_ops
 from tensorrt_llm._torch.speculative.interface import (
     FORCE_NUM_ACCEPTED_TOKENS_ENV_VAR,
     SpecMetadata,
@@ -62,6 +63,122 @@ def _make_input(batch_size: int, device: str = "cuda") -> torch.Tensor:
     # Initial counts: 1 (target token, no draft accepts yet). The forced
     # override only ever rewrites entries from ``num_contexts:`` onward.
     return torch.ones(batch_size, dtype=torch.int32, device=device)
+
+
+def _penalty_mapping_meta(
+    slot_ids: list[int], verify_lens: Optional[list[int]] = None
+) -> types.SimpleNamespace:
+    metadata = types.SimpleNamespace(
+        batch_slot_ids=torch.tensor(slot_ids, dtype=torch.int64),
+        is_ragged_verify=verify_lens is not None,
+        verify_lens=None,
+        qo_indptr=None,
+        total_verify_tokens=None,
+    )
+    if verify_lens is not None:
+        lens = torch.tensor(verify_lens, dtype=torch.int32)
+        metadata.verify_lens = lens
+        metadata.qo_indptr = torch.cat(
+            [torch.zeros(1, dtype=torch.int32), torch.cumsum(lens, dim=0)]
+        )
+        metadata.total_verify_tokens = sum(verify_lens)
+    return metadata
+
+
+def test_occurrence_penalty_uniform_row_mapping_is_unchanged():
+    """An all-full ragged layout must reproduce the existing uniform mapping."""
+    draft_len = 4
+    draft_tokens = torch.tensor([[11, 12, 13, 14], [21, 22, 23, 24]])
+    uniform = _penalty_mapping_meta([3, 7, 9])
+    ragged = _penalty_mapping_meta([3, 7, 9], [draft_len + 1, draft_len + 1])
+    num_rows = 1 + 2 * (draft_len + 1)
+
+    uniform_mapping = penalty_ops.build_row_mapping(
+        uniform,
+        num_contexts=1,
+        batch_size=3,
+        draft_len=draft_len,
+        draft_tokens=draft_tokens,
+        device=torch.device("cpu"),
+        num_logit_rows=num_rows,
+    )
+    ragged_mapping = penalty_ops.build_row_mapping(
+        ragged,
+        num_contexts=1,
+        batch_size=3,
+        draft_len=draft_len,
+        draft_tokens=draft_tokens,
+        device=torch.device("cpu"),
+        num_logit_rows=num_rows,
+    )
+
+    assert uniform_mapping is not None and ragged_mapping is not None
+    for uniform_tensor, ragged_tensor in zip(uniform_mapping, ragged_mapping):
+        assert torch.equal(uniform_tensor, ragged_tensor)
+
+
+def test_occurrence_penalty_ragged_row_mapping_uses_each_request_window():
+    """Packed rows must stay with their request and see only its earlier drafts."""
+    draft_tokens = torch.tensor([[11, 12, 13, 14], [21, 22, 23, 24]])
+    metadata = _penalty_mapping_meta([3, 7, 9], [2, 4])
+
+    mapping = penalty_ops.build_row_mapping(
+        metadata,
+        num_contexts=1,
+        batch_size=3,
+        draft_len=4,
+        draft_tokens=draft_tokens,
+        device=torch.device("cpu"),
+        num_logit_rows=7,
+    )
+
+    assert mapping is not None
+    row_slots, intra_tokens, intra_valid = mapping
+    assert row_slots.tolist() == [3, 7, 7, 9, 9, 9, 9]
+    assert intra_tokens.tolist() == [
+        [0, 0, 0, 0],
+        [11, 12, 13, 14],
+        [11, 12, 13, 14],
+        [21, 22, 23, 24],
+        [21, 22, 23, 24],
+        [21, 22, 23, 24],
+        [21, 22, 23, 24],
+    ]
+    assert intra_valid.tolist() == [
+        [False, False, False, False],
+        [False, False, False, False],
+        [True, False, False, False],
+        [False, False, False, False],
+        [True, False, False, False],
+        [True, True, False, False],
+        [True, True, True, False],
+    ]
+
+
+def test_occurrence_penalty_applies_to_ragged_packed_rows(monkeypatch):
+    """The worker must run, rather than silently skip, the ragged penalty pass."""
+    metadata = _penalty_mapping_meta([3, 7, 9], [2, 4])
+    metadata.enable_penalty = True
+    captured = {}
+
+    def _apply(logits, spec_metadata, row_slots, intra_tokens, intra_valid):
+        captured["row_slots"] = row_slots.clone()
+        captured["intra_tokens"] = intra_tokens.clone()
+        captured["intra_valid"] = intra_valid.clone()
+        logits[:, 0].copy_(row_slots.to(logits.dtype))
+
+    monkeypatch.setattr(penalty_ops, "apply_penalties", _apply)
+    logits = torch.zeros((7, 3))
+    draft_tokens = torch.tensor([[11, 12, 13, 14], [21, 22, 23, 24]])
+
+    penalized = _make_worker()._apply_occurrence_penalties(
+        logits, draft_tokens, num_contexts=1, batch_size=3, spec_metadata=metadata
+    )
+
+    assert torch.equal(logits, torch.zeros_like(logits))
+    assert penalized[:, 0].tolist() == [3.0, 7.0, 7.0, 9.0, 9.0, 9.0, 9.0]
+    assert captured["row_slots"].numel() == logits.shape[0]
+    assert captured["intra_valid"].sum().item() == 7
 
 
 def _require_cuda():

@@ -4399,7 +4399,8 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_mpi_world_size(8)
     @parametrize_with_ids("moe_backend", ["MEGAMOE_DEEPGEMM", "TRTLLM"])
-    def test_gsm8k_dep8_ragged_verify(self, moe_backend):
+    def test_gsm8k_dep8_ragged_verify(self, moe_backend, tmp_path,
+                                      monkeypatch):
         """Per-request verify windows, overlap scheduler on.
 
         ``enable_padding=True`` is required rather than incidental: the ragged
@@ -4411,29 +4412,38 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
         Accuracy alone would not establish much here -- the planner declines to
         trim without a profiled SPS cost table, and a run where it declined on
         every step is a uniform baseline wearing a different config, scoring
-        exactly the same. A crafted non-flat cost table exists for that
-        reason: it hands out windows from the captured ladder deterministically,
-        which separates "is the ragged packing correct" from "does the planner
-        choose to trim". Set it in the environment when running this to test the
-        former.
+        exactly the same. The test therefore supplies its own valid non-flat
+        table, forces a fractional budget through the production rank-0 control
+        path, and asserts the live worker counters after generation.
         """
         kv_cache_config = KvCacheConfig(enable_block_reuse=False,
                                         free_gpu_memory_fraction=0.5)
-        # Without a cost table the planner is provably unable to trim: a flat
-        # table short-circuits `decide_verify_lens` before confidence is even
-        # read, so the ragged path stays dark and this test degenerates into the
-        # uniform baseline while still scoring the same. Point this at a table to
-        # exercise the real decision path. A table need not be *accurate* to be
-        # useful here -- scheduling only chooses how many drafted positions are
-        # submitted, and acceptance is unchanged, so an approximate table cannot
-        # change the output distribution, only the throughput it was picked for.
-        sps_table_path = os.environ.get("TLLM_DSPARK_SPS_TABLE") or None
+        # Device-window selection is opt-in while the implementation is under
+        # validation. Set it before constructing LLM so every MPI worker
+        # inherits the same mode at planner initialization.
+        monkeypatch.setenv("TLLM_DSPARK_DEVICE_WINDOWS", "1")
+        # The forced fraction below bypasses the economic argmax, so the table's
+        # values cannot affect this correctness run. It still has to be valid and
+        # non-flat because compact mode's production configuration contract
+        # requires a measured-cost surface rather than an accidental no-op.
+        sps_table_path = tmp_path / "dspark-ragged-correctness-sps.json"
+        sps_table_path.write_text(
+            json.dumps({
+                "token_counts": [1, 768],
+                "step_time_ms": [1.0, 2.0],
+                "fixed_overhead_ms": 0.0,
+                "_meta": {
+                    "lookup": "interp",
+                    "encoding": "decomposed",
+                },
+            }),
+            encoding="utf-8")
         spec_config = DSparkDecodingConfig(
             max_draft_len=5,
             speculative_model=self.MODEL_PATH,
             enable_confidence_scheduling=True,
             enable_ragged_verify=True,
-            confidence_sps_table_path=sps_table_path)
+            confidence_sps_table_path=str(sps_table_path))
         with LLM(self.MODEL_PATH,
                  attn_backend="TRTLLM",
                  tensor_parallel_size=8,
@@ -4449,7 +4459,23 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
                  disable_overlap_scheduler=False,
                  custom_tokenizer="deepseek_v4",
                  speculative_config=spec_config) as llm:
+            # A 0.5 trimmable budget fits the captured K3 token bucket exactly
+            # at a full batch. The host split may be uniform because it only
+            # chooses that shape; the device-window counter below proves fresh
+            # confidence re-ranked the same compact budget before replay.
+            [applied_frac] = llm._executor.collective_rpc(
+                "set_dspark_budget_frac", args=(0.5, ))
+            assert applied_frac == pytest.approx(0.5, abs=1e-6)
             score, acc_params = self._run_gsm8k(llm)
+            [ragged_stats] = llm._executor.collective_rpc(
+                "get_dspark_ragged_stats")
+            assert ragged_stats["device_window_steps"] > 0, ragged_stats
+            assert (ragged_stats["forced_device_window_trimmed_steps"]
+                    > 0), ragged_stats
+            assert (ragged_stats["planner"].get("forced_budget_steps", 0)
+                    > 0), ragged_stats
+            assert (ragged_stats["window_tokens"]
+                    < ragged_stats["ceiling_tokens"]), ragged_stats
             assert score >= acc_params.ref_accuracy, (
                 f"GSM8K accuracy {score:.3f} with ragged verification is below "
                 f"the recorded reference {acc_params.ref_accuracy:.3f}")

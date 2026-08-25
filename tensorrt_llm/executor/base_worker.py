@@ -871,6 +871,12 @@ class BaseWorker(GenerationExecutor):
             raise RuntimeError("engine is not initialized")
         return self.engine.set_dspark_verify_len_pin(verify_len)
 
+    def get_dspark_ragged_stats(self) -> dict[str, object]:
+        """Return this worker's live DSpark ragged-verification counters."""
+        if self.engine is None:
+            raise RuntimeError("engine is not initialized")
+        return self.engine.get_dspark_ragged_stats()
+
     def set_dspark_budget_frac(self,
                                frac: Optional[float]) -> Optional[float]:
         """Set (or clear) the DSpark verify-budget fraction on this executor.
