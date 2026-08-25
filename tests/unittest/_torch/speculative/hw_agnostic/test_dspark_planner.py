@@ -10,6 +10,8 @@ snapshot instruments, and reconciliation guards.
 import hashlib
 import itertools
 import json
+import os
+from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -18,7 +20,7 @@ import torch
 from tensorrt_llm._torch.speculative.dspark_planner import (
     ExactSpsCostTable, SpsCostTable, budget_argmax_over_uniform_lens,
     check_table_fingerprint, compute_verify_token_budget,
-    derive_verify_len_tiers, load_sps_cost_table,
+    derive_verify_len_tiers, load_runtime_sps_cost_table, load_sps_cost_table,
     load_validated_sps_cost_table, select_exact_sps_candidate,
     validate_sps_cost_table_payload)
 from tensorrt_llm._torch.speculative.dspark_schedule import (
@@ -26,7 +28,8 @@ from tensorrt_llm._torch.speculative.dspark_schedule import (
     compute_survival,
     schedule_verify_lens_topk,
 )
-from tensorrt_llm._torch.speculative.dspark_verify import DSparkVerifyPlanner
+from tensorrt_llm._torch.speculative.dspark_verify import (
+    DSparkVerifyPlanner, ExactSpsLocalDecision, _exact_cell_geometry)
 
 BLOCK = 7
 
@@ -368,6 +371,17 @@ def test_exact_cost_table_loader_requires_schema_v2(tmp_path):
         )
 
     payload = _multi_g_sps_payload()
+    del payload["cost_tables"]
+    path = tmp_path / "missing-tables.json"
+    path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="missing required fields: cost_tables"):
+        load_validated_sps_cost_table(
+            path,
+            graph_batch_sizes=[64, 128],
+            max_draft_len=5,
+            live_engine_fingerprint=dict(payload["engine_fingerprint"]),
+        )
+    payload = _multi_g_sps_payload()
     del payload["schema_version"]
     path = tmp_path / "missing-version.json"
     path.write_text(json.dumps(payload))
@@ -379,17 +393,27 @@ def test_exact_cost_table_loader_requires_schema_v2(tmp_path):
             live_engine_fingerprint=dict(payload["engine_fingerprint"]),
         )
 
+
+def test_runtime_exact_loader_requires_independent_fingerprint_file(tmp_path):
     payload = _multi_g_sps_payload()
-    del payload["cost_tables"]
-    path = tmp_path / "missing-tables.json"
-    path.write_text(json.dumps(payload))
-    with pytest.raises(ValueError, match="missing required fields: cost_tables"):
-        load_validated_sps_cost_table(
-            path,
+    table_path = tmp_path / "exact-sps.json"
+    table_path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="independently generated"):
+        load_runtime_sps_cost_table(
+            table_path,
             graph_batch_sizes=[64, 128],
             max_draft_len=5,
-            live_engine_fingerprint=dict(payload["engine_fingerprint"]),
         )
+
+    fingerprint_path = tmp_path / "live-fingerprint.json"
+    fingerprint_path.write_text(json.dumps(payload["engine_fingerprint"]))
+    table, _ = load_runtime_sps_cost_table(
+        table_path,
+        graph_batch_sizes=[64, 128],
+        max_draft_len=5,
+        live_engine_fingerprint_path=fingerprint_path,
+    )
+    assert isinstance(table, ExactSpsCostTable)
 
 
 @pytest.mark.parametrize("marker", ["engine_fingerprint", "measurements"])
@@ -638,6 +662,78 @@ def test_exact_selector_keeps_native_on_tie_or_below_threshold():
             compact_expected_yields={0: 10.0, 704: 8.24},
             cost_table=table,
         )
+
+
+def test_exact_production_candidates_exclude_full_ragged_control():
+    table = ExactSpsCostTable(
+        tables={
+            128: SpsCostTable(token_counts=(0, 704, 768),
+                              step_time_ms=(8.0, 7.0, 8.1))
+        },
+        max_draft_len=5,
+    )
+    assert table.candidate_budgets(128) == (704, 768)
+    assert table.production_candidate_budgets(128) == (704, )
+    assert table.candidate_cells() == ((128, 704), )
+
+
+def test_exact_table_limits_compact_graph_cells_per_g():
+    with pytest.raises(ValueError, match="compact V cells per G"):
+        ExactSpsCostTable(
+            tables={
+                128: SpsCostTable(
+                    token_counts=(0, 128, 256, 384, 512, 640),
+                    step_time_ms=(8.0, 7.9, 7.8, 7.7, 7.6, 7.5),
+                )
+            },
+            max_draft_len=5,
+        )
+
+
+def test_exact_cell_geometry_models_shared_pad_window():
+    # 100 real rows at K5 can absorb 600 tokens. V704 at G128 therefore
+    # requires every one of the 28 pad rows to carry four tokens.
+    assert _exact_cell_geometry(
+        num_real=100,
+        graph_batch_size=128,
+        verifier_budget=704,
+        min_verify_len=1,
+        max_verify_len=5,
+    ) == (4, 592, 392)
+    assert _exact_cell_geometry(
+        num_real=0,
+        graph_batch_size=128,
+        verifier_budget=704,
+        min_verify_len=1,
+        max_verify_len=5,
+    ) is None
+
+
+def test_exact_allocator_spends_the_modeled_real_target():
+    table = ExactSpsCostTable(
+        tables={
+            4: SpsCostTable(token_counts=(0, 22),
+                            step_time_ms=(8.0, 7.0))
+        },
+        max_draft_len=5,
+    )
+    planner = DSparkVerifyPlanner(
+        cfg=DSparkScheduleConfig(block_size=5, min_verify_len=1),
+        cost_table=table,
+        tiers=[1, 3, 5],
+    )
+    decision = ExactSpsLocalDecision(
+        num_requests=3,
+        survival=torch.ones((3, 5)),
+        native_expected_yield=18.0,
+        compact_expected_yields=(18.0, ),
+    )
+    lens, budget, pad_tokens = planner.allocate_exact_sps_candidate(
+        decision, graph_batch_size=4, verifier_budget=22)
+    assert lens == [5, 5, 5]
+    assert budget == 12
+    assert pad_tokens == 4
+    assert sum(value + 1 for value in lens) + pad_tokens == 22
 
 
 # --------------------------------------------------------------------------
@@ -903,6 +999,40 @@ def test_cross_rank_full_bucket_routes_to_native_static_k():
     assert planner.stats["fallback_full_k"] == 1
 
 
+def test_exact_fit_executes_the_selected_bucket_without_rounding():
+    import types
+
+    from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
+
+    runner = types.SimpleNamespace(
+        enabled=True,
+        agreed_ragged_bucket=None,
+        ragged_pad_verify_len=0,
+        supported_batch_sizes=[4],
+        _round_up_batch_size=lambda _: 4,
+        will_pad_to=lambda *_: True,
+    )
+    engine = types.SimpleNamespace(
+        cuda_graph_runner=runner,
+        spec_config=types.SimpleNamespace(verify_len_tiers=[1, 3, 5]),
+        _dspark_last_padded_bs=None,
+        ragged_verify_token_buckets=lambda _: [22],
+        _get_spec_worker=lambda: None,
+    )
+    requests = [types.SimpleNamespace() for _ in range(3)]
+    bucket = PyTorchModelEngine.fit_ragged_verify_lens(
+        engine,
+        requests,
+        [5, 5, 5],
+        peer_stats=[[3, 18, 1]],
+        exact_shape=(4, 22, 4),
+    )
+    assert bucket == 22
+    assert runner.agreed_ragged_bucket == 22
+    assert runner.ragged_pad_verify_len == 3
+    assert [request.py_verify_len for request in requests] == [5, 5, 5]
+
+
 def _capture_set(batch_sizes, tiers, max_draft_len=BLOCK):
     """Invoke PyTorchModelEngine._get_graphs_to_capture with a stub engine."""
     import types
@@ -940,6 +1070,20 @@ def test_capture_pins_the_draft_length_to_the_top_tier():
     assert len(graphs) == len(bss), (
         f"expected one graph per batch size, got {len(graphs)}: {graphs}"
     )
+
+
+def test_compact_capture_preserves_native_static_graph_for_every_g():
+    """Full-K policy fallbacks must replay the same native keys as static K5."""
+    bss, tiers = [16, 32, 64, 128], [1, 3, 5]
+    with patch.dict(os.environ,
+                    {"TLLM_DSPARK_RAGGED_VERIFY_MODE": "compact"}):
+        graphs = _capture_set(bss, tiers, max_draft_len=5)
+
+    native = {(bs, 5) for bs in bss}
+    ragged = {(bs, 5, bs * (tier + 1))
+              for bs in bss for tier in tiers}
+    assert set(graphs) == native | ragged
+    assert len(graphs) == len(native) + len(ragged)
 
 
 # --------------------------------------------------------------------------

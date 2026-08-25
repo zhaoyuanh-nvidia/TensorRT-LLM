@@ -44,6 +44,17 @@ def test_sts_calibration_does_not_substitute_for_a_cost_table():
         _cfg(confidence_sts_path="/tmp/sts.json")
 
 
+def test_live_fingerprint_requires_the_cost_table_it_authenticates():
+    with pytest.raises(ValueError,
+                       match="confidence_sps_table_path|profiled cost table"):
+        _cfg(confidence_sps_live_fingerprint_path="/tmp/live.json")
+    config = _cfg(
+        confidence_sps_table_path="/tmp/table.json",
+        confidence_sps_live_fingerprint_path="/tmp/live.json",
+    )
+    assert config.confidence_sps_live_fingerprint_path == "/tmp/live.json"
+
+
 def test_confidence_scheduling_without_ragged_is_rejected():
     """There is no uniform tier ladder to fall back to.
 

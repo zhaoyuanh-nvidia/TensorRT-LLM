@@ -41,11 +41,15 @@ import numpy as np
 
 from ...logger import logger
 
+_MAX_EXACT_COMPACT_CELLS_PER_G = 4
+_MAX_EXACT_COMPACT_CELLS_TOTAL = 32
+
 __all__ = [
     "ExactSpsCostTable",
     "SpsCostTable",
     "check_table_fingerprint",
     "load_sps_cost_table",
+    "load_runtime_sps_cost_table",
     "load_validated_sps_cost_table",
     "select_exact_sps_candidate",
     "validate_sps_cost_table_payload",
@@ -227,6 +231,25 @@ class ExactSpsCostTable:
                     "G <= V <= G*(K+1); "
                     f"G={graph_batch_size}, K={max_draft_len}, "
                     f"invalid V={invalid_positive_budgets}")
+            production_budgets = [
+                verifier_budget for verifier_budget in budgets[1:]
+                if verifier_budget < max_verifier_budget
+            ]
+            if len(production_budgets) > _MAX_EXACT_COMPACT_CELLS_PER_G:
+                raise ValueError(
+                    "Exact SPS graph budget exceeds the production limit of "
+                    f"{_MAX_EXACT_COMPACT_CELLS_PER_G} compact V cells per G; "
+                    f"G={graph_batch_size} has {len(production_budgets)}")
+        production_cell_count = sum(
+            len([
+                verifier_budget for verifier_budget in table.token_counts[1:]
+                if verifier_budget < graph_batch_size * (max_draft_len + 1)
+            ]) for graph_batch_size, table in normalized.items())
+        if production_cell_count > _MAX_EXACT_COMPACT_CELLS_TOTAL:
+            raise ValueError(
+                "Exact SPS graph budget exceeds the production limit of "
+                f"{_MAX_EXACT_COMPACT_CELLS_TOTAL} compact (G,V) cells; "
+                f"artifact has {production_cell_count}")
         object.__setattr__(self, "tables", normalized)
         object.__setattr__(self, "max_draft_len", max_draft_len)
         object.__setattr__(
@@ -292,6 +315,23 @@ class ExactSpsCostTable:
             return budgets
         return tuple(value for value in budgets if value != 0)
 
+    def candidate_cells(self) -> tuple[tuple[int, int], ...]:
+        """Stable positive ``(G,V)`` ordering for collective payloads."""
+        return tuple((graph_batch_size, verifier_budget)
+                     for graph_batch_size in sorted(self.tables)
+                     for verifier_budget in self.production_candidate_budgets(
+                         graph_batch_size))
+
+    def production_candidate_budgets(
+            self, num_requests: int) -> tuple[int, ...]:
+        """Compact serving cells, excluding native and full-token controls."""
+        graph_batch_size = _require_exact_int(
+            num_requests, field="graph batch size", minimum=1)
+        full_budget = graph_batch_size * (self.max_draft_len + 1)
+        return tuple(
+            verifier_budget for verifier_budget in self.candidate_budgets(
+                graph_batch_size) if verifier_budget < full_budget)
+
     @property
     def is_flat(self) -> bool:
         """Whether every measured G curve has constant step time."""
@@ -324,7 +364,13 @@ def load_sps_cost_table(
         raise ValueError(
             "Schema-v2 exact SPS artifacts require "
             "load_validated_sps_cost_table")
-    table = SpsCostTable(
+    return _build_legacy_sps_cost_table(payload), payload
+
+
+def _build_legacy_sps_cost_table(
+    payload: dict[str, object],
+) -> SpsCostTable:
+    return SpsCostTable(
         token_counts=tuple(int(value) for value in payload["token_counts"]),
         step_time_ms=tuple(float(value) for value in payload["step_time_ms"]),
         fixed_overhead_ms=float(payload.get("fixed_overhead_ms", 0.0)),
@@ -335,7 +381,39 @@ def load_sps_cost_table(
         minimum_predicted_gain=float(
             payload.get("minimum_predicted_gain", 0.01)),
     )
-    return table, payload
+
+
+def load_runtime_sps_cost_table(
+    path: str | Path,
+    *,
+    graph_batch_sizes: Sequence[int],
+    max_draft_len: int,
+    live_engine_fingerprint_path: str | Path | None = None,
+) -> tuple[SpsCostTable | ExactSpsCostTable, dict[str, object]]:
+    """Load a legacy curve or an authenticated exact ``T(G,V)`` table.
+
+    Exact schema-v2 tables need an independently generated live-runtime
+    fingerprint. Keeping that seal in a separate file prevents the cost
+    artifact from authenticating itself while still allowing legacy profiler
+    curves to load unchanged.
+    """
+    payload = _read_sps_cost_payload(path)
+    if not _is_exact_sps_payload(payload):
+        return _build_legacy_sps_cost_table(payload), payload
+    if live_engine_fingerprint_path is None:
+        raise ValueError(
+            "Schema-v2 exact SPS artifacts require an independently generated "
+            "live engine fingerprint path")
+    live_engine_fingerprint = _read_sps_cost_payload(
+        live_engine_fingerprint_path)
+    validate_sps_cost_table_payload(
+        payload,
+        graph_batch_sizes=graph_batch_sizes,
+        max_draft_len=max_draft_len,
+        live_engine_fingerprint=live_engine_fingerprint,
+    )
+    return _build_exact_sps_cost_table(
+        payload, max_draft_len=max_draft_len), payload
 
 
 def load_validated_sps_cost_table(
@@ -875,7 +953,8 @@ def select_exact_sps_candidate(
     graph_batch_size = _require_exact_int(graph_batch_size,
                                           field="graph_batch_size",
                                           minimum=1)
-    measured_budgets = cost_table.candidate_budgets(graph_batch_size)
+    measured_budgets = cost_table.production_candidate_budgets(
+        graph_batch_size)
     native_budgets = cost_table.candidate_budgets(
         graph_batch_size, include_native=True)
     if not native_budgets or native_budgets[0] != 0:

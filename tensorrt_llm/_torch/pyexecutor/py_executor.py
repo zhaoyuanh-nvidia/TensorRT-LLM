@@ -3490,6 +3490,10 @@ class PyExecutor:
         planner = getattr(worker, "verify_planner", None)
         if planner is None:
             return max_draft_len
+        runtime_cost_table = getattr(self.model_engine,
+                                     "_dspark_sps_cost_table", None)
+        if runtime_cost_table is not None and planner.cost_table is None:
+            planner.install_runtime_cost_table(runtime_cost_table)
 
         gen_requests = scheduled_batch.generation_requests
         num_gen_requests = len(gen_requests)
@@ -3531,6 +3535,14 @@ class PyExecutor:
         ragged_lens = None
         fallback_reason = None
         device_budget = None
+        exact_local = None
+        exact_table = planner.exact_cost_table
+        exact_cells = (exact_table.candidate_cells()
+                       if exact_table is not None else ())
+        exact_policy = bool(
+            exact_table is not None
+            and planner.forced_verify_len is None
+            and planner.forced_budget_frac is None)
         # Cleared unconditionally: a budget left over from a previous step
         # would re-rank a batch it was never computed for.
         self.model_engine._dspark_device_budget = None
@@ -3540,6 +3552,15 @@ class PyExecutor:
                 # step, so the pure-decode cost table cannot price the trim.
                 # Declining here rides the normal all-or-nothing gate below.
                 fallback_reason = "mixed_step_declined"
+            elif exact_policy:
+                # Produce the whole measured yield grid locally. The common G
+                # and winning V are resolved from the existing attention-DP
+                # allgather below, so exact scheduling adds no synchronization.
+                exact_local = planner.prepare_exact_sps_decision(
+                    num_gen_requests=num_gen_requests,
+                    rows=confidence_rows)
+                if exact_local is None:
+                    fallback_reason = "planner_declined"
             elif planner.device_windows and mode.trims_submitted_tokens:
                 # Device-window mode: the host decides only the CAPACITY, from
                 # the lag-2 snapshot; the returned lens are a shape split used
@@ -3582,29 +3603,51 @@ class PyExecutor:
 
         # --- Phase 2: one collective, same shape on every rank, every step ----
         #
-        # Payload: [wants_ragged, num_rows, total_verify_tokens, max_window,
-        # can_graph, pending_pin]. `can_graph` rides along because the ragged
+        # Payload prefix: [wants_ragged, num_rows, total_verify_tokens,
+        # max_window, can_graph, pending_pin, pending_frac]. Exact tables append
+        # [exact_ready, native_yield, yield_for_each_stable_(G,V)_cell].
+        # `can_graph` rides along because the ragged
         # fit runs before the graph runner's own allgather and must know
         # whether row padding will happen: _get_padded_batch only takes the
         # cross-rank row maximum when EVERY rank can graph this step.
-        local_rows = len(ragged_lens) if ragged_lens is not None else 0
+        local_rows = (exact_local.num_requests if exact_local is not None else
+                      len(ragged_lens) if ragged_lens is not None else 0)
         local_tokens = (sum(1 + int(v)
                             for v in ragged_lens) if ragged_lens else 0)
-        local_max_window = max(ragged_lens) if ragged_lens else 0
+        local_max_window = (planner.max_tier if exact_local is not None else
+                            max(ragged_lens) if ragged_lens else 0)
         peer_stats = None
         # Single-rank runs have no peer that could be holding a context
         # request, so the local batch's own answer is the group's.
         all_can_graph = bool(scheduled_batch.can_run_cuda_graph)
-        if is_distributed:
-            payloads = self.dist.tp_allgather([
-                1 if ragged_lens is not None else 0,
-                local_rows,
-                local_tokens,
-                local_max_window,
-                1 if scheduled_batch.can_run_cuda_graph else 0,
-                planner.pending_verify_len_pin(),
-                planner.pending_budget_frac(),
+        local_payload = [
+            1 if (ragged_lens is not None or exact_local is not None) else 0,
+            local_rows,
+            local_tokens,
+            local_max_window,
+            1 if scheduled_batch.can_run_cuda_graph else 0,
+            planner.pending_verify_len_pin(),
+            planner.pending_budget_frac(),
+        ]
+        if exact_table is not None:
+            exact_yield_scale = 1_000_000
+            native_yield_wire = (
+                int(math.ceil(exact_local.native_expected_yield
+                              * exact_yield_scale))
+                if exact_local is not None else 0)
+            compact_yields_wire = (
+                tuple(-1 if value < 0.0 else int(
+                    math.floor(value * exact_yield_scale))
+                      for value in exact_local.compact_expected_yields)
+                if exact_local is not None else
+                tuple(-1 for _ in exact_cells))
+            local_payload.extend([
+                1 if exact_local is not None else 0,
+                native_yield_wire,
+                *compact_yields_wire,
             ])
+        if is_distributed:
+            payloads = self.dist.tp_allgather(local_payload)
             # The pin and the budget fraction ride the allgather so every rank
             # adopts the same value on the same step (the endpoint lands on
             # one rank). -1 means nobody queued anything.
@@ -3620,9 +3663,10 @@ class PyExecutor:
                 # All-or-nothing across ranks: `all_rank_num_tokens` is frozen
                 # into the captured graph, so a mixed step's mismatch would
                 # not even be observable at replay time.
-                if ragged_lens is not None:
+                if ragged_lens is not None or exact_local is not None:
                     fallback_reason = "peer_declined"
                 ragged_lens = None
+                exact_local = None
             else:
                 # payload[3] is unread; it stays so the collective keeps a
                 # stable shape. peer_stats' third element is the GROUP's
@@ -3634,9 +3678,98 @@ class PyExecutor:
                     int(payload[2]), 1 if all_can_graph else 0
                 ] for payload in payloads]
         else:
+            payloads = [local_payload]
             # Single-rank world: the local queue IS the group's agreement.
             planner.adopt_verify_len_pin(planner.pending_verify_len_pin())
             planner.adopt_budget_frac(planner.pending_budget_frac())
+
+        # Resolve the exact cell after the same allgather has exposed common G
+        # and every rank's expected yield. All ranks traverse payloads in the
+        # same order, so this produces one deterministic V without another
+        # collective. V=0 keeps the ordinary native-static graph key.
+        exact_shape = None
+        if exact_local is not None:
+            if not all_can_graph:
+                fallback_reason = "peer_not_graphable"
+                exact_local = None
+            else:
+                expected_payload_len = 9 + len(exact_cells)
+                if any(len(payload) != expected_payload_len
+                       or not int(payload[7]) for payload in payloads):
+                    raise RuntimeError(
+                        "DSpark exact SPS collective payloads disagree on the "
+                        "measured (G,V) grid")
+                runner = self.model_engine.cuda_graph_runner
+                widest_rows = max(int(payload[1]) for payload in payloads)
+                common_graph_batch_size = runner._round_up_batch_size(
+                    widest_rows)
+                if common_graph_batch_size == 0:
+                    fallback_reason = "no_captured_shape"
+                    exact_local = None
+                else:
+                    from ..speculative.dspark_planner import \
+                        select_exact_sps_candidate
+                    compact_expected_yields = {}
+                    for cell_index, (graph_batch_size,
+                                     verifier_budget) in enumerate(exact_cells):
+                        if graph_batch_size != common_graph_batch_size:
+                            continue
+                        rank_yields = [float(payload[9 + cell_index])
+                                       for payload in payloads]
+                        # A negative local value marks a cell that cannot fit
+                        # that rank's mandatory real-row floor. Giving it zero
+                        # aggregate yield makes it ineligible without changing
+                        # the exact selector's total measured-cell contract.
+                        compact_expected_yields[verifier_budget] = (
+                            0.0 if any(value < 0.0 for value in rank_yields)
+                            else sum(rank_yields))
+                    native_expected_yield = sum(
+                        float(payload[8]) for payload in payloads)
+                    selected_verifier_budget = select_exact_sps_candidate(
+                        graph_batch_size=common_graph_batch_size,
+                        native_expected_yield=native_expected_yield,
+                        compact_expected_yields=compact_expected_yields,
+                        cost_table=exact_table,
+                    )
+                    if selected_verifier_budget == 0:
+                        planner.stats["fallback_full_k"] += 1
+                        fallback_reason = "exact_native_k"
+                        exact_local = None
+                    else:
+                        (ragged_lens, local_exact_budget,
+                         exact_pad_tokens) = (
+                            planner.allocate_exact_sps_candidate(
+                                exact_local,
+                                graph_batch_size=common_graph_batch_size,
+                                verifier_budget=selected_verifier_budget))
+                        exact_shape = (common_graph_batch_size,
+                                       selected_verifier_budget,
+                                       exact_pad_tokens)
+                        if planner.device_windows and mode.trims_submitted_tokens:
+                            device_budget = int(local_exact_budget)
+                        from ..speculative.dspark_verify import \
+                            _exact_cell_geometry
+                        peer_stats = []
+                        for payload in payloads:
+                            peer_rows = int(payload[1])
+                            peer_geometry = _exact_cell_geometry(
+                                num_real=peer_rows,
+                                graph_batch_size=common_graph_batch_size,
+                                verifier_budget=selected_verifier_budget,
+                                min_verify_len=planner.cfg.min_verify_len,
+                                max_verify_len=planner.max_tier,
+                            )
+                            if peer_geometry is None:
+                                raise RuntimeError(
+                                    "Selected exact SPS cell is infeasible for "
+                                    f"peer rows={peer_rows}, "
+                                    f"G={common_graph_batch_size}, "
+                                    f"V={selected_verifier_budget}")
+                            _, peer_real_tokens, _ = peer_geometry
+                            peer_stats.append([
+                                peer_rows, peer_real_tokens,
+                                1 if all_can_graph else 0
+                            ])
 
         # --- Phase 3: no more collectives -------------------------------------
         #
@@ -3665,7 +3798,10 @@ class PyExecutor:
                 ragged_active = True
             elif all_can_graph:
                 bucket = self.model_engine.fit_ragged_verify_lens(
-                    gen_requests, ragged_lens, peer_stats=peer_stats)
+                    gen_requests,
+                    ragged_lens,
+                    peer_stats=peer_stats,
+                    exact_shape=exact_shape)
                 ragged_active = bucket is not None
                 if bucket is None:
                     fallback_reason = "no_captured_shape"
