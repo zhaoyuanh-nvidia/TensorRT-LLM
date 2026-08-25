@@ -1425,6 +1425,44 @@ class SpecMetadata:
         self._sampling_params_signature[0] = None
         self._sampling_params_signature[1] = None
 
+    def remap_expanded_sampling_params(self, req_idx: torch.Tensor,
+                                       num_tokens: int) -> None:
+        """Repack per-logits-row sampling state after device window selection.
+
+        Host preparation expands every request's parameters according to the
+        shape-only ragged split.  Device window selection can redistribute the
+        same token budget among requests immediately before replay, so the
+        flattened temperature/filter and Philox buffers must follow the new
+        token owners as well.  The request-indexed buffers are stable sources;
+        ``req_idx`` is the freshly selected owner of every packed logits row.
+        """
+        if num_tokens <= 0:
+            return
+        owners = req_idx[:num_tokens].to(torch.long)
+        pairs = (
+            (self.request_temperatures, self.temperatures),
+            (self.request_top_ks, self.top_ks),
+            (self.request_top_ps, self.top_ps),
+            (self.request_seeds, self.seeds),
+            (self.request_offsets, self.offsets),
+        )
+        for request_values, expanded_values in pairs:
+            if request_values is None or expanded_values is None:
+                continue
+            if expanded_values.numel() < num_tokens:
+                raise RuntimeError(
+                    "device-selected DSpark layout exceeds the captured "
+                    "sampling-parameter buffer")
+            torch.index_select(request_values,
+                               0,
+                               owners,
+                               out=expanded_values[:num_tokens])
+        # The host-expansion cache no longer describes temperatures/top-k/
+        # top-p after the in-place remap.  Force the next populate to restore
+        # its host layout before a step whose device prologue declines (graph
+        # miss, mixed batch, first overlap, or planner fallback).
+        self._sampling_params_signature[1] = None
+
 
 def apply_accept_caps(num_accepted_tokens: torch.Tensor, num_contexts: int,
                       spec_metadata) -> None:
@@ -1912,9 +1950,10 @@ class SpecWorkerBase(nn.Module, ABC):
 
         No-op unless the deploy enabled the penalties and some request in the batch
         actually uses one. ``logits`` must already be in the normalized
-        ``[ctx (1 row), gen (draft_len + 1 rows)]`` layout, i.e. after
-        ``_reshape_logits_for_accept`` -- which is what makes PARD's wider raw
-        layout fit the same mapping.
+        layout after ``_reshape_logits_for_accept``: one row per context plus
+        either ``draft_len + 1`` rows per generation request (uniform) or each
+        request's packed ``verify_lens`` rows (ragged). This is also what makes
+        PARD's wider raw layout fit the same mapping.
 
         Returns the logits acceptance should read: a penalized copy when the
         penalties apply, otherwise the caller's tensor unchanged.
@@ -1930,7 +1969,8 @@ class SpecWorkerBase(nn.Module, ABC):
         draft_len = draft_tokens.shape[1] if draft_tokens.dim() > 1 else 0
         mapping = penalty_ops.build_row_mapping(spec_metadata, num_contexts,
                                                 batch_size, draft_len,
-                                                draft_tokens, logits.device)
+                                                draft_tokens, logits.device,
+                                                num_logit_rows=logits.shape[0])
         if mapping is None:
             return logits
         row_slots, intra_tokens, intra_valid = mapping

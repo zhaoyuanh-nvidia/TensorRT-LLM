@@ -1662,7 +1662,7 @@ class PyTorchModelEngine(ModelEngine):
         No-op on non-DSA models. See nvbugs/6482566.
         """
         try:
-            from ..attention_backend.sparse.deepseek_v4.deepseek_v4 import \
+            from ..attention_backend.sparse.deepseek_v4.indexer import \
                 DeepseekV4Indexer
         except ImportError:
             return
@@ -5247,7 +5247,8 @@ class PyTorchModelEngine(ModelEngine):
         Returns True when applied; False when a precondition fails (the step
         then runs the shape split as-is, which is a valid window assignment).
         """
-        from ..speculative.dspark_device_select import select_windows_device
+        from ..speculative.dspark_device_select import (
+            gather_packed_draft_tokens, select_windows_device)
 
         runner = self.cuda_graph_runner
         budget = self._dspark_device_budget
@@ -5268,6 +5269,19 @@ class PyTorchModelEngine(ModelEngine):
         spec_metadata = inputs.get('spec_metadata')
         attn_metadata = inputs.get('attn_metadata')
         if spec_metadata is None or attn_metadata is None:
+            return False
+        if self.use_mrope:
+            # Host-selected ragged windows build the complete three-axis
+            # MRoPE positions correctly.  The device prologue currently owns
+            # only the scalar position buffer, so decline fresh reranking
+            # rather than leave the 3-D positions on the stale shape split.
+            return False
+        apply_device_layout = getattr(attn_metadata,
+                                      "apply_device_ragged_layout", None)
+        if not callable(apply_device_layout):
+            # Device-selected row ownership is an attention-backend
+            # capability.  Decline before mutating any shared buffers when a
+            # backend only supports the ordinary host-selected ragged layout.
             return False
         if int(attn_metadata.num_contexts) != 0:
             return False
@@ -5331,6 +5345,7 @@ class PyTorchModelEngine(ModelEngine):
             self.previous_kv_lens_offsets_cuda.dtype)
 
         req_idx = result.req_idx
+        spec_metadata.remap_expanded_sampling_params(req_idx, bucket)
         device = req_idx.device
         flat = torch.arange(bucket, device=device)
         offset = flat - result.qo_indptr.to(torch.long)[req_idx]
@@ -5352,19 +5367,32 @@ class PyTorchModelEngine(ModelEngine):
             self.previous_pos_indices_cuda.dtype)
         self.previous_pos_id_offsets_cuda[:real_tokens].copy_(
             new_tokens_lens_device[slots_tok[:real_tokens]])
-        # Draft tokens pack compactly: token t at in-window offset o >= 1 goes
-        # to slot t - owner - 1 (one bonus token per preceding row). Anchor
-        # tokens (o == 0) are parked one past the real draft region, where any
-        # valid token id is discard-territory.
+        # Draft tokens pack compactly, omitting each request's bonus/anchor.
+        # Build the draft-only row owners at the statically known real-draft
+        # size.  The previous scheme parked anchors at ``real_draft``; at a
+        # full K / full batch that index is exactly one past the allocation.
         real_draft = real_tokens - n_real
-        mask = offset >= 1
-        dst = torch.where(mask, flat - req_idx - 1,
-                          torch.full_like(req_idx, real_draft))
-        src = next_draft_tokens_device[slots_tok, (offset - 1).clamp_min(0)]
-        self.draft_tokens_cuda[dst] = src.to(self.draft_tokens_cuda.dtype)
+        if real_draft > 0:
+            self.draft_tokens_cuda[:real_draft].copy_(
+                gather_packed_draft_tokens(
+                    next_draft_tokens=next_draft_tokens_device,
+                    batch_slots=prev_slots,
+                    verify_lens=result.verify_lens,
+                    qo_indptr=result.qo_indptr,
+                    num_real=n_real,
+                    total_draft_tokens=real_draft,
+                ).to(self.draft_tokens_cuda.dtype))
 
-        attn_metadata.apply_device_ragged_layout(result.verify_lens, req_idx,
-                                                 result.kv_correction)
+        apply_device_layout(result.verify_lens, req_idx,
+                            result.kv_correction)
+        stats = self._dspark_ragged_stats
+        if stats is not None:
+            stats.record_device_window(
+                forced=planner.forced_budget_frac is not None,
+                num_real=n_real,
+                padded_bs=padded_bs,
+                bucket=bucket,
+            )
         return True
 
     @staticmethod
@@ -8412,7 +8440,7 @@ class PyTorchModelEngine(ModelEngine):
             # A ragged step that misses its captured shape quietly runs eager;
             # count it. Only generation-only steps count: a batch with context
             # requests has no generation graph to miss.
-            if padded_requests.can_run_cuda_graph:
+            if padded_graph_requests.can_run_cuda_graph:
                 self._record_dspark_graph_use(
                     replayed=can_run_graph,
                     shape=None if can_run_graph else
@@ -9180,6 +9208,14 @@ class PyTorchModelEngine(ModelEngine):
                 logits_processors = getattr(request,
                                             "py_logits_post_processors", None)
                 if logits_processors:
+                    if (not is_context_request and getattr(
+                            request, "py_verify_len", None) is not None):
+                        raise RuntimeError(
+                            "per-request logits post-processors are not "
+                            "supported with DSpark ragged verification: the "
+                            "processor interface assumes one uniform row "
+                            "stride and would modify another request's packed "
+                            "logits after a short verify window")
                     token_ids = ([request.get_tokens(0)]
                                  if is_context_request else [
                                      request.get_tokens(beam_idx)

@@ -195,6 +195,26 @@ def test_compact_still_derives_delivered_from_the_bucket():
     assert stats.trim_ratio > 0.0
 
 
+def test_device_window_execution_is_reported_separately_from_host_shape():
+    """A uniform host split may still be freshly re-ranked before replay."""
+    stats = _compact_stats()
+    stats.record_step(num_gen_requests=4,
+                      verify_lens=[3, 3, 3, 3],
+                      bucket=16)
+    stats.record_device_window(forced=True,
+                               num_real=4,
+                               padded_bs=4,
+                               bucket=16)
+
+    summary = stats.summary()
+    assert summary["steps_uniform_windows"] == 1
+    assert summary["steps_ragged"] == 0
+    assert summary["device_window_steps"] == 1
+    assert summary["forced_device_window_steps"] == 1
+    assert summary["forced_device_window_trimmed_steps"] == 1
+    assert summary["device_window_shape_hist"] == {"4/4/16": 1}
+
+
 # --- mode plumbing -----------------------------------------------------------
 
 
