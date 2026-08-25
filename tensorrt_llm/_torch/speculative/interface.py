@@ -143,8 +143,7 @@ def prepare_attn_metadata_for_draft_replay(attn_metadata,
         return None
     if not isinstance(attn_metadata, TrtllmAttentionMetadata):
         return None
-    draft_block_offsets = getattr(attn_metadata, 'draft_kv_cache_block_offsets',
-                                  None)
+    draft_block_offsets = attn_metadata.draft_kv_cache_block_offsets
     if draft_block_offsets is None:
         return None
 
@@ -502,6 +501,40 @@ class SpecMetadata:
     # Total runtime tokens per generation request for the current iteration,
     # Normally, it equals 1 + runtime_draft_len. But for PARD, it equals 2 * runtime_draft_len.
     runtime_tokens_per_gen_step: int = 1
+
+    # Ragged (per-request) verification split, set only when
+    # confidence-scheduled verification runs in ragged mode:
+    #
+    #   verify_lens  [num_gen]      positions verified per generation request
+    #   qo_indptr    [num_gen + 1]  exclusive prefix sum; request r owns
+    #                               [qo_indptr[r], qo_indptr[r + 1])
+    #
+    # Both stay None on every other path. Built by
+    # ``_torch/speculative/dspark_ragged.RaggedVerifyLayout``.
+    verify_lens: Optional[torch.Tensor] = None
+    qo_indptr: Optional[torch.Tensor] = None
+    # Host-side ``sum(verify_lens)`` (reading it off the tensor would sync).
+    # Equals the captured token bucket after ``RaggedVerifyLayout.fill_bucket``.
+    total_verify_tokens: Optional[int] = None
+
+    # ``cap-accept``: per-request ceilings on the accepted count, in the same
+    # token units as ``verify_lens``, for a batch whose layout was NOT trimmed.
+    # Deliberately separate from ``verify_lens``: that field also implies the
+    # packed buffer layout, and under cap-accept the buffers are the usual
+    # rectangle -- reusing it would silently unpack a rectangle as if ragged.
+    accept_caps: Optional[torch.Tensor] = None
+    # [batch] positions the cap discarded, per request -- the acceptance the
+    # schedule cost each one.
+    accept_cap_trim: Optional[torch.Tensor] = None
+
+    @property
+    def is_ragged_verify(self) -> bool:
+        """Whether this iteration uses per-request verify lengths.
+
+        Implies the packed layout. ``cap-accept`` is deliberately NOT ragged by
+        this test -- it caps acceptance without packing anything.
+        """
+        return self.verify_lens is not None
 
     # Auto-detected per step from populated sampling params:
     # True if every request is greedy (no temp/top_k/top_p) and we can take
@@ -984,8 +1017,7 @@ class SpecMetadata:
         overwritten here. No-op unless rejection is enabled and slots exist.
         Static shapes -> CUDA-graph safe.
         """
-        if (not padding_slot_ids
-                or not getattr(self, "use_rejection_sampling", False)
+        if (not padding_slot_ids or not self.use_rejection_sampling
                 or self.draft_probs is None):
             return
         onehot_vocab = (self.draft_probs_last_dim if self.draft_probs_last_dim
@@ -1045,7 +1077,8 @@ class SpecMetadata:
         population. Does NOT allocate or fill GPU buffers, so it is safe to call
         before the CUDA graph key is built.
         """
-        from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
+        from tensorrt_llm._torch.pyexecutor.llm_request import (
+            LlmRequestState, get_request_tokens_per_gen_step)
         from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import \
             GREEDY_TEMPERATURE_THRESHOLD
         from tensorrt_llm.sampling_params import SamplingParams
@@ -1111,8 +1144,13 @@ class SpecMetadata:
             tk_val = _first_or_none(sampling_config.top_k)
             tp_val = _first_or_none(sampling_config.top_p)
 
-            # Context requests have no draft tokens yet.
-            num_tokens = 1 + self.runtime_draft_len if request.state == LlmRequestState.GENERATION_IN_PROGRESS else 1
+            # Generation requests contribute one row per verified position,
+            # per-request under ragged verification: the buffers are indexed
+            # by flat token position, so a fixed stride would apply request
+            # r's sampling params to request r+1's tokens.
+            num_tokens = get_request_tokens_per_gen_step(
+                request, 1 + self.runtime_draft_len
+            ) if request.state == LlmRequestState.GENERATION_IN_PROGRESS else 1
 
             (
                 temp_val,
@@ -1386,6 +1424,59 @@ class SpecMetadata:
         """
         self._sampling_params_signature[0] = None
         self._sampling_params_signature[1] = None
+
+
+def apply_accept_caps(num_accepted_tokens: torch.Tensor, num_contexts: int,
+                      spec_metadata) -> None:
+    """``cap-accept``: hold each request to its scheduled window, in place.
+
+    Must run inside acceptance, before the DSpark drafter consumes
+    ``num_accepted_tokens`` on device (hidden-state pick, rolling-KV
+    back-fill, ``_ctx_len`` advance); capping later leaves the draft state
+    permanently ahead of what was committed. In-place and sync-free, so safe
+    to record into a CUDA graph.
+    """
+    caps = spec_metadata.accept_caps
+    if caps is None:
+        return
+    gen = num_accepted_tokens[num_contexts:]
+    if gen.numel() == 0:
+        return
+    caps = caps[:gen.shape[0]].to(gen.dtype)
+    capped = torch.minimum(gen, caps)
+    trim = spec_metadata.accept_cap_trim
+    if trim is not None:
+        # Zero the context slots too. The buffer is persistent and the batch
+        # composition moves every step, so a slot left unwritten would carry
+        # the previous step's loss and be attributed to whoever holds it now.
+        rows = num_contexts + gen.shape[0]
+        trim[:rows].zero_()
+        trim[num_contexts:rows] = (gen - capped).to(trim.dtype)
+    num_accepted_tokens[num_contexts:] = capped
+
+
+def _padded_gen_draft_tokens(spec_metadata, num_gens: int,
+                             runtime_draft_len: int) -> torch.Tensor:
+    """Unpack ragged-packed draft tokens into ``[num_gens, runtime_draft_len]``.
+
+    The overlap path packs draft tokens by each request's own window, so the
+    buffer holds ``sum(verify_lens) - num_gens`` entries rather than a
+    ``num_gens x runtime_draft_len`` rectangle. Acceptance is naturally
+    rectangular, so scatter back out; positions past a request's window are
+    padding and get masked by ``count_accepted_ragged``.
+    """
+    from .dspark_ragged import build_qo_indptr, scatter_ragged_to_padded
+
+    # verify_lens counts tokens (bonus position + drafts); the draft buffer
+    # only holds the drafts.
+    draft_lens = spec_metadata.verify_lens - 1
+    packed_len = spec_metadata.total_verify_tokens - num_gens
+    return scatter_ragged_to_padded(
+        spec_metadata.draft_tokens[:packed_len],
+        verify_lens=draft_lens,
+        qo_indptr=build_qo_indptr(draft_lens),
+        max_len=runtime_draft_len,
+    ).to(torch.int32)
 
 
 class SpecWorkerBase(nn.Module, ABC):
@@ -1762,16 +1853,37 @@ class SpecWorkerBase(nn.Module, ABC):
         accepted_tokens[:num_contexts, 0] = target_tokens[:num_contexts]
 
         # Generation requests: verify draft tokens against target tokens
-        gen_target_tokens = target_tokens[num_contexts:].reshape(
-            num_gens, runtime_draft_len + 1)
-        accepted_tokens[num_contexts:, :runtime_draft_len +
-                        1] = gen_target_tokens
+        if spec_metadata is not None and spec_metadata.is_ragged_verify:
+            from .dspark_ragged import (count_accepted_ragged,
+                                        scatter_ragged_to_padded)
+            verify_lens = spec_metadata.verify_lens
+            total = spec_metadata.total_verify_tokens
+            gen_target_tokens = scatter_ragged_to_padded(
+                target_tokens[num_contexts:num_contexts + total],
+                verify_lens=verify_lens,
+                qo_indptr=spec_metadata.qo_indptr,
+                max_len=runtime_draft_len + 1)
+            accepted_tokens[num_contexts:, :runtime_draft_len +
+                            1] = gen_target_tokens
+            # verify_lens counts tokens (bonus position included), so a
+            # request drafted verify_lens - 1 positions. Masking past that is
+            # what stops a stale padded slot from comparing equal and crediting
+            # an acceptance the target never made.
+            num_accepted_tokens[num_contexts:] += count_accepted_ragged(
+                draft_tokens=draft_tokens,
+                target_tokens=gen_target_tokens[:, :runtime_draft_len],
+                verify_lens=verify_lens - 1)
+        else:
+            gen_target_tokens = target_tokens[num_contexts:].reshape(
+                num_gens, runtime_draft_len + 1)
+            accepted_tokens[num_contexts:, :runtime_draft_len +
+                            1] = gen_target_tokens
 
-        # Compare draft tokens with target tokens using cumulative product
-        # Counts consecutive matches from the start
-        num_accepted_tokens[num_contexts:] += torch.cumprod(
-            (draft_tokens == gen_target_tokens[:, :runtime_draft_len]).int(),
-            dim=-1).sum(1)
+            # Compare draft tokens with target tokens using cumulative product
+            # Counts consecutive matches from the start
+            num_accepted_tokens[num_contexts:] += torch.cumprod((
+                draft_tokens == gen_target_tokens[:, :runtime_draft_len]).int(),
+                                                                dim=-1).sum(1)
 
         # Apply force override if set
         num_accepted_tokens = self._apply_force_accepted_tokens(
@@ -1779,6 +1891,16 @@ class SpecWorkerBase(nn.Module, ABC):
             num_contexts,
             runtime_draft_len,
             spec_metadata=spec_metadata)
+
+        if spec_metadata is not None and spec_metadata.is_ragged_verify:
+            # The synthetic-acceptance override caps at the batch-wide
+            # runtime_draft_len; under ragged a request may have verified
+            # fewer positions, and accepting past its window would commit
+            # tokens the target never produced.
+            num_accepted_tokens[num_contexts:] = torch.minimum(
+                num_accepted_tokens[num_contexts:],
+                spec_metadata.verify_lens.to(num_accepted_tokens.dtype))
+        apply_accept_caps(num_accepted_tokens, num_contexts, spec_metadata)
 
         return accepted_tokens, num_accepted_tokens
 
@@ -1912,7 +2034,7 @@ class SpecWorkerBase(nn.Module, ABC):
         sharded and gather identical copies (overflowing the d2t table).
         """
         mapping = self.mapping
-        if mapping is None or getattr(mapping, "tp_size", 1) <= 1:
+        if mapping is None or mapping.tp_size <= 1:
             return False
         # Under attention DP every rank is data-parallel -- it owns a distinct
         # set of requests -- so the draft logits must NOT be cross-rank gathered,
@@ -1923,7 +2045,7 @@ class SpecWorkerBase(nn.Module, ABC):
         # desyncing them into a hang / DeepEP launch failure. Only plain TP
         # (tp>1 without ADP), where all ranks share the same tokens sharded over
         # the vocab dim, needs the gather.
-        if getattr(mapping, "enable_attention_dp", False):
+        if mapping.enable_attention_dp:
             return False
         draft_full_vocab = (getattr(spec_metadata, "draft_vocab_size", 0)
                             or getattr(spec_metadata, "vocab_size", 0) or 0)
@@ -2028,6 +2150,12 @@ class SpecWorkerBase(nn.Module, ABC):
             return torch.zeros((num_gens, runtime_draft_len),
                                dtype=torch.int,
                                device=device)
+        if spec_metadata.is_ragged_verify:
+            # Packed by per-request windows, not a rectangle; a plain reshape
+            # can happen to divide and silently attribute one request's drafts
+            # to another.
+            return _padded_gen_draft_tokens(spec_metadata, num_gens,
+                                            runtime_draft_len)
         return spec_metadata.draft_tokens.reshape(num_gens, runtime_draft_len)
 
     def _reshape_logits_for_accept(self, logits, num_contexts, num_gens,
@@ -2084,9 +2212,22 @@ class SpecWorkerBase(nn.Module, ABC):
             return False
         if draft_tokens.dim() != 2 or draft_tokens.shape[0] != num_gens:
             return False
-        # logits must cover context rows (1 each) + gen rows (draft_len + 1 each).
+        # logits must cover context rows (1 each) + however many gen rows the
+        # target was actually given: under ragged verification that is
+        # `total_verify_tokens`, not `num_gens * (draft_len + 1)`.
         logits_rows = logits.shape[0] if logits.dim() > 1 else 1
-        if logits_rows < num_contexts + num_gens * (draft_len + 1):
+        if spec_metadata.is_ragged_verify:
+            # Fail closed on a half-built ragged layout: the branch below
+            # dereferences all three of these.
+            total_verify_tokens = spec_metadata.total_verify_tokens
+            if (total_verify_tokens is None
+                    or spec_metadata.verify_lens is None
+                    or spec_metadata.qo_indptr is None):
+                return False
+            required_gen_rows = int(total_verify_tokens)
+        else:
+            required_gen_rows = num_gens * (draft_len + 1)
+        if logits_rows < num_contexts + required_gen_rows:
             return False
         # Slot ids for the gen subset must exist (range safety is guaranteed by
         # construction).
@@ -2150,7 +2291,12 @@ class SpecWorkerBase(nn.Module, ABC):
 
         # === Generation subset: rejection sampling on the gen slice ===
         if num_gens > 0:
-            num_gen_logits = num_gens * (runtime_draft_len + 1)
+            is_ragged = spec_metadata.is_ragged_verify
+            # The per-token sampling-parameter buffers are packed by the same
+            # per-request windows as the logits (see
+            # _scan_one_model_sampling), so one flat total covers both.
+            num_gen_logits = (spec_metadata.total_verify_tokens if is_ragged
+                              else num_gens * (runtime_draft_len + 1))
             gen_logits = logits[num_contexts:num_contexts + num_gen_logits]
             gen_start = num_contexts
             gen_end = num_contexts + num_gen_logits
@@ -2166,9 +2312,19 @@ class SpecWorkerBase(nn.Module, ABC):
 
             target_probs_flat = compute_probs_from_logits(
                 gen_logits, temperatures, top_ks, top_ps)
-            target_probs = target_probs_flat.reshape(num_gens,
-                                                     runtime_draft_len + 1,
-                                                     vocab_size)
+            if is_ragged:
+                from .dspark_ragged import (fill_padded_rows_onehot,
+                                            scatter_ragged_to_padded)
+                target_probs = scatter_ragged_to_padded(
+                    target_probs_flat,
+                    verify_lens=spec_metadata.verify_lens,
+                    qo_indptr=spec_metadata.qo_indptr,
+                    max_len=runtime_draft_len + 1)
+                fill_padded_rows_onehot(target_probs,
+                                        verify_lens=spec_metadata.verify_lens)
+            else:
+                target_probs = target_probs_flat.reshape(
+                    num_gens, runtime_draft_len + 1, vocab_size)
 
             draft_vocab_size = draft_probs.shape[-1]
             assert draft_probs.shape[0] == num_gens, (
@@ -2247,6 +2403,16 @@ class SpecWorkerBase(nn.Module, ABC):
             num_contexts,
             runtime_draft_len,
             spec_metadata=spec_metadata)
+
+        if num_gens > 0 and spec_metadata.is_ragged_verify:
+            # The kernel walks the padded rectangle, so a request whose whole
+            # window was accepted keeps going into padding. verify_lens is the
+            # hard ceiling: accepting past it commits tokens the target never
+            # scored.
+            num_accepted_tokens[num_contexts:] = torch.minimum(
+                num_accepted_tokens[num_contexts:],
+                spec_metadata.verify_lens.to(num_accepted_tokens.dtype))
+        apply_accept_caps(num_accepted_tokens, num_contexts, spec_metadata)
         return accepted_tokens, num_accepted_tokens
 
     def _rng_state_per_request(
@@ -2365,7 +2531,7 @@ class SpecWorkerBase(nn.Module, ABC):
         ``[:batch]``, which belong to group rank 0.
         """
         if (mapping_lm_head_tp is not None
-                and getattr(mapping_lm_head_tp, "tp_size", 1) > 1):
+                and mapping_lm_head_tp.tp_size > 1):
             from ..distributed.ops import allgather
             combined = self._get_local_max_and_combined(logits,
                                                         mapping_lm_head_tp)
@@ -2377,8 +2543,7 @@ class SpecWorkerBase(nn.Module, ABC):
             return self._get_draft_tokens_from_gathered(own_segment)
         mapping = self.mapping
         sharded = self._draft_logits_are_sharded(logits, spec_metadata)
-        if (sharded and mapping is not None
-                and getattr(mapping, "tp_size", 1) > 1
+        if (sharded and mapping is not None and mapping.tp_size > 1
                 and not mapping.enable_attention_dp):
             from ..distributed.ops import allgather
             combined = self._get_local_max_and_combined(logits)
@@ -2432,7 +2597,7 @@ class SpecWorkerBase(nn.Module, ABC):
                                                    repeat=K,
                                                    step_offset=1)
 
-        if getattr(spec_metadata, "use_rejection_sampling", False):
+        if spec_metadata.use_rejection_sampling:
             flat_tokens, flat_probs = (
                 sampling_batch_spec_dec_one_model_for_rejection(flat_logits,
                                                                 temps,
@@ -2480,8 +2645,7 @@ class SpecWorkerBase(nn.Module, ABC):
         next iter reads this scalar). No-op unless rejection is enabled and the
         slot-indexed buffers exist. Static shapes -> CUDA-graph safe.
         """
-        if (num_contexts <= 0
-                or not getattr(spec_metadata, "use_rejection_sampling", False)
+        if (num_contexts <= 0 or not spec_metadata.use_rejection_sampling
                 or spec_metadata.draft_probs is None):
             return
         ctx_slot_ids = spec_metadata.batch_slot_ids[:num_contexts]
@@ -2656,7 +2820,7 @@ class SpecWorkerBase(nn.Module, ABC):
             return
 
         saved_state = prepare_attn_metadata_for_draft_replay(
-            attn_metadata, draft_kv_cache_manager)
+              attn_metadata, draft_kv_cache_manager)
         if saved_state is None:
             yield attn_metadata
             return

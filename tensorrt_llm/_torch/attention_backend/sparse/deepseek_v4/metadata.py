@@ -103,6 +103,18 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         )
         self.cu_seq_lens[0] = 0
 
+        # Tokens each generation request appends this step. Only populated for
+        # ragged verification; uniform batches continue to use the scalar
+        # ``num_gen_tokens_per_seq`` loop bound.
+        self.gen_new_tokens_per_seq_cuda = self.get_empty(
+            self.cuda_graph_buffers,
+            (self.max_num_sequences,),
+            dtype=torch.int,
+            cache_name="gen_new_tokens_per_seq_cuda",
+            capture_graph=capture_graph,
+        )
+        self.gen_new_tokens_per_seq: Optional[torch.Tensor] = None
+
         # new_comp_kv_lens_cuda is the number of new compressed tokens for the requests
         self.new_comp_kv_lens_cuda = {
             compress_ratio: self.get_empty(
@@ -512,7 +524,9 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         for field in self._DRAFT_SPARSE_FIELDS:
             setattr(self, field, saved_state[field])
 
-    def prepare(self):
+    def _prepare_impl(self):
+        # DSAtrtllmAttentionMetadata.prepare() owns the overlap-scheduler guard
+        # for pinned staging buffers and dispatches here.
         assert self.kv_cache_manager is not None
         assert self.request_ids is not None
 
@@ -584,10 +598,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         # --- Per-ratio metadata ---
         # 1) CPU-side: compute scalar metadata (num_total_compressed_tokens, etc.)
         # 2) CUDA-side: fill *_cuda buffers via prepare_compressed_kv_metadata()
-        num_gen_tokens_per_seq = (
-            num_gen_tokens // self.num_generations if self.num_generations > 0 else 0
-        )
-        self.num_gen_tokens_per_seq = num_gen_tokens_per_seq
+        num_gen_tokens_per_seq = self._sync_gen_tokens_per_seq(num_gen_tokens)
         num_contexts = self.num_contexts
         num_generations = self.num_generations
         kv_lens_slice = kv_lens[:num_requests]
@@ -641,6 +652,36 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             self.num_total_compressed_tokens,
             self._compress_ratios_sorted,
         )
+
+    def _sync_gen_tokens_per_seq(self, num_gen_tokens: int) -> int:
+        """Synchronize the compressor's scalar and per-request token counts.
+
+        The compressor uses ``num_gen_tokens_per_seq`` as a compile-time loop
+        bound. A ragged batch therefore uses the configured global maximum,
+        while exact request lengths travel in a device vector. The vector is
+        copied device-to-device from ``_seq_lens_cuda`` so CUDA-graph replay
+        observes device-window rewrites instead of reloading the captured host
+        shape split.
+        """
+        if self.is_ragged_verify and self.num_generations > 0:
+            self.num_gen_tokens_per_seq = 1 + self.max_draft_tokens
+            num_contexts = self.num_contexts
+            num_generations = self.num_generations
+            gen_new_tokens = self.gen_new_tokens_per_seq_cuda[:num_generations]
+            gen_new_tokens.copy_(
+                self._seq_lens_cuda[
+                    num_contexts : num_contexts + num_generations
+                ]
+            )
+            self.gen_new_tokens_per_seq = gen_new_tokens
+        else:
+            self.num_gen_tokens_per_seq = (
+                num_gen_tokens // self.num_generations
+                if self.num_generations > 0
+                else 0
+            )
+            self.gen_new_tokens_per_seq = None
+        return self.num_gen_tokens_per_seq
 
     def prepare_compressed_kv_metadata(
         self,
@@ -717,9 +758,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         cached_tokens = kv_lens - seq_lens
 
         num_gen_tokens = num_tokens - self.num_ctx_tokens
-        self.num_gen_tokens_per_seq = (
-            num_gen_tokens // self.num_generations if self.num_generations > 0 else 0
-        )
+        self._sync_gen_tokens_per_seq(num_gen_tokens)
 
         # Reuse prepare()'s host-computed ctx sizes unless the extend_ctx path
         # (num_chunked_ctx_requests > 0) may have mutated ctx-row kv_lens on
