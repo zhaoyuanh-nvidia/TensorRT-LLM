@@ -194,6 +194,16 @@ def _parse_partial_scores_env() -> Optional[int]:
     return value if value > 0 else None
 
 
+def _is_metric_key(key: str) -> bool:
+    """Whether a ``results[task]`` key is a metric rather than bookkeeping.
+
+    lm-eval keys every metric as ``"<metric>,<filter>"`` -- ``"exact_match,
+    strict-match"``, ``"acc,none"``. Entries without a comma are bookkeeping:
+    ``"alias"`` is the task name, ``"samples"`` is the example count.
+    """
+    return "," in key
+
+
 class LmEvalWrapper(TemplateLM):
 
     def __init__(self,
@@ -1003,10 +1013,11 @@ class LmEvalEvaluator(Evaluator):
             system_instruction=self.system_prompt,
             log_samples=self.log_samples)
 
-        # Normalize scores to range 0~100
+        # Normalize real metric scores to range 0~100 (see _is_metric_key).
         scores = results["results"][self.task_name]
         for metric in scores.keys():
-            if isinstance(scores[metric], (float, int)):
+            if _is_metric_key(metric) and isinstance(scores[metric],
+                                                     (float, int)):
                 scores[metric] *= 100
         logger.info(
             f"lm-eval {self.task_name} results (scores normalized to range 0~100):\n{lm_eval.utils.make_table(results)}"
@@ -1022,8 +1033,18 @@ class LmEvalEvaluator(Evaluator):
                 f"lm-eval {self.task_name} {scores_filter} accuracy: {result_acc:.2f}"
             )
         else:
-            result_acc = np.mean(
-                [acc for m, acc in scores.items() if "_stderr" not in m])
+            # Average real metrics only; bookkeeping keys ("alias",
+            # "samples") are excluded structurally (see _is_metric_key).
+            numeric = [
+                acc for m, acc in scores.items()
+                if _is_metric_key(m) and "_stderr" not in m
+                and isinstance(acc, (int, float)) and not isinstance(acc, bool)
+            ]
+            if not numeric:
+                raise ValueError(
+                    f"lm-eval returned no numeric metrics for "
+                    f"{self.task_name}; got {sorted(scores)}")
+            result_acc = np.mean(numeric)
             logger.info(
                 f"lm-eval {self.task_name} average accuracy: {result_acc:.2f}")
         return result_acc

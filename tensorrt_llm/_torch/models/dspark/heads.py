@@ -15,21 +15,13 @@
 #
 # The DSpark Markov/RNN/confidence-head math is ported from DeepSeek's DeepSpec
 # reference implementation (https://github.com/deepseek-ai/DeepSpec, MIT License).
-"""DSpark draft-network heads (pure-torch, framework-agnostic).
+"""DSpark draft-network heads (pure-torch so they unit-test against DeepSpec).
 
-These modules implement the *sequential refinement* and *acceptance-confidence*
-parts of DeepSeek's DSpark speculative-decoding draft network:
-
-  - Markov head: a low-rank token-bigram logit bias ``logits_k += W2(W1[t_{k-1}])``
-    applied autoregressively across the ``block_size`` draft positions (the cheap
-    "sequential" half of DSpark's "semi-parallel" drafting). RNN variant carries
-    a GRU-style recurrent state across positions.
-  - Confidence head: predicts a per-position acceptance probability; the cumulative
-    product over positions estimates prefix-acceptance and is used only to
-    *truncate* the proposed draft length (NOT to decide acceptance).
-
-This file deliberately depends on ``torch`` only so it can be unit-tested in
-isolation (token-for-token) against the DeepSpec reference.
+Markov/RNN heads apply an autoregressive per-position logit bias across the
+draft block. The confidence head predicts per-position *conditional* acceptance
+probabilities (``P(accept_k | accept_1..k-1)``) whose cumulative product the
+verification scheduler budgets against; it decides *how many* tokens are
+verified, never *whether* one is accepted, so scheduling stays lossless.
 """
 
 from typing import Optional
@@ -213,22 +205,41 @@ def build_markov_head(
 class DSparkConfidenceHead(nn.Module):
     """Per-position acceptance-confidence predictor (DeepSpec AcceptRatePredictor).
 
-    Input features are the backbone hidden state, optionally concatenated with the
-    Markov head's previous-token embedding. Output is a single logit per position.
+    Emits one raw logit per position; :meth:`apply_sts` turns it into a
+    probability, folding in the sequential-temperature-scaling (STS)
+    calibration (``sts_temperatures`` defaults to all-ones: plain sigmoid).
     """
 
-    def __init__(self, *, hidden_size: int, markov_rank: int = 0, with_markov: bool = False):
+    def __init__(
+        self,
+        *,
+        hidden_size: int,
+        markov_rank: int = 0,
+        with_markov: bool = False,
+        bias: bool = False,
+        block_size: int = 0,
+    ):
         super().__init__()
         self.with_markov = bool(with_markov)
         input_dim = int(hidden_size) + (int(markov_rank) if with_markov else 0)
-        # The checkpoint stores ``proj`` as a bias-free bf16 weight, but the
-        # confidence score is computed in fp32 (mirrors the DeepSpec reference
-        # ``Linear(input_dim, 1, dtype=torch.float32)`` with the fp32 matmul).
-        self.proj = nn.Linear(input_dim, 1, bias=False, dtype=torch.float32)
+        # Checkpoint weight is bf16, but the score matmul is fp32 (DeepSpec parity).
+        self.proj = nn.Linear(input_dim, 1, bias=bool(bias), dtype=torch.float32)
+        # Per-position temperatures, broadcast against ``[batch, block]``.
+        # Update in place only: a captured CUDA graph holds this storage;
+        # rebinding the attribute would be invisible to the graph.
+        self.register_buffer(
+            "sts_temperatures",
+            torch.ones(max(int(block_size), 1), dtype=torch.float32),
+            persistent=False,
+        )
+        # CPU mirror of ``sts_temperatures``; rebuilt lazily by
+        # ``_host_sts_temperatures`` and dropped by ``load_sts_temperatures``.
+        self._sts_temperatures_host: Optional[torch.Tensor] = None
 
     def forward(
         self, hidden_states: torch.Tensor, prev_embeddings: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
+        """``[*, block, hidden] -> [*, block]`` raw (uncalibrated) logits."""
         if self.with_markov:
             assert prev_embeddings is not None
             features = torch.cat([hidden_states, prev_embeddings.to(hidden_states.dtype)], dim=-1)
@@ -237,18 +248,57 @@ class DSparkConfidenceHead(nn.Module):
         # fp32 matmul for a stable confidence score (mirrors the reference).
         return self.proj(features.float()).squeeze(-1)
 
+    def apply_sts(self, confidence_logits: torch.Tensor) -> torch.Tensor:
+        """Raw logits -> calibrated per-position acceptance probabilities in [0, 1].
 
-def confident_prefix_length(
-    confidence_logits: torch.Tensor, *, block_size: int, threshold: float
-) -> int:
-    """First position k where ``sigmoid(confidence_k) < threshold``.
+        Must accept CPU logits: the verification planner calibrates on pinned
+        host memory while the head lives on the device. The device-mismatch
+        branch is host-side and devices match on the in-graph path, so nothing
+        extra is captured.
+        """
+        temperatures = self.sts_temperatures
+        if temperatures.device != confidence_logits.device:
+            if confidence_logits.device.type == "cpu":
+                temperatures = self._host_sts_temperatures()
+            else:
+                temperatures = temperatures.to(confidence_logits.device)
+        return torch.sigmoid(confidence_logits.float() / temperatures)
 
-    Returns ``block_size`` when threshold<=0 (no truncation) or all positions
-    are confident. Assumes batch size 1 (functional-first scope).
-    """
-    if threshold <= 0.0:
-        return int(block_size)
-    below = confidence_logits.sigmoid() < threshold
-    if not bool(below[0].any().item()):
-        return int(block_size)
-    return int(torch.nonzero(below[0], as_tuple=False)[0].item())
+    def _host_sts_temperatures(self) -> torch.Tensor:
+        """CPU mirror of ``sts_temperatures``, materialized at most once."""
+        cached = self._sts_temperatures_host
+        if cached is None:
+            cached = self.sts_temperatures.detach().to("cpu")
+            self._sts_temperatures_host = cached
+        return cached
+
+    @torch.no_grad()
+    def load_sts_temperatures(self, temperatures: torch.Tensor) -> None:
+        """In-place update of the STS table (never rebind: see ``__init__``)."""
+        flat = temperatures.reshape(-1).to(device=self.sts_temperatures.device, dtype=torch.float32)
+        if flat.numel() != self.sts_temperatures.numel():
+            raise ValueError(
+                f"STS temperature table has {flat.numel()} entries but the confidence "
+                f"head expects {self.sts_temperatures.numel()} (one per block position)"
+            )
+        if not bool(torch.all(flat > 0.0)):
+            raise ValueError("STS temperatures must be strictly positive")
+        self.sts_temperatures.copy_(flat)
+        # Drop the CPU mirror; apply_sts rebuilds it on next use.
+        self._sts_temperatures_host = None
+
+    def load_weights(self, weights: list) -> None:
+        """Strict loader: fail loudly on checkpoint keys the module lacks (a
+        silently dropped ``proj.bias`` would shift every confidence score)."""
+        (module_weights,) = weights
+        expected = dict(self.named_parameters())
+        unexpected = [k for k in module_weights if k not in expected]
+        if unexpected:
+            raise ValueError(
+                f"DSpark confidence head checkpoint has unsupported key(s) {sorted(unexpected)}; "
+                f"the module exposes {sorted(expected)}. A checkpoint bias requires constructing "
+                f"DSparkConfidenceHead(bias=True) -- silently dropping it would bias every "
+                f"per-position confidence score."
+            )
+        for name, param in expected.items():
+            param.data.copy_(module_weights[name][:])
