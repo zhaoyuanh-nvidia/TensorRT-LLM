@@ -325,6 +325,10 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
     #: Optional observability sink, attached by the DSpark worker. Left None
     #: everywhere else so this costs one attribute read per request.
     acceptance_stats = None
+    #: Correctness marker for overlap-safe policy-window snapshots. This is
+    #: deliberately separate from optional detailed telemetry: production may
+    #: disable acceptance_stats, but mixed ragged steps still need snapshots.
+    policy_windows_enabled = False
     #: STS calibration collection; attached alongside `acceptance_stats` and
     #: None everywhere else. `sts_row_for` resolves a py_request_id to its row
     #: in the worker's confidence buffer through the worker's OWN allocator --
@@ -619,12 +623,12 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         # Cheap (a few ints) and only populated when the policy path is live.
         # Mixed context/generation compact steps intentionally omit the
         # generation-indexed verify_lens device output, but still need this
-        # overlap-safe host snapshot. acceptance_stats is attached whenever
-        # confidence scheduling is active and therefore supplies the marker
-        # that those mixed steps cannot carry in outputs.
+        # overlap-safe host snapshot. policy_windows_enabled is attached
+        # whenever confidence scheduling is active and therefore supplies the
+        # marker those mixed steps cannot carry in outputs.
         verify_lens_snapshot = None
         verify_caps_snapshot = None
-        if (self.acceptance_stats is not None or o_verify_lens is not None
+        if (self.policy_windows_enabled or o_verify_lens is not None
                 or o_cap_trim is not None):
             verify_lens_snapshot, verify_caps_snapshot = (
                 self._snapshot_policy_windows(sampling_requests))
