@@ -262,6 +262,35 @@ def test_can_queue_debug_collective_fails_closed_on_disagreement():
         executor._can_queue(batch)
 
 
+def test_confidence_off_graph_lookup_preserves_two_field_adp_protocol():
+    """Static K5 must not pay the DSpark shape-agreement payload or scan."""
+    payloads = []
+
+    def gather(value):
+        payloads.append(value)
+        return [[True, 3], [True, 4]]
+
+    runner = CUDAGraphRunner.__new__(CUDAGraphRunner)
+    runner.enabled = True
+    runner._dspark_confidence_enabled = False
+    runner.adp_shape_agreement = object()
+    runner.adp_shape_debug = False
+    runner.config = SimpleNamespace(
+        enable_attention_dp=True,
+        mapping=SimpleNamespace(tp_size=8),
+        dist=SimpleNamespace(tp_allgather=gather),
+    )
+    runner._is_mixed_encoder_decoder_batch = lambda _batch: False
+    runner._can_run_cuda_graph_batch = lambda _batch: True
+    runner._local_draft_len = lambda _batch: (_ for _ in ()).throw(
+        AssertionError("confidence-off graph lookup scanned draft lengths"))
+
+    assert runner.maybe_get_cuda_graph(_Batch([object()] * 3), False,
+                                       object()) == (None, None, None)
+    assert payloads == [[True, 3]]
+    assert runner.last_miss_reason == "peer_shape_mismatch"
+
+
 def test_padding_reuses_only_a_finalized_ready_agreement():
     requests = [SimpleNamespace(py_verify_len=None, py_verify_cap=None) for _ in range(3)]
     batch = _Batch(requests)

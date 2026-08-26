@@ -194,6 +194,9 @@ class CUDAGraphRunner:
         self.max_supported_batch_size = config.max_cuda_graph_batch_size
         self.max_beam_width = config.max_beam_width
         self.spec_config = config.spec_config
+        self._dspark_confidence_enabled = bool(
+            self.spec_config is not None and getattr(
+                self.spec_config, "enable_confidence_scheduling", False))
         from ..speculative.dspark_observability import trims_submitted_tokens
         self._dspark_trims_submitted_tokens = trims_submitted_tokens(
             self.spec_config)
@@ -561,7 +564,8 @@ class CUDAGraphRunner:
         is_mixed_encoder_decoder = self._is_mixed_encoder_decoder_batch(batch)
         can_run_cuda_graph = self._can_run_cuda_graph_batch(batch)
         batch_size = batch.batch_size
-        agreement = self.adp_shape_agreement
+        agreement = (self.adp_shape_agreement
+                     if self._dspark_confidence_enabled else None)
         reuse_agreement = bool(
             agreement is not None and agreement.reuse_graph_shape
             and agreement.matches(batch, agreement.iteration, padded=True))
@@ -575,9 +579,28 @@ class CUDAGraphRunner:
                 raise RuntimeError(
                     "DSpark cached ADP graph-shape agreement no longer "
                     "matches the local replay key")
-        if (self.enabled and self.config.enable_attention_dp
-                and self.config.mapping.tp_size > 1
-                and (not reuse_agreement or self.adp_shape_debug)):
+        adp_graph_agreement = (self.enabled
+                               and self.config.enable_attention_dp
+                               and self.config.mapping.tp_size > 1)
+        if (adp_graph_agreement and not self._dspark_confidence_enabled):
+            # Preserve the upstream static-K5 protocol exactly. Confidence-off
+            # has no ragged bucket or policy agreement to reconcile, so do not
+            # scan draft lengths or widen the collective payload on its hot
+            # graph-lookup path.
+            graph_batch_info = self.config.dist.tp_allgather(
+                [can_run_cuda_graph, batch_size])
+            all_can_graph = all(rank_info[0]
+                                for rank_info in graph_batch_info)
+            all_batch_sizes_equal = all(
+                rank_info[1] == graph_batch_info[0][1]
+                for rank_info in graph_batch_info)
+            if not all_can_graph or not all_batch_sizes_equal:
+                self.last_miss_reason = ("peer_not_gen_only"
+                                         if not all_can_graph else
+                                         "peer_shape_mismatch")
+                return None, None, None
+        elif (adp_graph_agreement
+              and (not reuse_agreement or self.adp_shape_debug)):
             # Compare every key component a rank can decide for itself: replay
             # freezes all_rank_num_tokens, so a shape mismatch is invisible at
             # replay time. draft_len is settable rank-locally (acceptance-rate

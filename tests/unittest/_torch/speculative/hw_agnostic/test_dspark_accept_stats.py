@@ -242,18 +242,39 @@ def test_cap_accept_computes_windows_but_does_not_trim_the_token_axis():
     assert not RaggedVerifyMode.STATIC.trims_submitted_tokens
 
 
-def test_a_slot_left_unwritten_cannot_inherit_the_previous_occupant_s_loss():
-    """cap_trim_lens is persistent and slot-indexed: a step producing no caps
-    must still zero this batch's slots or recycled slots report stale loss."""
+def test_static_sampler_path_skips_optional_dspark_device_and_host_work():
+    """Absent policy outputs must leave the generic speculative path inert.
+
+    A stale slot is unobservable when the matching host tensor is None. This
+    guard matters more than clearing it: static K5 must not pay two device
+    writes and two full-slot D2H copies on every sample.
+    """
     import inspect
 
     from tensorrt_llm._torch.speculative.spec_sampler_base import SpecSampler
 
     src = inspect.getsource(SpecSampler.sample_async)
-    assert "zeros_like" in src and "cap_trim_lens" in src, (
-        "_process_outputs no longer writes zeros when the step produced no "
-        "cap_trim_lens; recycled slots will report a stale request's loss"
-    )
+    assert 'if o_cap_trim is not None:' in src
+    assert 'if o_verify_lens is not None:' in src
+    assert 'cap_trim_lens=host_cap_trim_lens' in src
+    assert 'verify_lens=host_verify_lens' in src
+    assert 'self.acceptance_stats is not None or o_verify_lens is not None' in src
+
+
+def test_mixed_ragged_step_snapshots_windows_without_device_output():
+    """Mixed compact steps rely on host snapshots under overlap scheduling."""
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.speculative.spec_sampler_base import SpecSampler
+
+    requests = [
+        SimpleNamespace(py_request_id=10, py_verify_len=None, py_verify_cap=None),
+        SimpleNamespace(py_request_id=11, py_verify_len=2, py_verify_cap=None),
+        SimpleNamespace(py_request_id=12, py_verify_len=4, py_verify_cap=None),
+    ]
+    verify_lens, caps = SpecSampler._snapshot_policy_windows(requests)
+    assert verify_lens == {11: 2, 12: 4}
+    assert caps is None
 
 
 def test_the_cuda_graph_padding_dummy_carries_a_cap():
