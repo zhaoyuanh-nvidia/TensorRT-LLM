@@ -66,6 +66,7 @@ from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.speculation_gate import SpeculationGate
 from .adp_iter_stats import ADPIterStatsBuffer
 from .connectors.kv_cache_connector import KvCacheConnectorManager
+from .cuda_graph_runner import ADPShapeAgreement
 from .dwdp import DwdpManager
 from .error_classification import ErrorBudget
 from .executor_request_queue import ExecutorRequestQueue, RequestQueueItem
@@ -3582,7 +3583,8 @@ class PyExecutor:
         # max_window, can_graph, pending_pin, pending_frac]. Every rank then
         # appends [has_exact_table, exact_ready, exact_cell_count,
         # table_sha256_as_8_u32, native_yield,
-        # yield_for_each_stable_(G,V)_cell]. Carrying the authenticated table
+        # yield_for_each_stable_(G,V)_cell, scheduled_batch_size,
+        # padding_dummy_cached]. Carrying the authenticated table
         # identity is mandatory: equal vector lengths do not prove that ranks
         # assign the same (G,V) or T(G,V) to each position.
         # `can_graph` rides along because the ragged
@@ -3630,6 +3632,12 @@ class PyExecutor:
             native_yield_wire,
             *compact_yields_wire,
         ])
+        runner = self.model_engine.cuda_graph_runner
+        local_payload.extend([
+            int(scheduled_batch.batch_size),
+            1 if planner.max_tier in getattr(runner, "padding_dummy_requests",
+                                             {}) else 0,
+        ])
         if is_distributed:
             payloads = self.dist.tp_allgather(local_payload)
             # The pin and the budget fraction ride the allgather so every rank
@@ -3655,7 +3663,7 @@ class PyExecutor:
                     for payload in payloads
                 ]
                 payload_shapes_valid = all(
-                    len(payload) == 19 + int(payload[9])
+                    len(payload) == 21 + int(payload[9])
                     for payload in payloads)
                 if (not payload_shapes_valid or len(set(exact_cell_counts)) != 1
                         or len(set(exact_identities)) != 1):
@@ -3686,6 +3694,57 @@ class PyExecutor:
             planner.adopt_verify_len_pin(planner.pending_verify_len_pin())
             planner.adopt_budget_frac(planner.pending_budget_frac())
 
+        exact_payload_end = 19 + len(exact_cells)
+        batch_size_index = exact_payload_end
+        padding_dummy_index = exact_payload_end + 1
+        if any(len(payload) != exact_payload_end + 2 for payload in payloads):
+            raise RuntimeError(
+                "DSpark ADP agreement payload has an inconsistent shape")
+        peer_batch_sizes = tuple(
+            int(payload[batch_size_index]) for payload in payloads)
+        widest_batch_size = max(peer_batch_sizes, default=0)
+        common_padded_batch_size = runner._round_up_batch_size_with_draft_len(
+            widest_batch_size, planner.max_tier)
+        all_can_graph = all(int(payload[4]) for payload in payloads)
+        padding_needed = any(
+            int(payload[batch_size_index]) != common_padded_batch_size
+            for payload in payloads)
+        padding_supported = bool(
+            not padding_needed
+            or (runner.padding_enabled
+                and common_padded_batch_size <= runner.config.batch_size))
+        padding_ready = bool(
+            common_padded_batch_size > 0 and padding_supported and all(
+                int(payload[batch_size_index]) == common_padded_batch_size
+                or int(payload[padding_dummy_index]) for payload in payloads))
+        exact_policy_agreed = bool(
+            exact_table is not None
+            and all(int(payload[8]) for payload in payloads))
+        agreement = ADPShapeAgreement(
+            iteration=int(self.iter_counter),
+            batch_identity=id(scheduled_batch),
+            local_batch_size=int(scheduled_batch.batch_size),
+            peer_batch_sizes=peer_batch_sizes,
+            all_can_graph=all_can_graph,
+            widest_batch_size=widest_batch_size,
+            graph_batch_size=common_padded_batch_size,
+            draft_len=int(planner.max_tier),
+            padding_ready=padding_ready,
+        )
+        runner.adp_shape_agreement = agreement
+        if not agreement.can_queue:
+            # Queue admission failed globally, so this is not a decode step:
+            # do not advance step-level stats/staging or leave a
+            # half-published window. Planner decision-attempt counters may
+            # still describe this attempted agreement.
+            self.model_engine._dspark_device_budget = None
+            runner.agreed_ragged_bucket = None
+            runner.ragged_pad_verify_len = 0
+            for request in gen_requests:
+                request.py_verify_len = None
+                request.py_verify_cap = None
+            return int(planner.max_tier)
+
         # Resolve the exact cell after the same allgather has exposed common G
         # and every rank's expected yield. All ranks traverse payloads in the
         # same order, so this produces one deterministic V without another
@@ -3696,14 +3755,13 @@ class PyExecutor:
                 fallback_reason = "peer_not_graphable"
                 exact_local = None
             else:
-                expected_payload_len = 19 + len(exact_cells)
+                expected_payload_len = 21 + len(exact_cells)
                 if any(
                         len(payload) != expected_payload_len
                         or not int(payload[8]) for payload in payloads):
                     raise RuntimeError(
                         "DSpark exact SPS collective payloads disagree on the "
                         "measured (G,V) grid")
-                runner = self.model_engine.cuda_graph_runner
                 widest_rows = max(int(payload[1]) for payload in payloads)
                 common_graph_batch_size = runner._round_up_batch_size(
                     widest_rows)
@@ -3827,6 +3885,25 @@ class PyExecutor:
                     request.py_verify_len = int(window)
                 ragged_active = True
 
+        reuse_graph_shape = bool(exact_policy_agreed and runner.enabled
+                                 and all_can_graph and padding_ready
+                                 and not runner.config.use_mrope)
+        if reuse_graph_shape:
+            if (exact_shape is not None
+                    and exact_shape[0] != common_padded_batch_size):
+                raise RuntimeError(
+                    "DSpark exact policy selected a graph batch size that "
+                    "disagrees with the cached ADP padding shape")
+            if exact_shape is not None and bucket is None:
+                raise RuntimeError(
+                    "DSpark exact policy failed to publish its proven "
+                    "captured ragged shape")
+        runner.adp_shape_agreement = dataclasses.replace(
+            agreement,
+            ragged_bucket=None if bucket is None else int(bucket),
+            reuse_graph_shape=reuse_graph_shape,
+        )
+
         # Record what the step actually decided.
         if stats is not None:
             # Periodic summary: under TP the counters sit across an MPI
@@ -3925,6 +4002,17 @@ class PyExecutor:
         When dynamic draft length is not enabled, runtime_draft_len is simply
         set to max_draft_len (the static maximum).
         """
+        signature = (
+            int(self.iter_counter),
+            id(scheduled_batch),
+            int(scheduled_batch.batch_size),
+            int(scheduled_batch.num_context_requests),
+            int(scheduled_batch.num_generation_requests),
+        )
+        if getattr(self, "_dspark_dynamic_handled_signature",
+                   None) == signature:
+            return
+
         if not hasattr(self.model_engine, 'max_draft_len'):
             return
 
@@ -3959,6 +4047,14 @@ class PyExecutor:
                 runtime_draft_len = get_draft_len_for_batch_size(
                     spec_config.draft_len_schedule, scheduled_batch.batch_size,
                     self.model_engine.max_draft_len)
+            runner = self.model_engine.cuda_graph_runner
+            agreement = getattr(runner, "adp_shape_agreement", None)
+            if (agreement is not None and agreement.matches(
+                    scheduled_batch, self.iter_counter, padded=False)
+                    and not agreement.can_queue):
+                self.model_engine.runtime_draft_len = runtime_draft_len
+                self._dspark_dynamic_handled_signature = signature
+                return
             # 2. Pad or truncate draft tokens to the resolved length
             DRAFT_BUFFER_PAD = 0  # Buffer sentinel, not PARD mask_token_id.
             rejection_on = getattr(self.model_engine.spec_config,
@@ -4009,6 +4105,18 @@ class PyExecutor:
                 self.model_engine.max_draft_len
                 if spec_config is not None and spec_config.is_linear_tree else
                 self.model_engine.max_total_draft_tokens)
+        self._dspark_dynamic_handled_signature = signature
+
+    def _dspark_adp_shape_cache_enabled(self) -> bool:
+        runner = getattr(self.model_engine, "cuda_graph_runner", None)
+        return bool(
+            self.enable_attention_dp and self.dist is not None
+            and self.dist.tp_size > 1 and runner is not None
+            and getattr(self.model_engine, "_dspark_confidence_enabled", False)
+            and getattr(self, "kv_connector_manager", None) is None
+            and getattr(self, "kv_cache_transceiver", None) is None
+            and getattr(self, "drafter", None) is None
+            and getattr(self, "_pp_rebalance_drain_iters", None) is None)
 
     @nvtx_range("_can_queue")
     def _can_queue(self, scheduled_batch):
@@ -4016,6 +4124,40 @@ class PyExecutor:
         # can_queue_this_rank is for case that the batch is not empty on this rank, but empty on other ranks
         # For bs == 1, we cannot pad dummy request to make the batch non-empty since it will cause the batch size to be 2.
         # 1 for dummy request, 1 for the yet-to-complete but not-yet-updated request.
+        runner = getattr(self.model_engine, "cuda_graph_runner", None)
+        if self._dspark_adp_shape_cache_enabled():
+            signature = (
+                int(self.iter_counter),
+                id(scheduled_batch),
+                int(scheduled_batch.batch_size),
+                int(scheduled_batch.num_context_requests),
+                int(scheduled_batch.num_generation_requests),
+            )
+            if getattr(self, "_dspark_dynamic_handled_signature",
+                       None) != signature:
+                runner.adp_shape_agreement = None
+            self._handle_dynamic_draft_len(scheduled_batch)
+            agreement = runner.adp_shape_agreement
+            if (agreement is not None and agreement.matches(
+                    scheduled_batch, self.iter_counter, padded=False)):
+                can_queue = agreement.can_queue
+                can_queue_this_rank = agreement.can_queue_this_rank
+                if runner.adp_shape_debug:
+                    tp_batch_sizes = self.dist.tp_allgather(
+                        scheduled_batch.batch_size)
+                    if (can_queue != (0 not in tp_batch_sizes)
+                            or can_queue_this_rank
+                            != (scheduled_batch.batch_size > 0)):
+                        raise RuntimeError(
+                            "DSpark cached ADP queue agreement disagrees "
+                            "with the debug collective")
+                return can_queue, can_queue_this_rank
+        elif runner is not None:
+            # An optional surface (for example a KV connector) can invalidate
+            # the request set after policy selection. Never let an agreement
+            # from a prior eligible step leak into its graph lookup.
+            runner.adp_shape_agreement = None
+
         if self.enable_attention_dp:
             tp_batch_sizes = self.dist.tp_allgather(scheduled_batch.batch_size)
             can_queue = 0 not in tp_batch_sizes
