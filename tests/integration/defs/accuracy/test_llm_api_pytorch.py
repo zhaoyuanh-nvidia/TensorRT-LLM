@@ -4524,6 +4524,9 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
         # validation. Set it before constructing LLM so every MPI worker
         # inherits the same mode at planner initialization.
         monkeypatch.setenv("TLLM_DSPARK_DEVICE_WINDOWS", "1")
+        # This test asserts diagnostic counters through the profiling RPC;
+        # production keeps their per-request aggregation disabled by default.
+        monkeypatch.setenv("TLLM_DSPARK_DETAILED_STATS", "1")
         # The forced fraction below bypasses the economic argmax, so the table's
         # values cannot affect this correctness run. It still has to be valid and
         # non-flat because compact mode's production configuration contract
