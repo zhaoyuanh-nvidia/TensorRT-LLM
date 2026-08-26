@@ -75,7 +75,6 @@ from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionNamedToolChoiceParam, ChatCompletionRequest,
     ChatCompletionResponse, ChatCompletionResponseChoice, ChatMessage,
     CompletionRequest, CompletionResponse, CompletionResponseChoice,
-    DSparkVerifyLenPinRequest,
     EmbeddingRequest, EmbeddingResponse, EmbeddingResponseData,
     EmbeddingUsageInfo, ErrorResponse, ImageEditRequest, ImageGenerationRequest,
     ImageGenerationResponse, ImageObject, MemoryUpdateRequest, ModelCard,
@@ -1135,9 +1134,6 @@ class OpenAIServer(_VideoRoutesMixin):
         self.app.add_api_route("/server_info",
                                self.get_server_info,
                                methods=["GET"])
-        self.app.add_api_route("/dspark/verify_len_pin",
-                               self.set_dspark_verify_len_pin,
-                               methods=["POST"])
         if self.generator.args.return_perf_metrics:
             # register /prometheus/metrics
             self.mount_metrics()
@@ -2756,44 +2752,6 @@ class OpenAIServer(_VideoRoutesMixin):
         await self.generator.collective_rpc('update_weights',
                                             args=(request.weights, ))
         return JSONResponse(content={"status": "success"})
-
-    async def set_dspark_verify_len_pin(
-            self, request: DSparkVerifyLenPinRequest) -> JSONResponse:
-        """Pin (or clear) the DSpark verify length at runtime.
-
-        Lets a cost-table sweep walk the verify-length ladder against a
-        RUNNING server -- the shape each cell needs in order to be labelled --
-        instead of rebuilding the engine per length, which is what the
-        ``TLLM_DSPARK_FORCE_VERIFY_LEN`` environment variable requires and
-        which cannot reach ranks spawned before it was set. The pin takes
-        effect on the next decode step, simultaneously on every rank.
-        """
-        # Dispatched by CAPABILITY, not by type. trtllm-serve builds a
-        # PyTorchLLM, which carries the synchronous `_collective_rpc`; only the
-        # AsyncLLM entry point has the awaitable `collective_rpc`. Asserting
-        # the type (as the memory endpoints do) rejects the very deployment
-        # this knob exists to profile, and does it with a 500.
-        rpc = getattr(self.generator, "collective_rpc", None)
-        sync_rpc = getattr(self.generator, "_collective_rpc", None)
-        if rpc is None and sync_rpc is None:
-            return JSONResponse(
-                content={"error": "this server exposes no worker RPC channel, "
-                                  "so the verify-length pin cannot be set"},
-                status_code=400)
-        try:
-            if rpc is not None:
-                applied = await rpc('set_dspark_verify_len_pin',
-                                    args=(request.verify_len, ))
-            else:
-                applied = await asyncio.to_thread(
-                    sync_rpc, 'set_dspark_verify_len_pin',
-                    args=(request.verify_len, ))
-        except (ValueError, RuntimeError, NotImplementedError) as exc:
-            # A bad tier or a non-DSpark engine is a caller error, not a server
-            # fault: answer it rather than returning a 500 with a stack trace.
-            return JSONResponse(content={"error": str(exc)}, status_code=400)
-        value = applied[0] if isinstance(applied, list) and applied else applied
-        return JSONResponse(content={"verify_len": value})
 
     async def get_server_info(self) -> JSONResponse:
         # Note: calling self.generator.disaggregated_params and startup_metrics below
