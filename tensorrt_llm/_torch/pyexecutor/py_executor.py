@@ -108,6 +108,37 @@ if TYPE_CHECKING:
 _UNBOUNDED_STATS_MAX_LEN = -1
 _DSPARK_EXACT_WIRE_PREFIX_LEN = 19
 _DSPARK_ADP_WIRE_TRAILER_LEN = 3
+_DSPARK_EXACT_NATIVE_YIELD_INDEX = _DSPARK_EXACT_WIRE_PREFIX_LEN - 1
+
+
+def _decode_dspark_exact_expected_yields(
+    *,
+    payloads: List[List[int]],
+    exact_cells: Iterable[Tuple[int, int]],
+    graph_batch_size: int,
+    yield_scale: int,
+) -> Tuple[float, Dict[int, float]]:
+    """Decode globally aggregated exact-policy yields from the ADP wire."""
+    if yield_scale <= 0:
+        raise ValueError("DSpark exact-policy yield scale must be positive")
+    native_expected_yield = sum(
+        float(payload[_DSPARK_EXACT_NATIVE_YIELD_INDEX])
+        for payload in payloads) / yield_scale
+    compact_expected_yields = {}
+    for cell_index, (cell_graph_batch_size,
+                     verifier_budget) in enumerate(exact_cells):
+        if cell_graph_batch_size != graph_batch_size:
+            continue
+        rank_yields = [
+            float(payload[_DSPARK_EXACT_WIRE_PREFIX_LEN + cell_index])
+            for payload in payloads
+        ]
+        # A negative local value marks a cell that cannot fit that rank's
+        # mandatory real-row floor. Zero aggregate yield makes it ineligible.
+        compact_expected_yields[verifier_budget] = (0.0 if any(
+            value < 0.0
+            for value in rank_yields) else sum(rank_yields) / yield_scale)
+    return native_expected_yield, compact_expected_yields
 
 
 def _validate_dspark_exact_bucket(*, exact_shape, bucket,
@@ -3831,29 +3862,18 @@ class PyExecutor:
                 else:
                     from ..speculative.dspark_planner import \
                         select_exact_sps_candidate
-                    compact_expected_yields = {}
-                    for cell_index, (graph_batch_size,
-                                     verifier_budget) in enumerate(exact_cells):
-                        if graph_batch_size != common_graph_batch_size:
-                            continue
-                        rank_yields = [
-                            float(payload[_DSPARK_EXACT_WIRE_PREFIX_LEN +
-                                          cell_index]) for payload in payloads
-                        ]
-                        # A negative local value marks a cell that cannot fit
-                        # that rank's mandatory real-row floor. Giving it zero
-                        # aggregate yield makes it ineligible without changing
-                        # the exact selector's total measured-cell contract.
-                        compact_expected_yields[verifier_budget] = (
-                            0.0 if any(value < 0.0 for value in rank_yields)
-                            else sum(rank_yields) / exact_yield_scale)
+
                     # Goodput ratios were invariant to the fixed-point wire
                     # scale, but the iteration/drain shadow price is in
                     # milliseconds per predicted output token. Normalize the
                     # already aggregated yields before applying that policy.
-                    native_expected_yield = sum(
-                        float(payload[18])
-                        for payload in payloads) / exact_yield_scale
+                    (native_expected_yield, compact_expected_yields
+                     ) = _decode_dspark_exact_expected_yields(
+                         payloads=payloads,
+                         exact_cells=exact_cells,
+                         graph_batch_size=common_graph_batch_size,
+                         yield_scale=exact_yield_scale,
+                     )
                     selected_verifier_budget = select_exact_sps_candidate(
                         graph_batch_size=common_graph_batch_size,
                         native_expected_yield=native_expected_yield,
