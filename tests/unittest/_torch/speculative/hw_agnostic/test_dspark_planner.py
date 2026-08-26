@@ -19,6 +19,7 @@ import torch
 
 from tensorrt_llm._torch.speculative.dspark_planner import (
     ExactSpsCostTable,
+    ExactSpsDrainGuard,
     SpsCostTable,
     budget_argmax_over_uniform_lens,
     check_table_fingerprint,
@@ -42,6 +43,23 @@ from tensorrt_llm._torch.speculative.dspark_verify import (
 )
 
 BLOCK = 7
+
+
+def _drain_guard(
+    *,
+    tail_graph_batch_size=128,
+    loss_multiplier=1.0,
+    mean_output_tokens_per_request_iteration=10.0,
+    minimum_group_value_ms=0.0,
+    source_result_sha256="d" * 64,
+):
+    return ExactSpsDrainGuard(
+        loss_multiplier=loss_multiplier,
+        mean_output_tokens_per_request_iteration=(mean_output_tokens_per_request_iteration),
+        minimum_group_value_ms=minimum_group_value_ms,
+        tail_graph_batch_size=tail_graph_batch_size,
+        source_result_sha256=source_result_sha256,
+    )
 
 
 def _cfg(**kw) -> DSparkScheduleConfig:
@@ -351,6 +369,12 @@ def test_exact_cost_table_identity_covers_grid_costs_and_policy():
         minimum_predicted_gain=0.02,
     )
     changed_policy = ExactSpsCostTable(tables=tables, max_draft_len=5, minimum_predicted_gain=0.03)
+    guarded = ExactSpsCostTable(
+        tables=tables,
+        max_draft_len=5,
+        minimum_predicted_gain=0.02,
+        iteration_drain_guard=_drain_guard(tail_graph_batch_size=64),
+    )
 
     assert first.identity_sha256 == reordered.identity_sha256
     assert first.collective_identity_words == reordered.collective_identity_words
@@ -358,6 +382,23 @@ def test_exact_cost_table_identity_covers_grid_costs_and_policy():
     assert all(0 <= value <= 0xFFFFFFFF for value in first.collective_identity_words)
     assert first.identity_sha256 != changed_cost.identity_sha256
     assert first.identity_sha256 != changed_policy.identity_sha256
+    assert first.identity_sha256 != guarded.identity_sha256
+
+
+def test_iteration_drain_guard_rejects_invalid_or_unmeasured_metadata():
+    with pytest.raises(ValueError, match="loss_multiplier"):
+        _drain_guard(loss_multiplier=0.0)
+    with pytest.raises(ValueError, match="mean_output_tokens"):
+        _drain_guard(mean_output_tokens_per_request_iteration=float("nan"))
+    with pytest.raises(ValueError, match="minimum_group_value_ms"):
+        _drain_guard(minimum_group_value_ms=-0.1)
+
+    with pytest.raises(ValueError, match="measured native tail table for G=16"):
+        ExactSpsCostTable(
+            tables={128: SpsCostTable(token_counts=(0,), step_time_ms=(8.0,))},
+            max_draft_len=5,
+            iteration_drain_guard=_drain_guard(tail_graph_batch_size=16),
+        )
 
 
 def test_runtime_cost_install_rejects_a_second_different_object():
@@ -517,6 +558,44 @@ def test_schema_v2_validation_accepts_exact_runtime_grid():
     )
 
     assert fingerprint["source_head"] == "23b73d8"
+
+
+def test_schema_v2_loads_authenticated_iteration_drain_metadata(tmp_path):
+    payload = _multi_g_sps_payload()
+    payload["iteration_drain_guard"] = {
+        "loss_multiplier": 1.5,
+        "mean_output_tokens_per_request_iteration": 4.25,
+        "minimum_group_value_ms": 2.0,
+        "source_result_sha256": "d" * 64,
+        "tail_graph_batch_size": 64,
+    }
+    path = tmp_path / "multi-g-sps-with-drain-guard.json"
+    path.write_text(json.dumps(payload))
+
+    table, _ = _load_test_exact(path, payload)
+
+    assert table.iteration_drain_guard == _drain_guard(
+        tail_graph_batch_size=64,
+        loss_multiplier=1.5,
+        mean_output_tokens_per_request_iteration=4.25,
+        minimum_group_value_ms=2.0,
+    )
+
+
+def test_schema_v2_iteration_drain_metadata_requires_measured_tail_g(tmp_path):
+    payload = _multi_g_sps_payload()
+    payload["iteration_drain_guard"] = {
+        "loss_multiplier": 1.5,
+        "mean_output_tokens_per_request_iteration": 4.25,
+        "minimum_group_value_ms": 2.0,
+        "source_result_sha256": "d" * 64,
+        "tail_graph_batch_size": 16,
+    }
+    path = tmp_path / "multi-g-sps-missing-tail-g.json"
+    path.write_text(json.dumps(payload))
+
+    with pytest.raises(ValueError, match="measured native tail table for G=16"):
+        _load_test_exact(path, payload)
 
 
 def test_schema_v2_validation_requires_the_runtime_graph_grid():
@@ -711,6 +790,7 @@ def test_exact_selector_keeps_native_on_tie_or_below_threshold():
         tables={128: SpsCostTable(token_counts=(0, 704), step_time_ms=(10.0, 8.0))},
         max_draft_len=5,
         minimum_predicted_gain=0.02,
+        iteration_drain_guard=_drain_guard(),
     )
 
     assert (
@@ -747,6 +827,90 @@ def test_exact_selector_keeps_native_on_tie_or_below_threshold():
             compact_expected_yields={0: 10.0, 704: 8.24},
             cost_table=table,
         )
+
+
+def test_exact_selector_fails_closed_without_iteration_drain_metadata():
+    table = ExactSpsCostTable(
+        tables={128: SpsCostTable(token_counts=(0, 512), step_time_ms=(100.0, 80.0))},
+        max_draft_len=5,
+        minimum_predicted_gain=0.0,
+    )
+
+    # Compact has positive immediate expected goodput, but the table cannot
+    # price its workload-specific iteration loss.
+    assert (
+        select_exact_sps_candidate(
+            graph_batch_size=128,
+            native_expected_yield=10.0,
+            compact_expected_yields={512: 8.5},
+            cost_table=table,
+        )
+        == 0
+    )
+
+
+def test_exact_selector_applies_strict_iteration_drain_group_value():
+    table = ExactSpsCostTable(
+        tables={
+            16: SpsCostTable(token_counts=(0,), step_time_ms=(40.0,)),
+            128: SpsCostTable(token_counts=(0, 512), step_time_ms=(100.0, 80.0)),
+        },
+        max_draft_len=5,
+        minimum_predicted_gain=0.0,
+        iteration_drain_guard=_drain_guard(
+            tail_graph_batch_size=16,
+            loss_multiplier=1.5,
+            mean_output_tokens_per_request_iteration=5.0,
+            minimum_group_value_ms=2.0,
+        ),
+    )
+
+    # T(128,0)-T(128,512) - 1.5*(10-8.5)*T(16,0)/5 == 2ms.
+    # Equality is deliberately native.
+    assert (
+        select_exact_sps_candidate(
+            graph_batch_size=128,
+            native_expected_yield=10.0,
+            compact_expected_yields={512: 8.5},
+            cost_table=table,
+        )
+        == 0
+    )
+    # A 1.4-token predicted loss has group value 3.2ms and is admitted.
+    assert (
+        select_exact_sps_candidate(
+            graph_batch_size=128,
+            native_expected_yield=10.0,
+            compact_expected_yields={512: 8.6},
+            cost_table=table,
+        )
+        == 512
+    )
+
+
+@pytest.mark.parametrize("graph_batch_size", [16, 32, 64])
+def test_exact_selector_fails_closed_without_measured_compact_cell(graph_batch_size):
+    table = ExactSpsCostTable(
+        tables={
+            16: SpsCostTable(token_counts=(0,), step_time_ms=(40.0,)),
+            32: SpsCostTable(token_counts=(0,), step_time_ms=(55.0,)),
+            64: SpsCostTable(token_counts=(0,), step_time_ms=(70.0,)),
+            128: SpsCostTable(token_counts=(0, 512), step_time_ms=(100.0, 80.0)),
+        },
+        max_draft_len=5,
+        minimum_predicted_gain=0.0,
+        iteration_drain_guard=_drain_guard(tail_graph_batch_size=16),
+    )
+
+    assert (
+        select_exact_sps_candidate(
+            graph_batch_size=graph_batch_size,
+            native_expected_yield=10.0,
+            compact_expected_yields={},
+            cost_table=table,
+        )
+        == 0
+    )
 
 
 def test_exact_production_candidates_exclude_full_ragged_control():

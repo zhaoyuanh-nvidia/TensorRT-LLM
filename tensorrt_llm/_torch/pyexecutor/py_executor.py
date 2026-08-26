@@ -3872,11 +3872,16 @@ class PyExecutor:
                         # that rank's mandatory real-row floor. Giving it zero
                         # aggregate yield makes it ineligible without changing
                         # the exact selector's total measured-cell contract.
-                        compact_expected_yields[verifier_budget] = (0.0 if any(
-                            value < 0.0
-                            for value in rank_yields) else sum(rank_yields))
+                        compact_expected_yields[verifier_budget] = (
+                            0.0 if any(value < 0.0 for value in rank_yields)
+                            else sum(rank_yields) / exact_yield_scale)
+                    # Goodput ratios were invariant to the fixed-point wire
+                    # scale, but the iteration/drain shadow price is in
+                    # milliseconds per predicted output token. Normalize the
+                    # already aggregated yields before applying that policy.
                     native_expected_yield = sum(
-                        float(payload[18]) for payload in payloads)
+                        float(payload[18])
+                        for payload in payloads) / exact_yield_scale
                     selected_verifier_budget = select_exact_sps_candidate(
                         graph_batch_size=common_graph_batch_size,
                         native_expected_yield=native_expected_yield,
