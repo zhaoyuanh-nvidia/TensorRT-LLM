@@ -13,7 +13,11 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from tensorrt_llm._torch.speculative.dspark_observability import DSparkRaggedStats, RaggedVerifyMode
+from tensorrt_llm._torch.speculative.dspark_observability import (
+    STATS_LOG_INTERVAL_ENV,
+    DSparkRaggedStats,
+    RaggedVerifyMode,
+)
 from tensorrt_llm._torch.speculative.interface import apply_accept_caps
 
 MAX_DRAFT_LEN = 5
@@ -25,6 +29,29 @@ def _cap_stats(mode=RaggedVerifyMode.CAP_ACCEPT):
 
 def _compact_stats(max_draft_len=5):
     return DSparkRaggedStats(mode=RaggedVerifyMode.COMPACT, max_draft_len=max_draft_len)
+
+
+def test_periodic_summary_is_disabled_by_default(monkeypatch):
+    monkeypatch.delenv(STATS_LOG_INTERVAL_ENV, raising=False)
+    stats = _compact_stats()
+    for _ in range(4):
+        stats.record_step(num_gen_requests=1)
+        assert not stats.should_log_periodic_summary()
+
+
+def test_periodic_summary_interval_is_opt_in(monkeypatch):
+    monkeypatch.setenv(STATS_LOG_INTERVAL_ENV, "4")
+    stats = _compact_stats()
+    for step in range(1, 9):
+        stats.record_step(num_gen_requests=1)
+        assert stats.should_log_periodic_summary() is (step % 4 == 0)
+
+
+@pytest.mark.parametrize("value", ["bad", "-1"])
+def test_periodic_summary_interval_is_validated(monkeypatch, value):
+    monkeypatch.setenv(STATS_LOG_INTERVAL_ENV, value)
+    with pytest.raises(ValueError, match=STATS_LOG_INTERVAL_ENV):
+        _compact_stats()
 
 
 class _Meta:

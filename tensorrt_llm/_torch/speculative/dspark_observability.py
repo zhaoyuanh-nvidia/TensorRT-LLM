@@ -38,6 +38,7 @@ __all__ = [
 #: Overrides ``DSparkDecodingConfig``. Read per call, not cached at import:
 #: tests flip it with ``monkeypatch.setenv``.
 RAGGED_VERIFY_MODE_ENV = "TLLM_DSPARK_RAGGED_VERIFY_MODE"
+STATS_LOG_INTERVAL_ENV = "TLLM_DSPARK_STATS_LOG_INTERVAL"
 
 
 class RaggedVerifyMode(str, Enum):
@@ -114,6 +115,17 @@ class DSparkRaggedStats:
     def __init__(self, *, mode: RaggedVerifyMode, max_draft_len: int):
         self.mode = mode
         self.max_draft_len = int(max_draft_len)
+        raw_log_interval = os.environ.get(STATS_LOG_INTERVAL_ENV, "0").strip()
+        try:
+            self.log_interval = int(raw_log_interval)
+        except ValueError:
+            raise ValueError(
+                f"{STATS_LOG_INTERVAL_ENV}={raw_log_interval!r} is not an integer"
+            ) from None
+        if self.log_interval < 0:
+            raise ValueError(
+                f"{STATS_LOG_INTERVAL_ENV} must be nonnegative, got {self.log_interval}"
+            )
         #: Planner decision counters, attached by the worker once the planner
         #: exists; the only record of WHY a step declined to trim
         #: (`fallback_flat_cost` = no profiled SPS table, so no trimming).
@@ -186,6 +198,14 @@ class DSparkRaggedStats:
 
         #: Reasons the step declined to go ragged, keyed by a short slug.
         self.fallbacks: Counter = Counter()
+
+    def should_log_periodic_summary(self) -> bool:
+        """Whether this step should emit the opt-in periodic summary."""
+        return (
+            self.log_interval > 0
+            and self.steps_total > 0
+            and self.steps_total % self.log_interval == 0
+        )
 
     def record_step(
         self,

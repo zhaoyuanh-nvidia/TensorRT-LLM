@@ -152,6 +152,9 @@ class CUDAGraphRunner:
         self.max_supported_batch_size = config.max_cuda_graph_batch_size
         self.max_beam_width = config.max_beam_width
         self.spec_config = config.spec_config
+        from ..speculative.dspark_observability import trims_submitted_tokens
+        self._dspark_trims_submitted_tokens = trims_submitted_tokens(
+            self.spec_config)
         self.sparse_config = config.sparse_attention_config
         self.is_encoder_decoder = config.is_encoder_decoder
         self.enable_encoder_decoder_mixed_cuda_graph = (
@@ -421,8 +424,7 @@ class CUDAGraphRunner:
         """
         # Keyed on the MODE: `cap-accept` shares this config flag but never
         # shrinks the token axis, so it must keep the ordinary uniform key.
-        from ..speculative.dspark_observability import trims_submitted_tokens
-        if not trims_submitted_tokens(self.spec_config):
+        if not self._dspark_trims_submitted_tokens:
             return None
         # Windows can vanish between the fit and key derivation; a ragged key
         # over a window-less batch replays stale token-major row maps (IMA).
@@ -444,10 +446,9 @@ class CUDAGraphRunner:
         reports its max, differs from well-formed peers, and the gate
         declines the graph.
         """
-        return max(
-            (len(request.py_draft_tokens)
-             for request in batch.generation_requests),
-            default=0)
+        return max((len(request.py_draft_tokens)
+                    for request in batch.generation_requests),
+                   default=0)
 
     @staticmethod
     def _get_mrope_position_delta(request: Any) -> Optional[Any]:
@@ -531,9 +532,8 @@ class CUDAGraphRunner:
             ])
             is_all_gen_only = all(all_can_graph[0]
                                   for all_can_graph in all_can_graph_batch)
-            all_shapes_equal = all(
-                peer[1:] == all_can_graph_batch[0][1:]
-                for peer in all_can_graph_batch)
+            all_shapes_equal = all(peer[1:] == all_can_graph_batch[0][1:]
+                                   for peer in all_can_graph_batch)
 
             if not is_all_gen_only or not all_shapes_equal:
                 self.last_miss_reason = ("peer_not_gen_only"
@@ -827,7 +827,7 @@ class CUDAGraphRunner:
         if padded_bs not in self.supported_batch_sizes:
             return False
         if padded_bs == num_requests:
-            return True          # already at a captured size, nothing to add
+            return True  # already at a captured size, nothing to add
         # _get_padded_batch bails when padding_size + batch_size exceeds the
         # configured batch size; that sum is just padded_bs.
         return padded_bs <= self.config.batch_size
@@ -890,8 +890,8 @@ class CUDAGraphRunner:
             ragged = any(
                 getattr(request, "py_verify_len", None) is not None
                 for request in batch.generation_requests)
-            padding_dummy_request.py_verify_len = (
-                self.ragged_pad_verify_len if ragged else None)
+            padding_dummy_request.py_verify_len = (self.ragged_pad_verify_len
+                                                   if ragged else None)
             cap_accept = any(
                 getattr(request, "py_verify_cap", None) is not None
                 for request in batch.generation_requests)
