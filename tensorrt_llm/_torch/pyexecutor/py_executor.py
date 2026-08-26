@@ -107,6 +107,52 @@ if TYPE_CHECKING:
     from ray.actor import ActorHandle
 
 _UNBOUNDED_STATS_MAX_LEN = -1
+_DSPARK_EXACT_WIRE_PREFIX_LEN = 19
+_DSPARK_ADP_WIRE_TRAILER_LEN = 3
+
+
+def _validate_dspark_exact_bucket(*, exact_shape, bucket,
+                                  trims_submitted_tokens: bool) -> None:
+    """Validate the graph-key meaning of one exact DSpark decision."""
+    if exact_shape is None:
+        return
+    expected_bucket = int(exact_shape[1])
+    if trims_submitted_tokens:
+        if bucket is None or int(bucket) != expected_bucket:
+            raise RuntimeError(
+                "DSpark exact compact policy did not publish its selected "
+                f"captured verifier bucket V={expected_bucket}; got {bucket}")
+    elif bucket is not None:
+        raise RuntimeError(
+            "DSpark cap-accept policy must keep the uniform CUDA-graph key; "
+            f"got ragged verifier bucket {bucket}")
+
+
+def _validate_dspark_adp_debug_flags(payloads, debug_index: int) -> bool:
+    """Require the debug-only collective protocol to match on every rank."""
+    flags = tuple(int(payload[debug_index]) for payload in payloads)
+    if any(flag not in (0, 1) for flag in flags):
+        raise RuntimeError(
+            "DSpark ADP agreement debug flags must be encoded as 0 or 1")
+    if len(set(flags)) != 1:
+        raise RuntimeError(
+            "DSpark ranks disagree on TLLM_DSPARK_ADP_SHAPE_DEBUG; this "
+            "option changes collective ordering and must match on every rank")
+    return bool(flags[0])
+
+
+def _validate_dspark_adp_acceptance_gate(
+        *, confidence_enabled: bool, attention_dp_enabled: bool,
+        speculation_gate_enabled: bool) -> None:
+    """Reject a rank-local gate that can split the ADP collective protocol."""
+    if (confidence_enabled and attention_dp_enabled
+            and speculation_gate_enabled):
+        raise ValueError(
+            "DSpark confidence scheduling with attention DP does not support "
+            "acceptance_rate_window_size/acceptance_rate_threshold: the "
+            "per-rank SpeculationGate can disable speculation at different "
+            "iterations and break collective ordering. Disable the acceptance "
+            "gate for this configuration.")
 
 
 class _ADPForwardIntent(IntEnum):
@@ -558,6 +604,12 @@ class PyExecutor:
             threshold = getattr(spec_config, 'acceptance_rate_threshold', None)
             if window and threshold is not None:
                 self.speculation_gate = SpeculationGate(window, threshold)
+        _validate_dspark_adp_acceptance_gate(
+            confidence_enabled=getattr(self.model_engine,
+                                       "_dspark_confidence_enabled", False),
+            attention_dp_enabled=self.enable_attention_dp,
+            speculation_gate_enabled=self.speculation_gate is not None,
+        )
 
         # response used data
         self.response_lock = threading.Lock()
@@ -3612,7 +3664,7 @@ class PyExecutor:
         # appends [has_exact_table, exact_ready, exact_cell_count,
         # table_sha256_as_8_u32, native_yield,
         # yield_for_each_stable_(G,V)_cell, scheduled_batch_size,
-        # padding_dummy_cached]. Carrying the authenticated table
+        # padding_dummy_cached, adp_shape_debug]. Carrying the authenticated table
         # identity is mandatory: equal vector lengths do not prove that ranks
         # assign the same (G,V) or T(G,V) to each position.
         # `can_graph` rides along because the ragged
@@ -3665,6 +3717,7 @@ class PyExecutor:
             int(scheduled_batch.batch_size),
             1 if planner.max_tier in getattr(runner, "padding_dummy_requests",
                                              {}) else 0,
+            1 if runner.adp_shape_debug else 0,
         ])
         if is_distributed:
             payloads = self.dist.tp_allgather(local_payload)
@@ -3691,8 +3744,9 @@ class PyExecutor:
                     for payload in payloads
                 ]
                 payload_shapes_valid = all(
-                    len(payload) == 21 + int(payload[9])
-                    for payload in payloads)
+                    len(payload) == (_DSPARK_EXACT_WIRE_PREFIX_LEN +
+                                     _DSPARK_ADP_WIRE_TRAILER_LEN +
+                                     int(payload[9])) for payload in payloads)
                 if (not payload_shapes_valid or len(set(exact_cell_counts)) != 1
                         or len(set(exact_identities)) != 1):
                     raise RuntimeError(
@@ -3722,12 +3776,16 @@ class PyExecutor:
             planner.adopt_verify_len_pin(planner.pending_verify_len_pin())
             planner.adopt_budget_frac(planner.pending_budget_frac())
 
-        exact_payload_end = 19 + len(exact_cells)
+        exact_payload_end = _DSPARK_EXACT_WIRE_PREFIX_LEN + len(exact_cells)
         batch_size_index = exact_payload_end
         padding_dummy_index = exact_payload_end + 1
-        if any(len(payload) != exact_payload_end + 2 for payload in payloads):
+        debug_index = exact_payload_end + 2
+        if any(
+                len(payload) != exact_payload_end + _DSPARK_ADP_WIRE_TRAILER_LEN
+                for payload in payloads):
             raise RuntimeError(
                 "DSpark ADP agreement payload has an inconsistent shape")
+        _validate_dspark_adp_debug_flags(payloads, debug_index)
         peer_batch_sizes = tuple(
             int(payload[batch_size_index]) for payload in payloads)
         widest_batch_size = max(peer_batch_sizes, default=0)
@@ -3783,7 +3841,9 @@ class PyExecutor:
                 fallback_reason = "peer_not_graphable"
                 exact_local = None
             else:
-                expected_payload_len = 21 + len(exact_cells)
+                expected_payload_len = (_DSPARK_EXACT_WIRE_PREFIX_LEN +
+                                        _DSPARK_ADP_WIRE_TRAILER_LEN +
+                                        len(exact_cells))
                 if any(
                         len(payload) != expected_payload_len
                         or not int(payload[8]) for payload in payloads):
@@ -3805,8 +3865,8 @@ class PyExecutor:
                         if graph_batch_size != common_graph_batch_size:
                             continue
                         rank_yields = [
-                            float(payload[19 + cell_index])
-                            for payload in payloads
+                            float(payload[_DSPARK_EXACT_WIRE_PREFIX_LEN +
+                                          cell_index]) for payload in payloads
                         ]
                         # A negative local value marks a cell that cannot fit
                         # that rank's mandatory real-row floor. Giving it zero
@@ -3916,16 +3976,17 @@ class PyExecutor:
         reuse_graph_shape = bool(exact_policy_agreed and runner.enabled
                                  and all_can_graph and padding_ready
                                  and not runner.config.use_mrope)
+        _validate_dspark_exact_bucket(
+            exact_shape=exact_shape,
+            bucket=bucket,
+            trims_submitted_tokens=mode.trims_submitted_tokens,
+        )
         if reuse_graph_shape:
             if (exact_shape is not None
                     and exact_shape[0] != common_padded_batch_size):
                 raise RuntimeError(
                     "DSpark exact policy selected a graph batch size that "
                     "disagrees with the cached ADP padding shape")
-            if exact_shape is not None and bucket is None:
-                raise RuntimeError(
-                    "DSpark exact policy failed to publish its proven "
-                    "captured ragged shape")
         runner.adp_shape_agreement = dataclasses.replace(
             agreement,
             ragged_bucket=None if bucket is None else int(bucket),

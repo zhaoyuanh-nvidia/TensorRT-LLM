@@ -1108,6 +1108,10 @@ class CUDAGraphRunner:
         dummy_request = self.padding_dummy_requests.pop(runtime_draft_len, None)
         if dummy_request is None:
             return False
+        # The cached ADP agreement authenticated this dummy's presence. A
+        # rebalance may release it between iterations; invalidate the local
+        # agreement before another batch can suppress the padding collective.
+        self.adp_shape_agreement = None
         for manager in self._padding_dummy_managers(resource_manager):
             manager.free_resources(dummy_request)
         return True
@@ -1266,6 +1270,7 @@ class CUDAGraphRunner:
         self.graph_outputs.clear()
         self.graph_metadata.clear()
         self.padding_dummy_requests = {}
+        self.adp_shape_agreement = None
         del self.memory_pool
         self.memory_pool = None
         torch.cuda.empty_cache()
