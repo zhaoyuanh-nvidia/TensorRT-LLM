@@ -1806,9 +1806,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     source.add_argument(
         "--base-url",
-        help="Sweep a RUNNING trtllm-serve instead of building an engine. The "
-        "verify length is pinned over /dspark/verify_len_pin, so walking "
-        "the ladder costs no engine rebuild.",
+        help="Sweep a RUNNING experimental trtllm-serve build instead of "
+        "building an engine. This mode requires the benchmark-only "
+        "/dspark/verify_len_pin control endpoint, which is intentionally not "
+        "registered by the production server.",
     )
     source.add_argument(
         "--control-url",
@@ -2262,10 +2263,11 @@ def samples_from_server(
 ) -> List[StepSample]:
     """Sweep a RUNNING server: pin the window over HTTP, then read /metrics.
 
-    The equivalent of SGLang's profiler loop, and the reason
-    ``/dspark/verify_len_pin`` exists: walking the verify-length ladder no
-    longer costs an engine rebuild per rung, and the engine being measured is
-    by construction the engine that will consume the table.
+    This benchmark-only mode expects an experimental server build that exposes
+    ``/dspark/verify_len_pin``. The production server does not register that
+    scheduler-bypassing endpoint. Walking the ladder then avoids an engine
+    rebuild per rung, and the engine being measured is by construction the
+    engine that will consume the table.
 
     Load is synthetic (random token ids, ignore_eos) because a cell has to hold
     a fixed batch size for long enough to measure it; the SHAPE is what the
@@ -2524,7 +2526,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             raise SystemExit(
                 "the server sweep collected nothing. Check that /metrics "
                 "returns iteration stats (enable_iter_perf_stats) and that "
-                "/dspark/verify_len_pin exists on this build."
+                "the benchmark-only /dspark/verify_len_pin overlay is "
+                "present on this experimental build."
             )
         _write_samples(samples_out, samples)
         print(f"[dspark-sps] {len(samples)} steps from {args.base_url}", file=sys.stderr)
