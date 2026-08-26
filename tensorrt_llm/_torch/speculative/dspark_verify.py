@@ -71,6 +71,10 @@ DEVICE_WINDOWS_ENV = "TLLM_DSPARK_DEVICE_WINDOWS"
 #: whose step time is dominated by prefill compute; this isolates that effect.
 SKIP_MIXED_TRIM_ENV = "TLLM_DSPARK_SKIP_MIXED_TRIM"
 
+#: Opt-in snapshot diagnostics. The detailed histograms perform host tensor
+#: scans and materialize Python lists, so production keeps them disabled.
+DETAILED_STATS_ENV = "TLLM_DSPARK_DETAILED_STATS"
+
 
 def device_windows_enabled() -> bool:
     """Whether device-side window selection is on (process-constant env)."""
@@ -156,12 +160,18 @@ class DSparkVerifyPlanner:
         tiers: Optional[Sequence[int]] = None,
         apply_calibration: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
         all_rank_max: Optional[Callable[[int], int]] = None,
+        detailed_stats: Optional[bool] = None,
     ):
         self.cfg = cfg
         self.cost_table = cost_table
         self.tiers: List[int] = sorted({int(t) for t in (tiers or [cfg.resolved_max_verify_len])})
         self.apply_calibration = apply_calibration or torch.sigmoid
         self.all_rank_max = all_rank_max
+        self.detailed_stats = (
+            os.environ.get(DETAILED_STATS_ENV, "0") == "1"
+            if detailed_stats is None
+            else bool(detailed_stats)
+        )
 
         # Profiling pin, read once at init: constant per process and forwarded
         # to every worker at spawn, so all ranks agree without a collective.
@@ -587,6 +597,8 @@ class DSparkVerifyPlanner:
         ``stamps``/``staged_seq`` override the current snapshot's pair when the
         caller read the older (lag-2) one.
         """
+        if not self.detailed_stats:
+            return
         try:
             stamps = self._host_stamps if stamps is None else stamps
             staged_seq = self._staged_seq if staged_seq is None else staged_seq
