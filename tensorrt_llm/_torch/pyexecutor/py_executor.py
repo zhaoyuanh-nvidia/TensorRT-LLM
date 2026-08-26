@@ -2582,6 +2582,11 @@ class PyExecutor:
         if recorder is not None:
             recorder.flush()
         if stats is None or not stats.steps_total:
+            planner = getattr(worker(), "verify_planner", None) if worker else None
+            planner_stats = getattr(planner, "stats", None)
+            if planner_stats and planner_stats.get("decisions", 0):
+                logger.info(
+                    f"DSpark confidence planner [final]: {planner_stats}")
             return
         stats.log_summary(prefix="DSpark ragged verify [final]")
 
@@ -3593,6 +3598,11 @@ class PyExecutor:
         # The mode, not the config flag, decides whether windows are computed;
         # every counter below is keyed off the same decision.
         stats = worker.ragged_stats
+        if self.sampler is not None:
+            # Correctness, not observability: mixed ragged steps omit the
+            # device verify-lens output and need the overlap-safe host snapshot
+            # even when detailed counters are disabled in production.
+            self.sampler.policy_windows_enabled = True
         # Wire the worker's counters into the sampler here, where both are
         # reachable: acceptance is only observable host-side in the sampler.
         if (stats is not None and self.sampler is not None

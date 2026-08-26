@@ -558,15 +558,18 @@ class DSv4DSparkWorker(SpecWorkerBase):
             ragged_mode=self.ragged_verify_mode.value,
         )
 
-        self.ragged_stats = DSparkRaggedStats(
-            mode=self.ragged_verify_mode, max_draft_len=block_size
-        )
-        # Shared (not copied) so the summary stays live.
-        self.ragged_stats.planner_stats = self.verify_planner.stats
+        self.ragged_stats: Optional[DSparkRaggedStats] = None
+        if self.verify_planner.detailed_stats:
+            self.ragged_stats = DSparkRaggedStats(
+                mode=self.ragged_verify_mode, max_draft_len=block_size
+            )
+            # Shared (not copied) so the summary stays live.
+            self.ragged_stats.planner_stats = self.verify_planner.stats
         logger.info(
             f"DSpark verify planner: tiers={self.verify_planner.tiers}, "
             f"profiled_cost_table={cost_table is None or not cost_table.is_flat}, "
-            f"ragged_verify_mode={self.ragged_verify_mode.value}"
+            f"ragged_verify_mode={self.ragged_verify_mode.value}, "
+            f"detailed_stats={self.verify_planner.detailed_stats}"
         )
         if (
             self.ragged_verify_mode.trims_submitted_tokens

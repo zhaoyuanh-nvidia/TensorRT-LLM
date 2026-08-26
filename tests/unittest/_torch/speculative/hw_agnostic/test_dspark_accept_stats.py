@@ -258,7 +258,7 @@ def test_static_sampler_path_skips_optional_dspark_device_and_host_work():
     assert 'if o_verify_lens is not None:' in src
     assert 'cap_trim_lens=host_cap_trim_lens' in src
     assert 'verify_lens=host_verify_lens' in src
-    assert 'self.acceptance_stats is not None or o_verify_lens is not None' in src
+    assert 'self.policy_windows_enabled or o_verify_lens is not None' in src
 
 
 def test_mixed_ragged_step_snapshots_windows_without_device_output():
