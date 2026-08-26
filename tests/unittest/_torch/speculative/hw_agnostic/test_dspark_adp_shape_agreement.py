@@ -8,7 +8,14 @@ from types import SimpleNamespace
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import ADPShapeAgreement, CUDAGraphRunner
-from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+from tensorrt_llm._torch.pyexecutor.py_executor import (
+    _DSPARK_ADP_WIRE_TRAILER_LEN,
+    _DSPARK_EXACT_WIRE_PREFIX_LEN,
+    PyExecutor,
+    _validate_dspark_adp_acceptance_gate,
+    _validate_dspark_adp_debug_flags,
+    _validate_dspark_exact_bucket,
+)
 
 
 class _Batch:
@@ -57,6 +64,89 @@ def test_agreement_is_bound_to_iteration_identity_and_padding_phase():
     batch.generation_requests.append(object())
     assert agreement.matches(batch, 9, padded=True)
     assert not agreement.matches(batch, 9, padded=False)
+
+
+@pytest.mark.parametrize(
+    ("trims", "bucket"),
+    [(True, 22), (False, None)],
+)
+def test_exact_bucket_invariant_accepts_compact_and_cap_accept(trims, bucket):
+    _validate_dspark_exact_bucket(
+        exact_shape=(4, 22, 4),
+        bucket=bucket,
+        trims_submitted_tokens=trims,
+    )
+
+
+@pytest.mark.parametrize(
+    ("trims", "bucket", "message"),
+    [
+        (True, None, "compact policy"),
+        (True, 21, "compact policy"),
+        (False, 22, "cap-accept policy"),
+    ],
+)
+def test_exact_bucket_invariant_rejects_wrong_graph_key(trims, bucket, message):
+    with pytest.raises(RuntimeError, match=message):
+        _validate_dspark_exact_bucket(
+            exact_shape=(4, 22, 4),
+            bucket=bucket,
+            trims_submitted_tokens=trims,
+        )
+
+
+@pytest.mark.parametrize(("trims", "bucket"), [(True, 22), (False, None)])
+def test_non_exact_policy_has_no_bucket_constraint(trims, bucket):
+    _validate_dspark_exact_bucket(
+        exact_shape=None,
+        bucket=bucket,
+        trims_submitted_tokens=trims,
+    )
+
+
+@pytest.mark.parametrize(
+    ("confidence", "attention_dp", "gate"),
+    [(False, True, True), (True, False, True), (True, True, False)],
+)
+def test_acceptance_gate_validation_is_noop_when_a_feature_is_off(confidence, attention_dp, gate):
+    _validate_dspark_adp_acceptance_gate(
+        confidence_enabled=confidence,
+        attention_dp_enabled=attention_dp,
+        speculation_gate_enabled=gate,
+    )
+
+
+def test_acceptance_gate_validation_rejects_rank_local_adp_disable():
+    with pytest.raises(ValueError, match="acceptance_rate_window_size"):
+        _validate_dspark_adp_acceptance_gate(
+            confidence_enabled=True,
+            attention_dp_enabled=True,
+            speculation_gate_enabled=True,
+        )
+
+
+def test_debug_flag_uses_the_final_adp_payload_field():
+    exact_cells = 2
+    payload_len = _DSPARK_EXACT_WIRE_PREFIX_LEN + exact_cells + _DSPARK_ADP_WIRE_TRAILER_LEN
+    debug_index = payload_len - 1
+    assert payload_len == 22 + exact_cells
+    assert debug_index == 21 + exact_cells
+    payloads = [[0] * payload_len for _ in range(2)]
+    payloads[0][debug_index] = payloads[1][debug_index] = 1
+    assert _validate_dspark_adp_debug_flags(payloads, debug_index)
+
+
+def test_debug_flag_disagreement_fails_identically_after_policy_collective():
+    debug_index = _DSPARK_EXACT_WIRE_PREFIX_LEN + 2
+    payloads = [[0] * (debug_index + 1) for _ in range(2)]
+    payloads[1][debug_index] = 1
+    with pytest.raises(RuntimeError, match="collective ordering"):
+        _validate_dspark_adp_debug_flags(payloads, debug_index)
+
+
+def test_debug_flag_rejects_non_boolean_wire_value():
+    with pytest.raises(RuntimeError, match="encoded as 0 or 1"):
+        _validate_dspark_adp_debug_flags([[2]], 0)
 
 
 def test_can_queue_reuses_policy_agreement_without_another_collective():
@@ -174,3 +264,19 @@ def test_padding_reuses_only_a_finalized_ready_agreement():
     assert CUDAGraphRunner._get_padded_batch(runner, batch, SimpleNamespace(), 5) == 1
     assert batch.batch_size == 4
     assert batch.generation_requests[-1] is dummy
+
+
+def test_releasing_padding_dummy_invalidates_cached_agreement():
+    batch = _Batch([object()] * 3)
+    dummy = object()
+    freed = []
+    manager = SimpleNamespace(free_resources=freed.append)
+    runner = SimpleNamespace(
+        padding_dummy_requests={5: dummy},
+        adp_shape_agreement=_agreement(batch),
+        _padding_dummy_managers=lambda _resource_manager: [manager],
+    )
+
+    assert CUDAGraphRunner.release_padding_dummy(runner, object(), 5)
+    assert runner.adp_shape_agreement is None
+    assert freed == [dummy]
