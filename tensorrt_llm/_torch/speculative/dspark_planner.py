@@ -45,6 +45,7 @@ _MAX_EXACT_COMPACT_CELLS_PER_G = 4
 _MAX_EXACT_COMPACT_CELLS_TOTAL = 32
 
 __all__ = [
+    "ExactSpsDrainGuard",
     "ExactSpsCostTable",
     "SpsCostTable",
     "check_table_fingerprint",
@@ -173,6 +174,67 @@ class SpsCostTable:
 
 
 @dataclass(frozen=True)
+class ExactSpsDrainGuard:
+    """Measured policy metadata for conservative group-E2E admission.
+
+    ``mean_output_tokens_per_request_iteration`` must come from a matched
+    workload trace, while ``tail_graph_batch_size`` identifies the measured
+    native ``T(G, 0)`` tail cell in the same exact cost table.  Keeping both
+    values in the authenticated table metadata prevents serving code from
+    silently reusing trace-specific constants on another workload.
+    """
+
+    loss_multiplier: float
+    mean_output_tokens_per_request_iteration: float
+    minimum_group_value_ms: float
+    tail_graph_batch_size: int
+    source_result_sha256: str
+
+    def __post_init__(self) -> None:
+        loss_multiplier = _require_positive_finite_number(
+            self.loss_multiplier, field="iteration drain loss_multiplier"
+        )
+        mean_output_tokens = _require_positive_finite_number(
+            self.mean_output_tokens_per_request_iteration,
+            field="iteration drain mean_output_tokens_per_request_iteration",
+        )
+        minimum_group_value_ms = _require_nonnegative_finite_number(
+            self.minimum_group_value_ms,
+            field="iteration drain minimum_group_value_ms",
+        )
+        tail_graph_batch_size = _require_exact_int(
+            self.tail_graph_batch_size,
+            field="iteration drain tail_graph_batch_size",
+            minimum=1,
+        )
+        source_result_sha256 = _require_sha256(
+            self.source_result_sha256,
+            field="iteration drain source_result_sha256",
+        )
+        object.__setattr__(self, "loss_multiplier", loss_multiplier)
+        object.__setattr__(
+            self,
+            "mean_output_tokens_per_request_iteration",
+            mean_output_tokens,
+        )
+        object.__setattr__(self, "minimum_group_value_ms", minimum_group_value_ms)
+        object.__setattr__(self, "tail_graph_batch_size", tail_graph_batch_size)
+        object.__setattr__(self, "source_result_sha256", source_result_sha256)
+
+    def identity_payload(self) -> dict[str, object]:
+        """Canonical fields included in all-rank table agreement."""
+        return {
+            "loss_multiplier": self.loss_multiplier,
+            "mean_output_tokens_per_request_iteration": (
+                self.mean_output_tokens_per_request_iteration
+            ),
+            "minimum_group_value_ms": self.minimum_group_value_ms,
+            "source_result_sha256": self.source_result_sha256,
+            "tail_graph_batch_size": self.tail_graph_batch_size,
+        }
+
+
+@dataclass(frozen=True)
 class ExactSpsCostTable:
     """Directly measured whole-step costs keyed by exact ``(G, V)``.
 
@@ -190,6 +252,7 @@ class ExactSpsCostTable:
     tables: dict[int, SpsCostTable]
     max_draft_len: int
     minimum_predicted_gain: float = 0.01
+    iteration_drain_guard: Optional[ExactSpsDrainGuard] = None
     identity_sha256: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -262,6 +325,15 @@ class ExactSpsCostTable:
             self.minimum_predicted_gain, field="minimum_predicted_gain"
         )
         object.__setattr__(self, "minimum_predicted_gain", minimum_predicted_gain)
+        iteration_drain_guard = self.iteration_drain_guard
+        if iteration_drain_guard is not None:
+            if not isinstance(iteration_drain_guard, ExactSpsDrainGuard):
+                raise TypeError("iteration_drain_guard must be an ExactSpsDrainGuard or None")
+            if iteration_drain_guard.tail_graph_batch_size not in normalized:
+                raise ValueError(
+                    "Iteration drain guard requires a measured native tail table for "
+                    f"G={iteration_drain_guard.tail_graph_batch_size}"
+                )
         # This is the rank-agreement identity used on every exact scheduling
         # step. It covers the canonical ordered grid, every measured cost, K,
         # and the minimum-gain policy. Two artifacts that merely have the same
@@ -270,6 +342,11 @@ class ExactSpsCostTable:
             "schema": "exact-sps-runtime-v1",
             "max_draft_len": max_draft_len,
             "minimum_predicted_gain": minimum_predicted_gain,
+            "iteration_drain_guard": (
+                iteration_drain_guard.identity_payload()
+                if iteration_drain_guard is not None
+                else None
+            ),
             "tables": [
                 {
                     "graph_batch_size": graph_batch_size,
@@ -476,12 +553,40 @@ def _build_exact_sps_cost_table(
                 for value in exact_payload["step_time_ms"]
             ),
         )
+    drain_guard_payload = payload.get("iteration_drain_guard")
+    iteration_drain_guard = None
+    if drain_guard_payload is not None:
+        assert isinstance(drain_guard_payload, dict)
+        iteration_drain_guard = ExactSpsDrainGuard(
+            loss_multiplier=_require_positive_finite_number(
+                drain_guard_payload["loss_multiplier"],
+                field="iteration drain loss_multiplier",
+            ),
+            mean_output_tokens_per_request_iteration=_require_positive_finite_number(
+                drain_guard_payload["mean_output_tokens_per_request_iteration"],
+                field="iteration drain mean_output_tokens_per_request_iteration",
+            ),
+            minimum_group_value_ms=_require_nonnegative_finite_number(
+                drain_guard_payload["minimum_group_value_ms"],
+                field="iteration drain minimum_group_value_ms",
+            ),
+            tail_graph_batch_size=_require_json_int(
+                drain_guard_payload["tail_graph_batch_size"],
+                field="iteration drain tail_graph_batch_size",
+                minimum=1,
+            ),
+            source_result_sha256=_require_sha256(
+                drain_guard_payload["source_result_sha256"],
+                field="iteration drain source_result_sha256",
+            ),
+        )
     return ExactSpsCostTable(
         tables=parsed_tables,
         max_draft_len=max_draft_len,
         minimum_predicted_gain=_require_nonnegative_finite_number(
             payload["minimum_predicted_gain"], field="minimum_predicted_gain"
         ),
+        iteration_drain_guard=iteration_drain_guard,
     )
 
 
@@ -498,6 +603,7 @@ _V2_TOP_LEVEL_FIELDS = {
     "minimum_predicted_gain",
     "schema_version",
 }
+_V2_OPTIONAL_TOP_LEVEL_FIELDS = {"iteration_drain_guard"}
 _V2_MARKER_FIELDS = {
     "cost_tables",
     "engine_fingerprint",
@@ -506,6 +612,13 @@ _V2_MARKER_FIELDS = {
     "schema_version",
 }
 _V2_TABLE_FIELDS = {"step_time_ms", "token_counts"}
+_V2_DRAIN_GUARD_FIELDS = {
+    "loss_multiplier",
+    "mean_output_tokens_per_request_iteration",
+    "minimum_group_value_ms",
+    "source_result_sha256",
+    "tail_graph_batch_size",
+}
 _V2_MEASUREMENT_FIELDS = {
     "rank_local_graph_batch_size",
     "rank_local_verifier_budget",
@@ -526,7 +639,13 @@ _V2_FINGERPRINT_FIELDS = {
 }
 
 
-def _validate_exact_fields(value: object, *, name: str, fields: set[str]) -> dict[str, object]:
+def _validate_exact_fields(
+    value: object,
+    *,
+    name: str,
+    fields: set[str],
+    optional_fields: Optional[set[str]] = None,
+) -> dict[str, object]:
     if not isinstance(value, dict):
         raise TypeError(f"{name} must be a JSON object")
     non_string_keys = [key for key in value if not isinstance(key, str)]
@@ -535,7 +654,7 @@ def _validate_exact_fields(value: object, *, name: str, fields: set[str]) -> dic
     missing = sorted(fields - value.keys())
     if missing:
         raise ValueError(f"{name} is missing required fields: " + ", ".join(missing))
-    unknown = sorted(value.keys() - fields)
+    unknown = sorted(value.keys() - fields - (optional_fields or set()))
     if unknown:
         raise ValueError(f"{name} has unknown fields: " + ", ".join(unknown))
     null_fields = sorted(key for key, item in value.items() if item is None)
@@ -545,7 +664,12 @@ def _validate_exact_fields(value: object, *, name: str, fields: set[str]) -> dic
 
 
 def _validate_v2_shape(payload: dict[str, object]) -> None:
-    _validate_exact_fields(payload, name="schema-v2 SPS artifact", fields=_V2_TOP_LEVEL_FIELDS)
+    _validate_exact_fields(
+        payload,
+        name="schema-v2 SPS artifact",
+        fields=_V2_TOP_LEVEL_FIELDS,
+        optional_fields=_V2_OPTIONAL_TOP_LEVEL_FIELDS,
+    )
     exact_tables = payload["cost_tables"]
     if not isinstance(exact_tables, dict) or not exact_tables:
         raise TypeError("SPS cost_tables must be a non-empty object keyed by graph batch size")
@@ -596,6 +720,34 @@ def _validate_v2_shape(payload: dict[str, object]) -> None:
     _require_nonnegative_finite_number(
         payload["minimum_predicted_gain"], field="minimum_predicted_gain"
     )
+    drain_guard = payload.get("iteration_drain_guard")
+    if drain_guard is not None:
+        drain_guard = _validate_exact_fields(
+            drain_guard,
+            name="SPS iteration_drain_guard",
+            fields=_V2_DRAIN_GUARD_FIELDS,
+        )
+        _require_positive_finite_number(
+            drain_guard["loss_multiplier"],
+            field="iteration drain loss_multiplier",
+        )
+        _require_positive_finite_number(
+            drain_guard["mean_output_tokens_per_request_iteration"],
+            field="iteration drain mean_output_tokens_per_request_iteration",
+        )
+        _require_nonnegative_finite_number(
+            drain_guard["minimum_group_value_ms"],
+            field="iteration drain minimum_group_value_ms",
+        )
+        _require_json_int(
+            drain_guard["tail_graph_batch_size"],
+            field="iteration drain tail_graph_batch_size",
+            minimum=1,
+        )
+        _require_sha256(
+            drain_guard["source_result_sha256"],
+            field="iteration drain source_result_sha256",
+        )
     measurements = payload["measurements"]
     if not isinstance(measurements, list) or not measurements:
         raise TypeError("SPS measurements must be a non-empty list")
@@ -809,6 +961,19 @@ def validate_sps_cost_table_payload(
         _parse_graph_batch_size_key(graph_batch_size): table_payload
         for graph_batch_size, table_payload in exact_tables.items()
     }
+    drain_guard = payload.get("iteration_drain_guard")
+    if drain_guard is not None:
+        assert isinstance(drain_guard, dict)
+        tail_graph_batch_size = _require_json_int(
+            drain_guard["tail_graph_batch_size"],
+            field="iteration drain tail_graph_batch_size",
+            minimum=1,
+        )
+        if tail_graph_batch_size not in measured_tables:
+            raise ValueError(
+                "Iteration drain guard requires a measured native tail table for "
+                f"G={tail_graph_batch_size}"
+            )
     fingerprint_graph_batch_sizes = set(fingerprint["rank_local_graph_batch_sizes"])
     if (
         configured_graph_batch_sizes != set(measured_tables)
@@ -940,11 +1105,18 @@ def select_exact_sps_candidate(
     compact_expected_yields: dict[int, float],
     cost_table: ExactSpsCostTable,
 ) -> int:
-    """Choose a measured V, retaining native V=0 on ties or weak gains.
+    """Choose a measured V, retaining native V=0 on weak group-E2E value.
 
     The caller supplies globally agreed expected yields after the phase-2
     allgather. This pure layer only compares exact measured cells; it cannot
-    create a ragged budget or synchronize ranks.
+    create a ragged budget or synchronize ranks. Compact serving fails closed
+    until the exact table carries matched iteration/drain metadata. The
+    immediate-goodput winner must then also satisfy, strictly::
+
+        T(G, 0) - T(G, V)
+        - loss_multiplier * (Y_native - Y_V)
+          * T(tail_G, 0) / mean_output_tokens_per_request_iteration
+        > minimum_group_value_ms
     """
     graph_batch_size = _require_exact_int(graph_batch_size, field="graph_batch_size", minimum=1)
     measured_budgets = cost_table.production_candidate_budgets(graph_batch_size)
@@ -968,6 +1140,8 @@ def select_exact_sps_candidate(
     native_yield = _require_nonnegative_finite_number(
         native_expected_yield, field="native_expected_yield"
     )
+    if any(value > native_yield for value in compact_yields.values()):
+        raise ValueError("compact expected yield must not exceed native expected yield")
     native_score = native_yield / cost_table.step_time(0, graph_batch_size)
     compact_scores = {
         budget: compact_yields[budget] / cost_table.step_time(budget, graph_batch_size)
@@ -979,6 +1153,26 @@ def select_exact_sps_candidate(
     best_score = compact_scores[best_budget]
     required_score = native_score * (1.0 + cost_table.minimum_predicted_gain)
     if best_score <= native_score or best_score < required_score:
+        return 0
+    drain_guard = cost_table.iteration_drain_guard
+    if drain_guard is None:
+        # The matched mean-output statistic is workload-specific and cannot be
+        # inferred from T(G,V). An older exact artifact therefore remains a
+        # valid native-static control but is not allowed to enable compact V.
+        return 0
+    native_step_ms = cost_table.step_time(0, graph_batch_size)
+    compact_step_ms = cost_table.step_time(best_budget, graph_batch_size)
+    tail_step_ms = cost_table.step_time(0, drain_guard.tail_graph_batch_size)
+    predicted_yield_loss = native_yield - compact_yields[best_budget]
+    group_value_ms = (
+        native_step_ms
+        - compact_step_ms
+        - drain_guard.loss_multiplier
+        * predicted_yield_loss
+        * tail_step_ms
+        / drain_guard.mean_output_tokens_per_request_iteration
+    )
+    if group_value_ms <= drain_guard.minimum_group_value_ms:
         return 0
     return int(best_budget)
 
