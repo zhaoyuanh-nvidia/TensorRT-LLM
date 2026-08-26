@@ -1082,10 +1082,16 @@ def test_cross_rank_full_bucket_routes_to_native_static_k():
     assert planner.stats["fallback_full_k"] == 1
 
 
-def test_exact_fit_executes_the_selected_bucket_without_rounding():
+def test_exact_fit_executes_the_selected_bucket_without_rounding(monkeypatch):
     import types
 
     from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
+    from tensorrt_llm._torch.speculative.dspark_ragged import RaggedVerifyLayout
+
+    def reject_repacking(*_args, **_kwargs):
+        raise AssertionError("exact fit must publish the selected layout directly")
+
+    monkeypatch.setattr(RaggedVerifyLayout, "from_verify_lens", reject_repacking)
 
     runner = types.SimpleNamespace(
         enabled=True,
@@ -1114,6 +1120,45 @@ def test_exact_fit_executes_the_selected_bucket_without_rounding():
     assert runner.agreed_ragged_bucket == 22
     assert runner.ragged_pad_verify_len == 3
     assert [request.py_verify_len for request in requests] == [5, 5, 5]
+
+
+def test_feature_off_metadata_paths_do_not_scan_request_windows():
+    import types
+
+    from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
+
+    class RequestWithoutWindowAccess:
+        @property
+        def py_verify_len(self):
+            raise AssertionError("feature-off path scanned request windows")
+
+        @property
+        def py_verify_cap(self):
+            raise AssertionError("feature-off path scanned request caps")
+
+    requests = [RequestWithoutWindowAccess()]
+    attention = types.SimpleNamespace(ragged_verify_lens=object())
+    engine = types.SimpleNamespace(
+        _dspark_computes_windows=False,
+        _dspark_device_windows=False,
+        _dspark_trims_submitted_tokens=False,
+    )
+    PyTorchModelEngine._publish_gen_token_layout(engine, attention, requests)
+    assert attention.ragged_verify_lens is None
+
+    speculative = types.SimpleNamespace(
+        accept_caps=object(),
+        accept_cap_trim=object(),
+        qo_indptr=object(),
+        total_verify_tokens=1,
+        verify_lens=object(),
+    )
+    PyTorchModelEngine._attach_ragged_verify_layout(engine, speculative, attention, requests)
+    assert speculative.accept_caps is None
+    assert speculative.accept_cap_trim is None
+    assert speculative.verify_lens is None
+    assert speculative.qo_indptr is None
+    assert speculative.total_verify_tokens is None
 
 
 def _capture_set(batch_sizes, tiers, max_draft_len=BLOCK, exact_table=None):
@@ -1545,7 +1590,12 @@ def _pin_planner(tiers=(1, 2, 5)):
         fixed_overhead_ms=1.0,
     )
     cfg = DSparkScheduleConfig(block_size=5, min_verify_len=1)
-    return DSparkVerifyPlanner(cfg=cfg, cost_table=table, tiers=list(tiers))
+    return DSparkVerifyPlanner(
+        cfg=cfg,
+        cost_table=table,
+        tiers=list(tiers),
+        detailed_stats=True,
+    )
 
 
 def test_adopting_the_agreed_value_applies_it():
@@ -1610,6 +1660,15 @@ def test_pinned_steps_hand_every_request_the_same_window():
 # --------------------------------------------------------------------------
 # snapshot instruments: stamp-lag histogram and neutral-row count
 # --------------------------------------------------------------------------
+
+
+def test_detailed_snapshot_instruments_are_opt_in(monkeypatch):
+    monkeypatch.delenv("TLLM_DSPARK_DETAILED_STATS", raising=False)
+    cfg = DSparkScheduleConfig(block_size=5, min_verify_len=1)
+    planner = DSparkVerifyPlanner(cfg=cfg, tiers=[1, 2, 5])
+    planner._note_snapshot_stats(torch.zeros((4, 5)), rows=None)
+    assert "snap_rows" not in planner.stats
+    assert "snap_neutral_rows" not in planner.stats
 
 
 def test_neutral_rows_are_counted_and_real_rows_are_not():

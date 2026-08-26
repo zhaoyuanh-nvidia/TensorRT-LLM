@@ -483,6 +483,21 @@ class PyTorchModelEngine(ModelEngine):
             spec_config.max_total_draft_tokens = 0
         self.spec_config = spec_config
         self.is_spec_decode = spec_config is not None
+        self._dspark_confidence_enabled = bool(
+            spec_config is not None
+            and getattr(spec_config, "enable_confidence_scheduling", False))
+        self._dspark_computes_windows = False
+        self._dspark_trims_submitted_tokens = False
+        self._dspark_device_windows = False
+        if self._dspark_confidence_enabled:
+            from ..speculative.dspark_observability import \
+                resolve_ragged_verify_mode
+            from ..speculative.dspark_verify import device_windows_enabled
+            dspark_mode = resolve_ragged_verify_mode(spec_config)
+            self._dspark_computes_windows = dspark_mode.computes_windows
+            self._dspark_trims_submitted_tokens = (
+                dspark_mode.trims_submitted_tokens)
+            self._dspark_device_windows = device_windows_enabled()
         self.sparse_attention_config = None if is_draft_model else llm_args.sparse_attention_config
         self.enable_spec_decode = self.is_spec_decode
         self.is_draft_model = is_draft_model
@@ -714,6 +729,8 @@ class PyTorchModelEngine(ModelEngine):
         # one-dimensional planner path.
         self._dspark_sps_cost_table = None
         self._dspark_sps_payload = None
+        self._dspark_exact_candidate_cells = ()
+        self._dspark_exact_identity_words = (0, ) * 8
         if (self.spec_config is not None and getattr(
                 self.spec_config, "enable_confidence_scheduling", False) and
                 getattr(self.spec_config, "confidence_sps_table_path", None)):
@@ -729,6 +746,12 @@ class PyTorchModelEngine(ModelEngine):
                      self.spec_config, "confidence_sps_live_fingerprint_path",
                      None),
              )
+            from ..speculative.dspark_planner import ExactSpsCostTable
+            if isinstance(self._dspark_sps_cost_table, ExactSpsCostTable):
+                self._dspark_exact_candidate_cells = (
+                    self._dspark_sps_cost_table.candidate_cells())
+                self._dspark_exact_identity_words = (
+                    self._dspark_sps_cost_table.collective_identity_words)
 
         self._encoder_cuda_graph_padding_enabled = (
             encoder_cuda_graph_padding_enabled)
@@ -4992,8 +5015,7 @@ class PyTorchModelEngine(ModelEngine):
         max_verify_len = 1 + tiers[-1]
         token_lens = [1 + int(v) for v in verify_lens]
 
-        from ..speculative.dspark_ragged import (RaggedVerifyLayout,
-                                                 choose_ragged_capture_shape)
+        from ..speculative.dspark_ragged import choose_ragged_capture_shape
 
         bs_buckets = sorted({int(b) for b in runner.supported_batch_sizes})
         if not bs_buckets:
@@ -5137,19 +5159,28 @@ class PyTorchModelEngine(ModelEngine):
                 f"to uniform scheduling")
             return None
 
-        lens_tensor = torch.tensor(token_lens, dtype=torch.int32)
-        layout = RaggedVerifyLayout.from_verify_lens(
-            lens_tensor,
-            graph_num_tokens=real_target,
-            total_verify_tokens=sum(token_lens))
-        try:
-            filled = layout.fill_bucket(max_verify_len=max_verify_len)
-        except ValueError as exc:
-            # A mismatch means this batch has no captured shape; degrade to
-            # uniform rather than run eager.
-            logger.debug(f"DSpark ragged bucket fit failed, falling back to "
-                         f"uniform scheduling: {exc}")
-            return None
+        if exact_shape is not None:
+            # The exact selector already returned a bounded split whose real
+            # rows sum to the measured cell. Repacking it through
+            # RaggedVerifyLayout would build two CPU tensors, two prefix sums,
+            # and two host lists without changing a value.
+            published = token_lens
+        else:
+            from ..speculative.dspark_ragged import RaggedVerifyLayout
+            lens_tensor = torch.tensor(token_lens, dtype=torch.int32)
+            layout = RaggedVerifyLayout.from_verify_lens(
+                lens_tensor,
+                graph_num_tokens=real_target,
+                total_verify_tokens=sum(token_lens))
+            try:
+                filled = layout.fill_bucket(max_verify_len=max_verify_len)
+            except ValueError as exc:
+                # A mismatch means this batch has no captured shape; degrade to
+                # uniform rather than run eager.
+                logger.debug(f"DSpark ragged bucket fit failed, falling back "
+                             f"to uniform scheduling: {exc}")
+                return None
+            published = filled.verify_lens.tolist()
 
         # Published only now, past the last way this fit can fail: a stale
         # published bucket on a fallback step is the state behind the ragged
@@ -5161,7 +5192,6 @@ class PyTorchModelEngine(ModelEngine):
         runner.agreed_ragged_bucket = int(bucket)
         runner.ragged_pad_verify_len = pad_len - 1
 
-        published = filled.verify_lens.tolist()
         for request, tokens in zip(generation_requests, published):
             request.py_verify_len = int(tokens) - 1
         return int(bucket)
@@ -5367,14 +5397,16 @@ class PyTorchModelEngine(ModelEngine):
             attn_metadata.runtime_tokens_per_gen_step = (
                 self.get_runtime_tokens_per_gen_step(self.runtime_draft_len))
         if hasattr(attn_metadata, "ragged_verify_lens"):
-            attn_metadata.ragged_verify_lens = self._ragged_token_lens(
-                generation_requests)
+            attn_metadata.ragged_verify_lens = (
+                self._ragged_token_lens(generation_requests)
+                if self._dspark_trims_submitted_tokens else None)
         if hasattr(attn_metadata, "device_windows_mode"):
             # Tells the attention prepare that the host window VALUES are a
             # shape split (bounds only); the true windows land on device
             # through apply_device_ragged_layout after prepare.
-            from ..speculative.dspark_verify import device_windows_enabled
-            attn_metadata.device_windows_mode = device_windows_enabled()
+            attn_metadata.device_windows_mode = (
+                self._dspark_trims_submitted_tokens
+                and self._dspark_device_windows)
 
     def _pinned_host(self, key: str, values, dtype) -> torch.Tensor:
         """A persistent pinned staging buffer holding ``values``.
@@ -5494,6 +5526,17 @@ class PyTorchModelEngine(ModelEngine):
         slice correctly; the DSA indexer needs them to expand kv_lens/block
         tables per query token.
         """
+        if not self._dspark_computes_windows:
+            spec_metadata.accept_caps = None
+            spec_metadata.accept_cap_trim = None
+            spec_metadata.verify_lens = None
+            spec_metadata.qo_indptr = None
+            spec_metadata.total_verify_tokens = None
+            if attn_metadata is not None and hasattr(attn_metadata,
+                                                     "ragged_verify_lens"):
+                attn_metadata.ragged_verify_lens = None
+            return
+
         self._attach_accept_caps(spec_metadata, generation_requests)
         token_lens = self._ragged_token_lens(generation_requests)
         if token_lens is None:
@@ -5702,8 +5745,10 @@ class PyTorchModelEngine(ModelEngine):
             # from this one per-request value; mixing it with the batch-wide
             # count desynchronizes the flat token layout from the KV-length
             # correction applied in _preprocess_inputs.
-            req_tokens_per_gen_step = get_request_tokens_per_gen_step(
+            req_tokens_per_gen_step = (get_request_tokens_per_gen_step(
                 request, num_tokens_per_extend_request)
+                                       if self._dspark_trims_submitted_tokens
+                                       else num_tokens_per_extend_request)
 
             if use_extend_ctx:
                 # We're treating the prompt lengths as context requests here, so
@@ -5737,8 +5782,9 @@ class PyTorchModelEngine(ModelEngine):
             request.py_batch_idx = request.py_seq_slot
 
         num_extend_reqeust_wo_dummy = num_extend_requests - num_extend_dummy_requests
-        is_ragged_gen = any(tokens != num_tokens_per_extend_request
-                            for tokens in tokens_per_extend_request)
+        is_ragged_gen = self._dspark_trims_submitted_tokens and any(
+            tokens != num_tokens_per_extend_request
+            for tokens in tokens_per_extend_request)
         total_num_tokens = sum(tokens_per_extend_request)
 
         previous_slots = self.previous_batch_indices_cuda[:num_previous_batch]
@@ -6342,7 +6388,8 @@ class PyTorchModelEngine(ModelEngine):
         # Uniform speculation makes every entry runtime_tokens_per_gen_step;
         # ragged verification does not, and the device-side gathers below
         # switch to an index-list layout when they disagree.
-        previous_batch_tokens_per_request = []
+        previous_batch_tokens_per_request = (
+            [] if self._dspark_trims_submitted_tokens else None)
         # Flat generation-token offset of the first previous-batch request,
         # captured while walking the batch so the ragged layout does not have
         # to assume a fixed stride.
@@ -6427,8 +6474,10 @@ class PyTorchModelEngine(ModelEngine):
                 # every length below has to come from the same per-request
                 # value, otherwise the flat token layout and the KV-length
                 # correction in _preprocess_inputs disagree.
-                req_tokens_per_gen_step = get_request_tokens_per_gen_step(
-                    request, runtime_tokens_per_gen_step)
+                req_tokens_per_gen_step = (get_request_tokens_per_gen_step(
+                    request, runtime_tokens_per_gen_step) if
+                                           self._dspark_trims_submitted_tokens
+                                           else runtime_tokens_per_gen_step)
 
                 sequence_lengths.append(req_tokens_per_gen_step)
                 num_accepted_draft_tokens.append(
@@ -6448,8 +6497,9 @@ class PyTorchModelEngine(ModelEngine):
                 previous_batch_indices.append(previous_batch_idx)
                 previous_pos_indices.extend([previous_batch_idx] *
                                             req_tokens_per_gen_step)
-                previous_batch_tokens_per_request.append(
-                    req_tokens_per_gen_step)
+                if previous_batch_tokens_per_request is not None:
+                    previous_batch_tokens_per_request.append(
+                        req_tokens_per_gen_step)
                 extend_tokens_emitted += req_tokens_per_gen_step
 
                 num_cached_tokens_per_seq.append(
@@ -6919,9 +6969,10 @@ class PyTorchModelEngine(ModelEngine):
                 # Ragged windows break the fixed strided gathers below; use
                 # explicit (row, col) index lists, keeping the cheaper strided
                 # path for uniform batches.
-                is_ragged_gen = any(
-                    tokens != runtime_tokens_per_gen_step
-                    for tokens in previous_batch_tokens_per_request)
+                is_ragged_gen = (
+                    previous_batch_tokens_per_request is not None
+                    and any(tokens != runtime_tokens_per_gen_step
+                            for tokens in previous_batch_tokens_per_request))
                 # previous input ids
                 previous_batch_tokens = len(previous_pos_indices)
                 if is_ragged_gen:

@@ -3464,7 +3464,8 @@ class PyExecutor:
             return max_draft_len
         runtime_cost_table = getattr(self.model_engine,
                                      "_dspark_sps_cost_table", None)
-        if runtime_cost_table is not None:
+        if (runtime_cost_table is not None
+                and planner.cost_table is not runtime_cost_table):
             planner.install_runtime_cost_table(runtime_cost_table)
 
         gen_requests = scheduled_batch.generation_requests
@@ -3509,8 +3510,12 @@ class PyExecutor:
         device_budget = None
         exact_local = None
         exact_table = planner.exact_cost_table
-        exact_cells = (exact_table.candidate_cells()
-                       if exact_table is not None else ())
+        exact_cells = ()
+        if exact_table is not None:
+            exact_cells = getattr(self.model_engine,
+                                  "_dspark_exact_candidate_cells", None)
+            if exact_cells is None:
+                exact_cells = exact_table.candidate_cells()
         exact_policy = bool(exact_table is not None
                             and planner.forced_verify_len is None
                             and planner.forced_budget_frac is None)
@@ -3604,8 +3609,12 @@ class PyExecutor:
             planner.pending_budget_frac(),
         ]
         exact_yield_scale = 1_000_000
-        exact_identity_words = ((exact_table.collective_identity_words)
-                                if exact_table is not None else (0, ) * 8)
+        exact_identity_words = (0, ) * 8
+        if exact_table is not None:
+            exact_identity_words = getattr(self.model_engine,
+                                           "_dspark_exact_identity_words", None)
+            if exact_identity_words is None:
+                exact_identity_words = exact_table.collective_identity_words
         native_yield_wire = (int(
             math.ceil(exact_local.native_expected_yield *
                       exact_yield_scale)) if exact_local is not None else 0)
@@ -3822,7 +3831,7 @@ class PyExecutor:
         if stats is not None:
             # Periodic summary: under TP the counters sit across an MPI
             # boundary, so the log is the only shared channel.
-            if stats.steps_total and stats.steps_total % 32 == 0:
+            if stats.should_log_periodic_summary():
                 stats.log_summary(prefix="DSpark ragged verify [periodic]")
             fitted = None
             delivered = None
