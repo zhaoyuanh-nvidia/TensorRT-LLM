@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import bisect
 import contextlib
+import os
 from dataclasses import dataclass
 from typing import (Any, Callable, Dict, Iterator, List, NamedTuple, Optional,
                     Tuple, TypeAlias)
@@ -38,6 +39,47 @@ CUDA_GRAPH_DUMMY_REQUEST_ID = (1 << 64) - 1
 # as a one-token context chunk to write its cross-KV cache, so enc-dec
 # dummies need one prompt token plus one generated token.
 ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM = 2
+
+ADP_SHAPE_DEBUG_ENV = "TLLM_DSPARK_ADP_SHAPE_DEBUG"
+
+
+@dataclass(frozen=True)
+class ADPShapeAgreement:
+    """One DSpark policy collective's queue and graph-shape agreement.
+
+    The object is local process state, so ``batch_identity`` is intentionally
+    the Python identity on this rank. The collective-derived fields are equal
+    across ranks. Only a finalized exact-policy agreement may suppress the
+    later graph-shape and padding collectives.
+    """
+
+    iteration: int
+    batch_identity: int
+    local_batch_size: int
+    peer_batch_sizes: Tuple[int, ...]
+    all_can_graph: bool
+    widest_batch_size: int
+    graph_batch_size: int
+    draft_len: int
+    padding_ready: bool
+    ragged_bucket: Optional[int] = None
+    reuse_graph_shape: bool = False
+
+    @property
+    def can_queue(self) -> bool:
+        return bool(self.peer_batch_sizes) and all(self.peer_batch_sizes)
+
+    @property
+    def can_queue_this_rank(self) -> bool:
+        return self.local_batch_size > 0
+
+    def matches(self, batch: ScheduledRequests, iteration: int, *,
+                padded: bool) -> bool:
+        expected_size = (self.graph_batch_size
+                         if padded else self.local_batch_size)
+        return (self.iteration == int(iteration)
+                and self.batch_identity == id(batch)
+                and batch.batch_size == expected_size)
 
 
 class KeyType(NamedTuple):
@@ -166,6 +208,8 @@ class CUDAGraphRunner:
         # Published by ModelEngine when the ragged fit picks a token bucket;
         # None is the resting value (no ragged step in flight).
         self.agreed_ragged_bucket: Optional[int] = None
+        self.adp_shape_agreement: Optional[ADPShapeAgreement] = None
+        self.adp_shape_debug = os.environ.get(ADP_SHAPE_DEBUG_ENV, "0") == "1"
 
         self.graphs: Dict[KeyType, torch.cuda.CUDAGraph] = {}
         self.graph_outputs: Dict[KeyType,
@@ -517,7 +561,23 @@ class CUDAGraphRunner:
         is_mixed_encoder_decoder = self._is_mixed_encoder_decoder_batch(batch)
         can_run_cuda_graph = self._can_run_cuda_graph_batch(batch)
         batch_size = batch.batch_size
-        if self.enabled and self.config.enable_attention_dp and self.config.mapping.tp_size > 1:
+        agreement = self.adp_shape_agreement
+        reuse_agreement = bool(
+            agreement is not None and agreement.reuse_graph_shape
+            and agreement.matches(batch, agreement.iteration, padded=True))
+        if reuse_agreement:
+            local_bucket = self._ragged_verify_bucket(batch)
+            local_draft_len = self._local_draft_len(batch)
+            if (not can_run_cuda_graph
+                    or batch_size != agreement.graph_batch_size
+                    or local_bucket != agreement.ragged_bucket
+                    or local_draft_len != agreement.draft_len):
+                raise RuntimeError(
+                    "DSpark cached ADP graph-shape agreement no longer "
+                    "matches the local replay key")
+        if (self.enabled and self.config.enable_attention_dp
+                and self.config.mapping.tp_size > 1
+                and (not reuse_agreement or self.adp_shape_debug)):
             # Compare every key component a rank can decide for itself: replay
             # freezes all_rank_num_tokens, so a shape mismatch is invisible at
             # replay time. draft_len is settable rank-locally (acceptance-rate
@@ -540,6 +600,16 @@ class CUDAGraphRunner:
                                          if not is_all_gen_only else
                                          "peer_shape_mismatch")
                 return None, None, None
+            if reuse_agreement:
+                expected = (agreement.graph_batch_size,
+                            -1 if agreement.ragged_bucket is None else
+                            agreement.ragged_bucket, agreement.draft_len)
+                if any(
+                        tuple(peer[1:]) != expected
+                        for peer in all_can_graph_batch):
+                    raise RuntimeError(
+                        "DSpark cached ADP graph-shape agreement disagrees "
+                        "with the debug collective")
 
         if not self.enabled or not can_run_cuda_graph:
             self.last_miss_reason = ("disabled" if not self.enabled else
@@ -839,7 +909,20 @@ class CUDAGraphRunner:
         batch_size = batch.batch_size
         new_batch_size = batch_size
 
-        if self.enabled and self.config.enable_attention_dp and self.config.mapping.tp_size > 1:
+        agreement = self.adp_shape_agreement
+        reuse_agreement = bool(
+            agreement is not None and agreement.reuse_graph_shape
+            and agreement.matches(batch, agreement.iteration, padded=False))
+        if reuse_agreement:
+            if not can_run_cuda_graph or not agreement.padding_ready:
+                raise RuntimeError(
+                    "DSpark cached ADP padding agreement lost a local "
+                    "eligibility invariant")
+            new_batch_size = agreement.widest_batch_size
+
+        if (self.enabled and self.config.enable_attention_dp
+                and self.config.mapping.tp_size > 1
+                and (not reuse_agreement or self.adp_shape_debug)):
             graph_batch_info = self.config.dist.tp_allgather(
                 [can_run_cuda_graph, batch_size])
             all_can_run_cuda_graph = all(rank_info[0]
@@ -847,6 +930,12 @@ class CUDAGraphRunner:
             if all_can_run_cuda_graph:
                 new_batch_size = max(rank_info[1]
                                      for rank_info in graph_batch_info)
+            if reuse_agreement:
+                if (not all_can_run_cuda_graph
+                        or new_batch_size != agreement.widest_batch_size):
+                    raise RuntimeError(
+                        "DSpark cached ADP padding agreement disagrees with "
+                        "the debug collective")
 
         if (not self.enabled or not self.padding_enabled
                 or not can_run_cuda_graph
@@ -859,6 +948,11 @@ class CUDAGraphRunner:
         # otherwise this reduces to plain batch-size rounding.
         padded_batch_size = self._round_up_batch_size_with_draft_len(
             new_batch_size, runtime_draft_len)
+        if (reuse_agreement
+                and padded_batch_size != agreement.graph_batch_size):
+            raise RuntimeError(
+                "DSpark cached ADP padding agreement selected a different "
+                "graph batch size")
 
         if batch_size == padded_batch_size:
             return 0
