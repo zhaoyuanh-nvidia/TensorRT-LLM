@@ -10,8 +10,10 @@ import pytest
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import ADPShapeAgreement, CUDAGraphRunner
 from tensorrt_llm._torch.pyexecutor.py_executor import (
     _DSPARK_ADP_WIRE_TRAILER_LEN,
+    _DSPARK_EXACT_NATIVE_YIELD_INDEX,
     _DSPARK_EXACT_WIRE_PREFIX_LEN,
     PyExecutor,
+    _decode_dspark_exact_expected_yields,
     _validate_dspark_adp_acceptance_gate,
     _validate_dspark_adp_debug_flags,
     _validate_dspark_exact_bucket,
@@ -134,6 +136,51 @@ def test_debug_flag_uses_the_final_adp_payload_field():
     payloads = [[0] * payload_len for _ in range(2)]
     payloads[0][debug_index] = payloads[1][debug_index] = 1
     assert _validate_dspark_adp_debug_flags(payloads, debug_index)
+
+
+def test_exact_yield_decode_stops_before_three_field_adp_trailer():
+    exact_cells = ((16, 64), (128, 704))
+    payload_len = _DSPARK_EXACT_WIRE_PREFIX_LEN + len(exact_cells) + _DSPARK_ADP_WIRE_TRAILER_LEN
+    payloads = [[0] * payload_len for _ in range(2)]
+    payloads[0][_DSPARK_EXACT_NATIVE_YIELD_INDEX] = 10_000_000
+    payloads[1][_DSPARK_EXACT_NATIVE_YIELD_INDEX] = 20_000_000
+    payloads[0][_DSPARK_EXACT_WIRE_PREFIX_LEN] = 3_000_000
+    payloads[1][_DSPARK_EXACT_WIRE_PREFIX_LEN] = 4_000_000
+    payloads[0][_DSPARK_EXACT_WIRE_PREFIX_LEN + 1] = 5_000_000
+    payloads[1][_DSPARK_EXACT_WIRE_PREFIX_LEN + 1] = 6_000_000
+    # C's trailer starts immediately after the exact cells. Its batch-size,
+    # padding-ready, and debug values must not be interpreted as yields.
+    trailer_start = _DSPARK_EXACT_WIRE_PREFIX_LEN + len(exact_cells)
+    payloads[0][trailer_start:] = [128, 1, 1]
+    payloads[1][trailer_start:] = [64, 0, 1]
+
+    native_yield, compact_yields = _decode_dspark_exact_expected_yields(
+        payloads=payloads,
+        exact_cells=exact_cells,
+        graph_batch_size=128,
+        yield_scale=1_000_000,
+    )
+
+    assert payload_len == 22 + len(exact_cells)
+    assert native_yield == 30.0
+    assert compact_yields == {704: 11.0}
+
+
+def test_exact_yield_decode_fails_closed_on_any_rank_sentinel():
+    exact_cells = ((128, 704),)
+    payload_len = _DSPARK_EXACT_WIRE_PREFIX_LEN + len(exact_cells) + _DSPARK_ADP_WIRE_TRAILER_LEN
+    payloads = [[0] * payload_len for _ in range(2)]
+    payloads[0][_DSPARK_EXACT_WIRE_PREFIX_LEN] = 5_000_000
+    payloads[1][_DSPARK_EXACT_WIRE_PREFIX_LEN] = -1
+
+    _, compact_yields = _decode_dspark_exact_expected_yields(
+        payloads=payloads,
+        exact_cells=exact_cells,
+        graph_batch_size=128,
+        yield_scale=1_000_000,
+    )
+
+    assert compact_yields == {704: 0.0}
 
 
 def test_debug_flag_disagreement_fails_identically_after_policy_collective():
