@@ -372,6 +372,25 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             per_request = getattr(request, "py_verify_len", None)
         return runtime_draft_len if per_request is None else int(per_request)
 
+    @staticmethod
+    def _snapshot_policy_windows(requests) -> tuple[Optional[dict],
+                                                    Optional[dict]]:
+        """Snapshot overlap-sensitive host windows for one policy step."""
+        verify_lens_snapshot = None
+        verify_caps_snapshot = None
+        for request in requests:
+            window = getattr(request, "py_verify_len", None)
+            if window is not None:
+                if verify_lens_snapshot is None:
+                    verify_lens_snapshot = {}
+                verify_lens_snapshot[request.py_request_id] = int(window)
+            cap = getattr(request, "py_verify_cap", None)
+            if cap is not None:
+                if verify_caps_snapshot is None:
+                    verify_caps_snapshot = {}
+                verify_caps_snapshot[request.py_request_id] = int(cap)
+        return verify_lens_snapshot, verify_caps_snapshot
+
     def update_requests(
         self,
         state: SampleStateSpec,
@@ -552,29 +571,30 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         self.store.next_new_tokens.squeeze(-1).T.index_copy_(0, slots, o_next_new_tokens)
         self.store.new_tokens_lens.index_copy_(0, slots, o_new_tokens_lens)
         self.store.next_draft_tokens.index_copy_(0, slots, o_next_draft_tokens)
-        # cap-accept: absent on every other path, and written as ZEROS then
-        # rather than skipped. The buffer is persistent and slot-indexed, so a
-        # slot left untouched would keep whatever the previous occupant lost
-        # and hand it to the current one.
+        # These two outputs exist only on their DSpark policy paths. Keep the
+        # generic/static speculative path byte-for-byte free of the extra
+        # device writes and D2H copies: when an output is absent the matching
+        # host field below is None, so no stale slot can be observed.
         o_cap_trim = outputs.get("cap_trim_lens")
-        if o_cap_trim is None:
-            o_cap_trim = torch.zeros_like(o_new_tokens_lens)
-        else:
+        host_cap_trim_lens = None
+        if o_cap_trim is not None:
             o_cap_trim = o_cap_trim[num_skip:num_skip + num_sampling_requests]
-        self.store.cap_trim_lens.index_copy_(
-            0, slots, o_cap_trim.to(self.store.cap_trim_lens.dtype))
-        # Ragged verification: the true token windows, same zero-then-write
-        # slot discipline as cap_trim_lens. Under device-window selection the
-        # host py_verify_len holds only a shape split, so the rewind
-        # arithmetic in update_requests must read THIS.
+            self.store.cap_trim_lens.index_copy_(
+                0, slots, o_cap_trim.to(self.store.cap_trim_lens.dtype))
+            host_cap_trim_lens = self._copy_to_host(
+                self.store.cap_trim_lens)
+
+        # Under device-window selection the host py_verify_len holds only a
+        # shape split, so the rewind arithmetic in update_requests must read
+        # the device output when it is present.
         o_verify_lens = outputs.get("verify_lens")
-        if o_verify_lens is None:
-            o_verify_lens = torch.zeros_like(o_new_tokens_lens)
-        else:
+        host_verify_lens = None
+        if o_verify_lens is not None:
             o_verify_lens = o_verify_lens[num_skip:num_skip +
                                           num_sampling_requests]
-        self.store.verify_lens.index_copy_(
-            0, slots, o_verify_lens.to(self.store.verify_lens.dtype))
+            self.store.verify_lens.index_copy_(
+                0, slots, o_verify_lens.to(self.store.verify_lens.dtype))
+            host_verify_lens = self._copy_to_host(self.store.verify_lens)
 
         # Create sample state with async D2H copy
         device_tensors = SampleStateTensorsSpec(
@@ -587,10 +607,8 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             new_tokens=self._copy_to_host(self.store.new_tokens),
             new_tokens_lens=self._copy_to_host(self.store.new_tokens_lens),
             next_draft_tokens=self._copy_to_host(self.store.next_draft_tokens),
-            # [max_num_sequences] int32 -- kilobytes next to new_tokens above,
-            # and it rides the same event, so no extra synchronization.
-            cap_trim_lens=self._copy_to_host(self.store.cap_trim_lens),
-            verify_lens=self._copy_to_host(self.store.verify_lens),
+            cap_trim_lens=host_cap_trim_lens,
+            verify_lens=host_verify_lens,
         )
         sampler_event = self._record_sampler_event()
 
@@ -598,20 +616,18 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         for request in finished_context_requests:
             request.py_draft_tokens = [1] * self.draft_len
 
-        # Cheap (a few ints) and only populated when the ragged path is live.
+        # Cheap (a few ints) and only populated when the policy path is live.
+        # Mixed context/generation compact steps intentionally omit the
+        # generation-indexed verify_lens device output, but still need this
+        # overlap-safe host snapshot. acceptance_stats is attached whenever
+        # confidence scheduling is active and therefore supplies the marker
+        # that those mixed steps cannot carry in outputs.
         verify_lens_snapshot = None
         verify_caps_snapshot = None
-        for request in sampling_requests:
-            window = getattr(request, "py_verify_len", None)
-            if window is not None:
-                if verify_lens_snapshot is None:
-                    verify_lens_snapshot = {}
-                verify_lens_snapshot[request.py_request_id] = int(window)
-            cap = getattr(request, "py_verify_cap", None)
-            if cap is not None:
-                if verify_caps_snapshot is None:
-                    verify_caps_snapshot = {}
-                verify_caps_snapshot[request.py_request_id] = int(cap)
+        if (self.acceptance_stats is not None or o_verify_lens is not None
+                or o_cap_trim is not None):
+            verify_lens_snapshot, verify_caps_snapshot = (
+                self._snapshot_policy_windows(sampling_requests))
 
         return SampleStateSpec(
             requests=sampling_requests,
