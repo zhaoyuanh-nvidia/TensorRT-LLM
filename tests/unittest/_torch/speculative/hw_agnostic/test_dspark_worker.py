@@ -419,7 +419,11 @@ def test_disagg_position_bootstrap_uses_actual_positions_and_target_width():
     target rows by their runtime width rather than the configured K+1 width."""
     worker = _make_worker()
     draft_model = _RecordingDraftModel()
-    metadata = types.SimpleNamespace(max_num_requests=2)
+    metadata = types.SimpleNamespace(
+        max_num_requests=2,
+        qo_indptr=None,
+        verify_lens=None,
+    )
     worker._lazy_init(draft_model, metadata)
 
     slots = [worker._assign_slot(1000, reset=False), worker._assign_slot(1001, reset=False)]
@@ -747,6 +751,7 @@ def _routing_config(embedded):
         draft_is_embedded_in_target=embedded,
         attention_backend="TRTLLM",
         confidence_threshold=0.5,
+        enable_confidence_scheduling=False,
         _use_shared_kv_cache=False,
         _allow_separate_draft_kv_cache=True,
     )
@@ -823,14 +828,12 @@ def _stride_probe_draft_model(block_size=5, num_stages=3, window_size=128, head_
 
 @pytest.mark.parametrize("runtime_draft_len", [3, None])
 def test_gen_draft_gathers_hidden_with_the_runtime_stride(runtime_draft_len):
-    """The gather stride must follow runtime_draft_len, not max_draft_len.
+    """The gather must follow the packed ragged layout, not max_draft_len.
 
-    The target lays out ``runtime_draft_len + 1`` tokens per generation request.
-    Striding by ``max_draft_len + 1`` instead walks into the *next* request's
-    hidden states as soon as the scheduler trims the draft length -- the draft
-    then conditions on another request's context, with no error anywhere.
-    ``runtime_draft_len=None`` pins the fallback: metadata without a runtime
-    length keeps the pre-existing max_draft_len stride.
+    Ragged target rows are described by ``qo_indptr``. Reusing the uniform
+    ``max_draft_len + 1`` stride instead walks into the *next* request's hidden
+    states as soon as the scheduler trims the draft length. ``None`` pins the
+    uniform fallback where the accepted-token width remains authoritative.
     """
     num_gens, hidden = 4, HIDDEN * NCAP
     worker = _make_worker()
@@ -846,6 +849,20 @@ def test_gen_draft_gathers_hidden_with_the_runtime_stride(runtime_draft_len):
         captured[g * stride : (g + 1) * stride] = float(g)
 
     meta.runtime_draft_len = runtime_draft_len
+    if runtime_draft_len is not None:
+        meta.qo_indptr = torch.arange(
+            0,
+            (num_gens + 1) * stride,
+            stride,
+            device="cuda",
+            dtype=torch.int32,
+        )
+        meta.verify_lens = torch.full(
+            (num_gens,), stride, device="cuda", dtype=torch.int32
+        )
+    else:
+        meta.qo_indptr = None
+        meta.verify_lens = None
     meta.get_hidden_states = lambda _n: captured
     attn = types.SimpleNamespace(num_ctx_tokens=0, num_seqs=num_gens, num_contexts=0)
 
