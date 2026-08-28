@@ -946,16 +946,53 @@ def test_exact_cell_geometry_models_shared_pad_window():
         min_verify_len=1,
         max_verify_len=5,
     ) == (4, 592, 392)
-    assert (
-        _exact_cell_geometry(
-            num_real=0,
-            graph_batch_size=128,
-            verifier_budget=704,
-            min_verify_len=1,
-            max_verify_len=5,
-        )
-        is None
+    # V704 = 128*5 + 64: the idle rank uses 64 six-token rows and 64
+    # five-token rows without assigning any logical request work.
+    assert _exact_cell_geometry(
+        num_real=0,
+        graph_batch_size=128,
+        verifier_budget=704,
+        min_verify_len=1,
+        max_verify_len=5,
+    ) == (5, 0, 0)
+
+
+def test_exact_zero_real_rank_advertises_pad_only_cells_without_yield():
+    table = ExactSpsCostTable(
+        tables={
+            4: SpsCostTable(
+                token_counts=(0, 12, 14, 24),
+                step_time_ms=(8.0, 6.0, 6.5, 8.1),
+            )
+        },
+        max_draft_len=5,
     )
+    planner = DSparkVerifyPlanner(
+        cfg=DSparkScheduleConfig(block_size=5, min_verify_len=1),
+        cost_table=table,
+        tiers=[1, 3, 5],
+        detailed_stats=True,
+    )
+
+    decision = planner.prepare_exact_sps_decision(
+        num_gen_requests=0, rows=[])
+
+    assert decision is not None
+    assert decision.num_requests == 0
+    assert tuple(decision.survival.shape) == (0, 5)
+    assert decision.native_expected_yield == 0.0
+    assert decision.compact_expected_yields == (0.0, 0.0)
+    lens, budget, pad_tokens = planner.allocate_exact_sps_candidate(
+        decision, graph_batch_size=4, verifier_budget=14)
+    assert lens == []
+    assert budget == 0
+    assert pad_tokens == 3
+    assert planner.stats["exact_cell_hist"] == {"G4V14": 1}
+    assert planner.stats["exact_zero_real_ready_steps"] == 1
+    assert planner.stats["exact_zero_real_selected_steps"] == 1
+    assert planner.stats["exact_zero_real_dummy_row_split_hist"] == {
+        "q3r2G4": 1
+    }
 
 
 def test_exact_allocator_spends_the_modeled_real_target():
@@ -1227,6 +1264,7 @@ def test_cross_rank_full_bucket_routes_to_native_static_k():
     runner = types.SimpleNamespace(
         enabled=True,
         agreed_ragged_bucket=999,
+        ragged_zero_real_high_rows=0,
         supported_batch_sizes=[4],
         _round_up_batch_size=lambda _: 4,
         will_pad_to=lambda *_: True,
@@ -1261,6 +1299,7 @@ def test_exact_fit_executes_the_selected_bucket_without_rounding(monkeypatch):
         enabled=True,
         agreed_ragged_bucket=None,
         ragged_pad_verify_len=0,
+        ragged_zero_real_high_rows=0,
         supported_batch_sizes=[4],
         _round_up_batch_size=lambda _: 4,
         will_pad_to=lambda *_: True,

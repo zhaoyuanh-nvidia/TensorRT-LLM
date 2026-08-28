@@ -791,6 +791,29 @@ class KVCacheManagerV2(BaseResourceManager):
     # Declared on the class so it is present even when an instance is built without running __init__.
     _cold_pool_group_membership_cache: Optional[tuple[tuple[int, frozenset[int]], ...]] = None
 
+    @staticmethod
+    def _resolve_num_reserved_index_slots(
+        configured_slots: Optional[int],
+        spec_config,
+        is_estimating_kv_cache: bool,
+    ) -> int:
+        """Return stable IndexMapper headroom for retained graph dummies."""
+        requires_secondary_dummy = bool(
+            not is_estimating_kv_cache
+            and spec_config is not None
+            and getattr(spec_config, "enable_confidence_scheduling", False))
+        required_slots = (
+            0 if is_estimating_kv_cache else 2 if requires_secondary_dummy else 1)
+        if configured_slots is None:
+            return required_slots
+        if configured_slots < 0:
+            raise ValueError("num_reserved_index_slots must be non-negative")
+        if configured_slots < required_slots:
+            raise ValueError(
+                "num_reserved_index_slots is smaller than the CUDA-graph "
+                f"padding requirement ({configured_slots} < {required_slots})")
+        return configured_slots
+
     def __init__(
         self,
         kv_cache_config: KvCacheConfig,
@@ -817,7 +840,7 @@ class KVCacheManagerV2(BaseResourceManager):
         execution_stream: Optional[torch.cuda.Stream] = None,
         is_disagg: bool = False,
         enable_stats: bool = False,
-        num_reserved_index_slots: int = 1,
+        num_reserved_index_slots: Optional[int] = None,
         is_estimating_kv_cache: bool = False,
         **kwargs,
     ) -> None:
@@ -1308,7 +1331,11 @@ class KVCacheManagerV2(BaseResourceManager):
         # capacity lets the next batch of active requests acquire slots without
         # waiting for the previous batch's transfers to finish.
         max_num_sequences = max_batch_size * mapping.pp_size
-        assert num_reserved_index_slots >= 0, "num_reserved_index_slots must be non-negative"
+        num_reserved_index_slots = self._resolve_num_reserved_index_slots(
+            num_reserved_index_slots,
+            spec_config,
+            is_estimating_kv_cache,
+        )
         index_mapper_capacity = (
             max_num_sequences * (2 if is_disagg else 1) + num_reserved_index_slots
         )

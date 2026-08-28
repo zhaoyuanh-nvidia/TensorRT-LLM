@@ -384,14 +384,17 @@ class DSv4DSparkWorker(SpecWorkerBase):
         self._scratch_slot = max_batch
         num_rows = max_batch + 1
 
-        # CUDA-graph padding ids sit in
-        # ``[CUDA_GRAPH_DUMMY_REQUEST_ID - runtime_draft_len, CUDA_GRAPH_DUMMY_REQUEST_ID]``;
-        # real ids start at ``max_batch_size``, so a floor separates them.
+        # CUDA-graph padding ids occupy two disjoint per-draft-length blocks:
+        # the ordinary low-row dummy and the high-row dummy used by zero-real
+        # non-divisible exact cells. A floor separates both from real IDs.
         # Imported lazily to break the dspark -> cuda_graph_runner ->
         # speculative.utils -> dspark import cycle.
-        from ..pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
+        from ..pyexecutor.cuda_graph_runner import cuda_graph_dummy_request_id
 
-        self._graph_dummy_id_floor = CUDA_GRAPH_DUMMY_REQUEST_ID - self.max_draft_len
+        self._graph_dummy_id_floor = cuda_graph_dummy_request_id(
+            self.max_draft_len,
+            variant=1,
+            max_draft_len=self.max_draft_len)
 
         self._kv_windows = torch.zeros(
             (num_rows, num_stages, self._win, head_dim),

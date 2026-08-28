@@ -101,18 +101,26 @@ def _exact_cell_geometry(
 ) -> Optional[Tuple[int, int, int]]:
     """Return ``(pad_tokens, real_tokens, extra_budget)`` or infeasible.
 
-    Every pad row shares one token length. Choosing the smallest feasible pad
-    length maximizes useful real-row work; the same calculation is reused by
-    yield modeling and execution so the policy cannot price one layout and run
-    another.
+    Real-containing ranks use one shared pad-row length. A zero-real rank may
+    use the deterministic quotient/remainder split ``V = G*q + r`` backed by
+    two cached dummy objects (low=q, high=q+1); the returned pad length is q.
+    The same calculation is reused by yield modeling and execution so the
+    policy cannot price one layout and run another.
     """
     n = int(num_real)
     graph_batch_size = int(graph_batch_size)
     verifier_budget = int(verifier_budget)
-    if n <= 0 or n > graph_batch_size:
-        # Uneven DEP8 idle ranks conservatively force native for now. Pad-only
-        # exact execution needs an explicit dummy-window publication path.
+    if n < 0 or n > graph_batch_size or graph_batch_size <= 0:
         return None
+    if n == 0:
+        # Row zero is the scheduled ADP dummy; CUDA padding contributes the
+        # remaining G-1 rows. Two cached CUDA dummy variants represent the
+        # quotient/remainder split without allocating G distinct KV objects.
+        pad_tokens, remainder = divmod(verifier_budget, graph_batch_size)
+        if (pad_tokens < 1
+                or pad_tokens + int(remainder > 0) > int(max_verify_len) + 1):
+            return None
+        return pad_tokens, 0, 0
     num_pad = graph_batch_size - n
     real_floor = n * (int(min_verify_len) + 1)
     real_capacity = n * (int(max_verify_len) + 1)
@@ -268,11 +276,40 @@ class DSparkVerifyPlanner:
         if table is None:
             raise RuntimeError("prepare_exact_sps_decision requires an exact SPS table")
         n = int(num_gen_requests)
-        if n <= 0:
+        if n < 0:
             self.stats["fallback_no_gen_requests"] += 1
             return None
         if self._forced_verify_len is not None or self._forced_budget_frac is not None:
             raise RuntimeError("profiling overrides must use the legacy pinned decision path")
+
+        if n == 0:
+            # An idle ADP rank has no confidence rows and contributes no
+            # expected output. It still advertises every pad-only cell that the
+            # low/high dummy pair can represent; resource readiness is agreed
+            # by the executor before a selected cell can execute.
+            max_verify_len = int(self.cfg.resolved_max_verify_len)
+            compact_expected_yields = tuple(
+                0.0
+                if _exact_cell_geometry(
+                    num_real=0,
+                    graph_batch_size=graph_batch_size,
+                    verifier_budget=verifier_budget,
+                    min_verify_len=self.cfg.min_verify_len,
+                    max_verify_len=max_verify_len,
+                ) is not None
+                else -1.0
+                for graph_batch_size, verifier_budget in table.candidate_cells()
+            )
+            if self.detailed_stats:
+                self.stats["exact_zero_real_ready_steps"] = self.stats.get(
+                    "exact_zero_real_ready_steps", 0
+                ) + 1
+            return ExactSpsLocalDecision(
+                num_requests=0,
+                survival=torch.empty((0, max_verify_len), dtype=torch.float32),
+                native_expected_yield=0.0,
+                compact_expected_yields=compact_expected_yields,
+            )
 
         if self.device_windows:
             snapshot = self._ready_older_snapshot()
@@ -354,6 +391,29 @@ class DSparkVerifyPlanner:
                 f"cannot fit {n} real requests with verify floor {floor}"
             )
         pad_tokens, real_tokens, budget = geometry
+        if n == 0:
+            if real_tokens != 0 or budget != 0:
+                raise RuntimeError("zero-real exact SPS geometry assigned real-row work")
+            predicted = table.step_time(verifier_budget, graph_batch_size)
+            self.last_predicted_step_ms = float(predicted)
+            self.stats["predicted_ms_sum"] = self.stats.get(
+                "predicted_ms_sum", 0.0
+            ) + float(predicted)
+            self.stats["predicted_steps"] = self.stats.get("predicted_steps", 0) + 1
+            cell_hist = self.stats.setdefault("exact_cell_hist", {})
+            cell = f"G{graph_batch_size}V{verifier_budget}"
+            cell_hist[cell] = cell_hist.get(cell, 0) + 1
+            if self.detailed_stats:
+                self.stats["exact_zero_real_selected_steps"] = self.stats.get(
+                    "exact_zero_real_selected_steps", 0
+                ) + 1
+                split_hist = self.stats.setdefault(
+                    "exact_zero_real_dummy_row_split_hist", {}
+                )
+                quotient, remainder = divmod(verifier_budget, graph_batch_size)
+                split = f"q{quotient}r{remainder}G{graph_batch_size}"
+                split_hist[split] = split_hist.get(split, 0) + 1
+            return [], 0, int(pad_tokens)
         exact_cfg = replace(self.cfg, survival_eps=0.0)
         lens = schedule_verify_lens_topk(
             survival=decision.survival, budget=budget, cfg=exact_cfg

@@ -14,8 +14,8 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from enum import IntEnum
 from queue import Queue
-from typing import (TYPE_CHECKING, Dict, Iterable, Iterator, List, Optional,
-                    Tuple, Union)
+from typing import (TYPE_CHECKING, Callable, Dict, Iterable, Iterator, List,
+                    Optional, Tuple, Union)
 
 import torch
 from strenum import StrEnum
@@ -108,7 +108,7 @@ if TYPE_CHECKING:
 
 _UNBOUNDED_STATS_MAX_LEN = -1
 _DSPARK_EXACT_WIRE_PREFIX_LEN = 19
-_DSPARK_ADP_WIRE_TRAILER_LEN = 3
+_DSPARK_ADP_WIRE_TRAILER_LEN = 4
 _DSPARK_EXACT_NATIVE_YIELD_INDEX = _DSPARK_EXACT_WIRE_PREFIX_LEN - 1
 
 
@@ -184,6 +184,49 @@ def _validate_dspark_adp_acceptance_gate(
             "per-rank SpeculationGate can disable speculation at different "
             "iterations and break collective ordering. Disable the acceptance "
             "gate for this configuration.")
+
+
+def _classify_dspark_exact_generation_rows(
+    generation_requests: List[LlmRequest],
+) -> Tuple[Optional[List[LlmRequest]], bool]:
+    """Return logical exact rows and whether one idle ADP dummy is scheduled."""
+    real_requests = [request for request in generation_requests
+                     if not request.is_dummy]
+    if len(real_requests) == len(generation_requests):
+        return real_requests, False
+    one_adp_dummy = bool(
+        not real_requests
+        and len(generation_requests) == 1
+        and generation_requests[0].is_attention_dp_dummy)
+    if one_adp_dummy:
+        return real_requests, True
+    return None, False
+
+
+def _dspark_exact_common_graph_batch_size(
+    payloads: List[List[int]],
+    round_up: Callable[[int], int],
+) -> int:
+    """Resolve a common exact G, preserving zero as all-rank termination."""
+    widest_rows = max((int(payload[1]) for payload in payloads), default=0)
+    if widest_rows <= 0:
+        return 0
+    return int(round_up(widest_rows))
+
+
+def _dspark_exact_secondary_padding_ready(
+    payloads: List[List[int]],
+    *,
+    graph_batch_size: int,
+    verifier_budget: int,
+    secondary_ready_index: int,
+) -> bool:
+    """Whether every zero-real peer can represent the selected remainder."""
+    if verifier_budget % graph_batch_size <= 1:
+        return True
+    return all(
+        int(payload[1]) != 0 or bool(int(payload[secondary_ready_index]))
+        for payload in payloads)
 
 
 class _ADPForwardIntent(IntEnum):
@@ -3641,6 +3684,11 @@ class PyExecutor:
         exact_policy = bool(exact_table is not None
                             and planner.forced_verify_len is None
                             and planner.forced_budget_frac is None)
+        exact_requests: Optional[List[LlmRequest]] = gen_requests
+        exact_zero_real_adp_dummy = False
+        if exact_policy:
+            (exact_requests, exact_zero_real_adp_dummy) = (
+                _classify_dspark_exact_generation_rows(gen_requests))
         # Cleared unconditionally: a budget left over from a previous step
         # would re-rank a batch it was never computed for.
         self.model_engine._dspark_device_budget = None
@@ -3654,9 +3702,24 @@ class PyExecutor:
                 # Produce the whole measured yield grid locally. The common G
                 # and winning V are resolved from the existing attention-DP
                 # allgather below, so exact scheduling adds no synchronization.
-                exact_local = planner.prepare_exact_sps_decision(
-                    num_gen_requests=num_gen_requests, rows=confidence_rows)
-                if exact_local is None:
+                if exact_requests is None:
+                    fallback_reason = "unsupported_dummy_shape"
+                elif (exact_zero_real_adp_dummy
+                      and not mode.trims_submitted_tokens):
+                    # Pad-only exact execution removes physical target work.
+                    # Cap-accept deliberately keeps the whole target block, so
+                    # admitting an empty rank there adds protocol state without
+                    # any compute saving and remains native.
+                    fallback_reason = "planner_declined"
+                else:
+                    exact_confidence_rows = [
+                        worker.confidence_row_for(request.py_request_id)
+                        for request in exact_requests
+                    ]
+                    exact_local = planner.prepare_exact_sps_decision(
+                        num_gen_requests=len(exact_requests),
+                        rows=exact_confidence_rows)
+                if exact_requests is not None and exact_local is None:
                     fallback_reason = "planner_declined"
             elif planner.device_windows and mode.trims_submitted_tokens:
                 # Device-window mode: the host decides only the CAPACITY, from
@@ -3705,7 +3768,8 @@ class PyExecutor:
         # appends [has_exact_table, exact_ready, exact_cell_count,
         # table_sha256_as_8_u32, native_yield,
         # yield_for_each_stable_(G,V)_cell, scheduled_batch_size,
-        # padding_dummy_cached, adp_shape_debug]. Carrying the authenticated table
+        # low_padding_dummy_cached, high_padding_dummy_cached,
+        # adp_shape_debug]. Carrying the authenticated table
         # identity is mandatory: equal vector lengths do not prove that ranks
         # assign the same (G,V) or T(G,V) to each position.
         # `can_graph` rides along because the ragged
@@ -3758,6 +3822,8 @@ class PyExecutor:
             int(scheduled_batch.batch_size),
             1 if planner.max_tier in getattr(runner, "padding_dummy_requests",
                                              {}) else 0,
+            1 if planner.max_tier in getattr(
+                runner, "secondary_padding_dummy_requests", {}) else 0,
             1 if runner.adp_shape_debug else 0,
         ])
         if is_distributed:
@@ -3820,7 +3886,8 @@ class PyExecutor:
         exact_payload_end = _DSPARK_EXACT_WIRE_PREFIX_LEN + len(exact_cells)
         batch_size_index = exact_payload_end
         padding_dummy_index = exact_payload_end + 1
-        debug_index = exact_payload_end + 2
+        secondary_padding_dummy_index = exact_payload_end + 2
+        debug_index = exact_payload_end + 3
         if any(
                 len(payload) != exact_payload_end + _DSPARK_ADP_WIRE_TRAILER_LEN
                 for payload in payloads):
@@ -3867,6 +3934,7 @@ class PyExecutor:
             self.model_engine._dspark_device_budget = None
             runner.agreed_ragged_bucket = None
             runner.ragged_pad_verify_len = 0
+            runner.ragged_zero_real_high_rows = 0
             for request in gen_requests:
                 request.py_verify_len = None
                 request.py_verify_cap = None
@@ -3891,9 +3959,8 @@ class PyExecutor:
                     raise RuntimeError(
                         "DSpark exact SPS collective payloads disagree on the "
                         "measured (G,V) grid")
-                widest_rows = max(int(payload[1]) for payload in payloads)
-                common_graph_batch_size = runner._round_up_batch_size(
-                    widest_rows)
+                common_graph_batch_size = _dspark_exact_common_graph_batch_size(
+                    payloads, runner._round_up_batch_size)
                 if common_graph_batch_size == 0:
                     fallback_reason = "no_captured_shape"
                     exact_local = None
@@ -3922,16 +3989,39 @@ class PyExecutor:
                         planner.stats["fallback_full_k"] += 1
                         fallback_reason = "exact_native_k"
                         exact_local = None
+                    elif not _dspark_exact_secondary_padding_ready(
+                            payloads,
+                            graph_batch_size=common_graph_batch_size,
+                            verifier_budget=selected_verifier_budget,
+                            secondary_ready_index=(
+                                secondary_padding_dummy_index)):
+                        # Only a zero-real quotient/remainder layout with more
+                        # than row zero high needs the second cached dummy.
+                        planner.stats["fallback_full_k"] += 1
+                        fallback_reason = "secondary_padding_not_ready"
+                        exact_local = None
                     else:
                         (ragged_lens, local_exact_budget, exact_pad_tokens) = (
                             planner.allocate_exact_sps_candidate(
                                 exact_local,
                                 graph_batch_size=common_graph_batch_size,
                                 verifier_budget=selected_verifier_budget))
+                        if exact_local.num_requests == 0:
+                            if not exact_zero_real_adp_dummy:
+                                raise RuntimeError(
+                                    "zero-real exact SPS allocation has no "
+                                    "authenticated attention-DP dummy row")
+                            _, remainder = divmod(selected_verifier_budget,
+                                                  common_graph_batch_size)
+                            scheduled_tokens = (int(exact_pad_tokens)
+                                                + int(remainder > 0))
+                            ragged_lens = [scheduled_tokens - 1]
                         exact_shape = (common_graph_batch_size,
                                        selected_verifier_budget,
                                        exact_pad_tokens)
-                        if planner.device_windows and mode.trims_submitted_tokens:
+                        if (planner.device_windows
+                                and mode.trims_submitted_tokens
+                                and local_exact_budget > 0):
                             device_budget = int(local_exact_budget)
                         from ..speculative.dspark_verify import \
                             _exact_cell_geometry
@@ -3987,7 +4077,8 @@ class PyExecutor:
                     gen_requests,
                     ragged_lens,
                     peer_stats=peer_stats,
-                    exact_shape=exact_shape)
+                    exact_shape=exact_shape,
+                    exact_zero_real=exact_zero_real_adp_dummy)
                 ragged_active = bucket is not None
                 if bucket is None:
                     fallback_reason = "no_captured_shape"
@@ -4004,6 +4095,7 @@ class PyExecutor:
                 runner = self.model_engine.cuda_graph_runner
                 runner.agreed_ragged_bucket = None
                 runner.ragged_pad_verify_len = 0
+                runner.ragged_zero_real_high_rows = 0
                 for request, window in zip(gen_requests, ragged_lens):
                     request.py_verify_len = int(window)
                 ragged_active = True
@@ -4036,22 +4128,29 @@ class PyExecutor:
                 stats.log_summary(prefix="DSpark ragged verify [periodic]")
             fitted = None
             delivered = None
+            logical_num_gen_requests = (
+                0 if exact_zero_real_adp_dummy else num_gen_requests)
             if cap_accept:
                 # Nothing was fitted: the scheduled windows ARE the decision,
                 # and `delivered` must say the block was submitted whole.
-                fitted = [int(v) for v in ragged_lens] if ragged_lens else None
-                delivered = num_gen_requests * (1 + max_draft_len)
+                fitted = ([] if exact_zero_real_adp_dummy and ragged_lens
+                          is not None else [int(v) for v in ragged_lens]
+                          if ragged_lens else None)
+                delivered = logical_num_gen_requests * (1 + max_draft_len)
             elif ragged_active:
                 # Read back off the requests, not `ragged_lens`: the fit spent
                 # the bucket's rounding slack on real verification.
-                fitted = [
-                    int(request.py_verify_len) for request in gen_requests
-                    if getattr(request, "py_verify_len", None) is not None
-                ]
-                if len(fitted) != num_gen_requests:
-                    fitted = None
+                if exact_zero_real_adp_dummy:
+                    fitted = []
+                else:
+                    fitted = [
+                        int(request.py_verify_len) for request in gen_requests
+                        if getattr(request, "py_verify_len", None) is not None
+                    ]
+                    if len(fitted) != num_gen_requests:
+                        fitted = None
             stats.record_step(
-                num_gen_requests=num_gen_requests,
+                num_gen_requests=logical_num_gen_requests,
                 verify_lens=fitted,
                 bucket=bucket,
                 # Only when the fit delivered: otherwise this
@@ -4079,6 +4178,7 @@ class PyExecutor:
             if self.model_engine.cuda_graph_runner is not None:
                 self.model_engine.cuda_graph_runner.agreed_ragged_bucket = None
                 self.model_engine.cuda_graph_runner.ragged_pad_verify_len = 0
+                self.model_engine.cuda_graph_runner.ragged_zero_real_high_rows = 0
             # The only fallback is the full drafted block; nothing to agree on
             # across ranks, so no collective.
             runtime_draft_len = planner.max_tier
@@ -5788,7 +5888,8 @@ class PyExecutor:
         self._pp_rebalance_drain_iters = None
 
     def _suspend_padding_dummies_for_rebalance(
-            self, mgr: KVCacheManagerV2) -> List[Tuple[int, LlmRequest]]:
+            self, mgr: KVCacheManagerV2
+    ) -> List[Tuple[int, int, LlmRequest]]:
         """Suspend the CUDA-graph padding dummies before ``adjust()``.
 
         ``CUDAGraphRunner`` retains one padding dummy per captured draft
@@ -5805,21 +5906,27 @@ class PyExecutor:
         and silently drop padded batches to eager mode for the rest of the
         process lifetime.
 
-        Returns the ``(draft_len, dummy)`` pairs that were suspended.
+        Returns ``(draft_len, variant, dummy)`` triples. Variant zero is the
+        low-row dummy and variant one is the high-row dummy.
         """
         runner = getattr(self.model_engine, "cuda_graph_runner", None)
         if runner is None:
             return []
-        suspended: List[Tuple[int, LlmRequest]] = []
-        for draft_len, dummy in runner.padding_dummy_requests.items():
-            if mgr.is_request_active(dummy.py_request_id):
-                mgr.suspend_request(dummy)
-                suspended.append((draft_len, dummy))
+        suspended: List[Tuple[int, int, LlmRequest]] = []
+        caches = (
+            getattr(runner, "padding_dummy_requests", {}),
+            getattr(runner, "secondary_padding_dummy_requests", {}),
+        )
+        for variant, cache in enumerate(caches):
+            for draft_len, dummy in cache.items():
+                if mgr.is_request_active(dummy.py_request_id):
+                    mgr.suspend_request(dummy)
+                    suspended.append((draft_len, variant, dummy))
         return suspended
 
     def _resume_padding_dummies_after_rebalance(
             self, mgr: KVCacheManagerV2,
-            suspended: List[Tuple[int, LlmRequest]]) -> None:
+            suspended: List[Tuple[int, int, LlmRequest]]) -> None:
         """Resume the padding dummies suspended for ``adjust()``.
 
         A real request that fails to resume is left suspended for the
@@ -5837,13 +5944,19 @@ class PyExecutor:
         runner = getattr(self.model_engine, "cuda_graph_runner", None)
         if runner is None:
             return
-        for draft_len, dummy in suspended:
+        failed_draft_lens = set()
+        for draft_len, variant, dummy in suspended:
             if mgr.resume_request(dummy):
                 continue
             logger.warning(
                 "Could not resume the CUDA graph padding dummy request "
-                f"(draft_len={draft_len}) after a KV pool rebalance; "
+                f"(draft_len={draft_len}, variant={variant}) after a KV pool "
+                "rebalance; "
                 "releasing it and falling back to lazy re-creation.")
+            failed_draft_lens.add(draft_len)
+        # Resume both siblings before releasing a low/high pair. Releasing
+        # inline could free a resumed sibling and later try to resume it.
+        for draft_len in sorted(failed_draft_lens):
             runner.release_padding_dummy(self.resource_manager, draft_len)
 
     @contextmanager

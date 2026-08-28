@@ -121,8 +121,13 @@ def test_worker_lazy_init_window_buffers():
     assert worker._valid_len.shape == (9,)
     assert worker._position_initialized.shape == (9,)
     assert worker._scratch_slot == 8
-    # Dummy-id floor separates real request ids from CUDA-graph padding ids.
-    assert worker._graph_dummy_id_floor == (1 << 64) - 1 - worker.max_draft_len
+    # The floor includes both low/high CUDA-graph padding ID blocks.
+    from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
+        cuda_graph_dummy_request_id
+    assert worker._graph_dummy_id_floor == cuda_graph_dummy_request_id(
+        worker.max_draft_len,
+        variant=1,
+        max_draft_len=worker.max_draft_len)
     # The scratch row is never handed out through the free pool.
     assert list(worker._free_slots) == list(range(8))
     assert worker._batch_to_slot is not None
@@ -337,7 +342,8 @@ def test_prepare_assigns_slots_to_disagg_generation_requests():
 
 def test_prepare_keeps_dummy_generation_requests_on_scratch_row():
     """ADP-idle (id 0) and CUDA-graph padding dummies never consume a real slot."""
-    from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
+    from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
+        cuda_graph_dummy_request_id
     from tensorrt_llm._torch.pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
 
     worker = _make_worker()
@@ -345,18 +351,29 @@ def test_prepare_keeps_dummy_generation_requests_on_scratch_row():
     worker._lazy_init(_fake_draft_model(), meta)
     meta._dspark_worker = worker
 
-    graph_dummy = CUDA_GRAPH_DUMMY_REQUEST_ID - worker.max_draft_len
-    meta.request_ids = [1000, ATTENTION_DP_DUMMY_REQUEST_ID, graph_dummy]
-    meta.num_generations = 3
+    low_graph_dummy = cuda_graph_dummy_request_id(
+        worker.max_draft_len,
+        variant=0,
+        max_draft_len=worker.max_draft_len)
+    high_graph_dummy = cuda_graph_dummy_request_id(
+        worker.max_draft_len,
+        variant=1,
+        max_draft_len=worker.max_draft_len)
+    meta.request_ids = [
+        1000, ATTENTION_DP_DUMMY_REQUEST_ID, low_graph_dummy, high_graph_dummy
+    ]
+    meta.num_generations = 4
     meta.prepare()
 
     s_real = worker._req_to_slot[1000]
     assert s_real != worker._scratch_slot
     # Dummies are neither registered nor given a real slot; they map to scratch.
     assert ATTENTION_DP_DUMMY_REQUEST_ID not in worker._req_to_slot
-    assert graph_dummy not in worker._req_to_slot
-    assert worker._batch_to_slot[:3].tolist() == [
+    assert low_graph_dummy not in worker._req_to_slot
+    assert high_graph_dummy not in worker._req_to_slot
+    assert worker._batch_to_slot[:4].tolist() == [
         s_real,
+        worker._scratch_slot,
         worker._scratch_slot,
         worker._scratch_slot,
     ]

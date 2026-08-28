@@ -1477,6 +1477,8 @@ class PyTorchModelEngine(ModelEngine):
         # The lifetime of model engine and kv cache manager can be different.
         # Reset the global cuda graph dummy requests in warmup.
         self.cuda_graph_runner.padding_dummy_requests = {}
+        self.cuda_graph_runner.secondary_padding_dummy_requests = {}
+        self.cuda_graph_runner.ragged_zero_real_high_rows = 0
 
         is_enc_dec = self._is_encoder_decoder_model()
         if self.mapping.cp_size > 1:
@@ -1558,6 +1560,8 @@ class PyTorchModelEngine(ModelEngine):
                 finally:
                     self.cuda_graph_runner.is_warmup_only = False
                 self.cuda_graph_runner.padding_dummy_requests = {}
+                self.cuda_graph_runner.secondary_padding_dummy_requests = {}
+                self.cuda_graph_runner.ragged_zero_real_high_rows = 0
                 self._run_cuda_graph_warmup(resource_manager)
         log_mem_snapshot("warmup/after_cuda_graph_capture")
         # Pre-compile DeepGEMM paged_mqa_logits_metadata for every 32-aligned
@@ -5136,7 +5140,8 @@ class PyTorchModelEngine(ModelEngine):
             verify_lens: List[int],
             peer_stats: Optional[List[List[int]]] = None,
             exact_shape: Optional[Tuple[int, int,
-                                        int]] = None) -> Optional[int]:
+                                        int]] = None,
+            exact_zero_real: bool = False) -> Optional[int]:
         """Round this batch's verify total onto a captured bucket, in place.
 
         The flat token count is a CUDA-graph key axis, so the total must land
@@ -5155,12 +5160,19 @@ class PyTorchModelEngine(ModelEngine):
         ``exact_shape`` is an already agreed ``(G,V,pad_tokens)`` from the
         exact SPS selector. It bypasses bucket rounding: changing V here would
         execute a different cell from the one the policy priced.
+
+        ``exact_zero_real`` means this rank contributes no logical requests
+        but carries the one scheduler-owned attention-DP dummy. The dummy is
+        mapped onto the high row when ``V % G != 0``; CUDA padding supplies
+        the remaining low/high rows without publishing output or KV ownership
+        for a real request.
         """
         runner = self.cuda_graph_runner
         # Cleared on entry so every early return leaves no stale value: a
         # bucket carried over from a previous step would key into the wrong
         # graph. The padded row count follows the same rule.
         runner.agreed_ragged_bucket = None
+        runner.ragged_zero_real_high_rows = 0
         self._dspark_last_padded_bs = None
         if not runner.enabled or not verify_lens:
             return None
@@ -5254,6 +5266,40 @@ class PyTorchModelEngine(ModelEngine):
                     f"to uniform scheduling: {exc}")
                 return None
             padded_bs, bucket = shape.padded_bs, shape.bucket
+
+        if exact_zero_real:
+            if (exact_shape is None or len(generation_requests) != 1
+                    or not generation_requests[0].is_attention_dp_dummy
+                    or len(verify_lens) != 1):
+                raise RuntimeError(
+                    "DSpark zero-real exact fit lost its single scheduled "
+                    "attention-DP dummy invariant")
+            quotient, remainder = divmod(int(bucket), int(padded_bs))
+            if (quotient < 1 or quotient + int(remainder > 0)
+                    > max_verify_len):
+                raise RuntimeError(
+                    "DSpark zero-real exact bucket has no bounded low/high "
+                    f"row split: G={padded_bs}, V={bucket}, "
+                    f"max_tokens={max_verify_len}")
+            expected_scheduled_window = quotient - 1 + int(remainder > 0)
+            if int(verify_lens[0]) != expected_scheduled_window:
+                raise RuntimeError(
+                    "DSpark zero-real scheduled dummy window differs from "
+                    f"the exact quotient/remainder split: got={verify_lens[0]}, "
+                    f"expected={expected_scheduled_window}")
+            if remainder > 1:
+                draft_len = int(self.spec_config.max_draft_len)
+                if draft_len not in runner.secondary_padding_dummy_requests:
+                    raise RuntimeError(
+                        "DSpark secondary padding dummy disappeared after "
+                        "the all-rank exact-cell agreement")
+            self._dspark_last_padded_bs = int(padded_bs)
+            self._dspark_last_num_real = 0
+            runner.agreed_ragged_bucket = int(bucket)
+            runner.ragged_pad_verify_len = int(quotient) - 1
+            runner.ragged_zero_real_high_rows = int(remainder)
+            generation_requests[0].py_verify_len = expected_scheduled_window
+            return int(bucket)
 
         full_bucket = int(padded_bs) * (int(tiers[-1]) + 1)
         worker = self._get_spec_worker()
