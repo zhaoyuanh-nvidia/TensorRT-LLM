@@ -25,24 +25,25 @@ import torch
 import torch.nn.functional as F
 
 import tensorrt_llm._torch.models.modeling_dspark as modeling_dspark
-from tensorrt_llm._torch.models.dspark.attention import (
+from tensorrt_llm._torch.models.modeling_dspark import (
+    DSv4DSparkDraftModel,
     apply_dspark_rotary,
     apply_dspark_rotary_batched,
+    build_draft_input_ids,
     dspark_attention_forward,
     dspark_attention_forward_batched,
+    dspark_propose,
     dspark_sparse_attn,
     get_dspark_topk_idxs,
     get_dspark_topk_idxs_batched,
     precompute_dspark_freqs_cis,
 )
-from tensorrt_llm._torch.models.dspark.draft import build_draft_input_ids, dspark_propose
-from tensorrt_llm._torch.models.dspark.heads import (
+from tensorrt_llm._torch.models.modeling_speculative import (
     DSparkConfidenceHead,
     RNNHead,
     VanillaMarkov,
     build_markov_head,
 )
-from tensorrt_llm._torch.models.modeling_dspark import DSparkDraftModel
 
 VOCAB, RANK, HID, BLK = 257, 16, 32, 5
 DRAFT_B, HEADS_B = 2, 3
@@ -61,8 +62,8 @@ def test_rope_table_is_cached_once_per_device():
         _freqs_table_cache={},
     )
 
-    first = DSparkDraftModel._dspark_freqs_table(model, torch.device("cpu"))
-    second = DSparkDraftModel._dspark_freqs_table(model, torch.device("cpu"))
+    first = DSv4DSparkDraftModel._dspark_freqs_table(model, torch.device("cpu"))
+    second = DSv4DSparkDraftModel._dspark_freqs_table(model, torch.device("cpu"))
 
     assert first.data_ptr() == second.data_ptr()
     assert len(model._freqs_table_cache) == 1
@@ -105,7 +106,7 @@ def test_dspark_block_uses_stage_id_as_attention_layer_idx(monkeypatch):
         spec_config=None,
     )
 
-    block = modeling_dspark.DSparkBlock(
+    block = modeling_dspark.DSv4DSparkBlock(
         model_config,
         layer_idx=10,
         aux_stream_dict={},
@@ -187,7 +188,7 @@ def test_forward_stage_honors_enable_fused_hc(monkeypatch, enable_fused_hc):
         ),
     )
 
-    actual = DSparkDraftModel._forward_stage(
+    actual = DSv4DSparkDraftModel._forward_stage(
         model,
         stage,
         h,
@@ -888,9 +889,7 @@ def test_dspark_propose_is_free_of_host_syncs():
     import io
     import tokenize
 
-    from tensorrt_llm._torch.models.dspark import draft as draft_mod
-
-    src = inspect.getsource(draft_mod.dspark_propose)
+    src = inspect.getsource(modeling_dspark.dspark_propose)
     # Strip comments and string literals so the check reads the code, not the
     # prose describing it (the implementation comments name these very calls).
     code = "".join(
