@@ -1168,6 +1168,7 @@ def test_graph_key_uses_the_agreed_bucket_not_a_fresh_sum():
 
     class _R:
         spec_config = type("S", (), {"enable_ragged_verify": True})()
+        _dspark_trims_submitted_tokens = True
         agreed_ragged_bucket = None
 
     def _batch(*verify_lens):
@@ -1201,6 +1202,7 @@ def test_graph_key_uses_the_agreed_bucket_not_a_fresh_sum():
     # Config gate still wins: a non-ragged engine keeps the original key shape.
     r.agreed_ragged_bucket = 512
     r.spec_config = type("S", (), {"enable_ragged_verify": False})()
+    r._dspark_trims_submitted_tokens = False
     assert get(r, windowed) is None
 
 
