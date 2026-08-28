@@ -5114,6 +5114,10 @@ class PyTorchModelEngine(ModelEngine):
         tiers = sorted({int(t) for t in self.spec_config.verify_len_tiers})
         return [int(padded_bs) * (t + 1) for t in tiers]
 
+    def _get_spec_worker(self):
+        """Return the one-model speculative worker when it is initialized."""
+        return getattr(self.model, "spec_worker", None)
+
     def _record_dspark_graph_use(self, *, replayed: bool, shape=None) -> None:
         """Count graph replay vs eager for the DSpark ragged stats, if enabled."""
         stats = self._dspark_ragged_stats

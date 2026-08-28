@@ -1286,6 +1286,20 @@ def test_exact_fit_executes_the_selected_bucket_without_rounding(monkeypatch):
     assert [request.py_verify_len for request in requests] == [5, 5, 5]
 
 
+def test_static_warmup_observability_is_safe_without_spec_worker():
+    """Static warmup may record graph use before a DSpark worker exists."""
+    import types
+
+    from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
+
+    engine = object.__new__(PyTorchModelEngine)
+    engine.model = types.SimpleNamespace()
+
+    assert engine._get_spec_worker() is None
+    assert engine._dspark_ragged_stats is None
+    engine._record_dspark_graph_use(replayed=False, shape="warmup")
+
+
 def test_feature_off_metadata_paths_do_not_scan_request_windows():
     import types
 
