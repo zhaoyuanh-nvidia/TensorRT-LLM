@@ -40,6 +40,11 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
+    def _invalidate_mla_scheduler_buffers(self) -> None:
+        """Invalidate request- and token-prefix buffers derived from sequence lengths."""
+        super()._invalidate_mla_scheduler_buffers()
+        self._fused_q_gen_cu_seqlens_valid = False
+
     def __post_init__(self):
         super().__post_init__()
         self.num_total_compressed_tokens = {}
@@ -102,6 +107,21 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             self.cu_seq_lens_cuda, device="cpu", pin_memory=prefer_pinned()
         )
         self.cu_seq_lens[0] = 0
+
+        # Request-major token prefixes for the fused Q-RoPE kernel. Unlike the
+        # token-major sparse-MLA view, this kernel can consume one arbitrary
+        # query length per request through cu_q_seqlens. Keep separate storage
+        # from both the compressor's prefixes and MLA's Q-row prefixes: those
+        # buffers can be read concurrently or use a different presentation.
+        self.fused_q_gen_cu_seqlens = self.get_empty(
+            self.cuda_graph_buffers,
+            (self.max_num_sequences + 1,),
+            cache_name="fused_q_gen_cu_seqlens",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
+        )
+        self.fused_q_gen_cu_seqlens[:1].zero_()
+        self._fused_q_gen_cu_seqlens_valid = False
 
         # Tokens each generation request appends this step. Only populated for
         # ragged verification; uniform batches continue to use the scalar
@@ -299,6 +319,51 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
 
         # Draft-sized sparse buffers for one-model MTP separate draft KV cache.
         self._init_draft_sparse_buffers()
+
+    def mla_prepare_fused_q_gen_cu_seqlens(self) -> Optional[torch.Tensor]:
+        """Return stable request-major query prefixes for ragged fused Q-RoPE.
+
+        The fused Q normalization op accepts token prefixes (not Q rows), so
+        this deliberately uses request-major ``seq_lens_cuda`` rather than the
+        one-row-per-token presentation used by sparse MLA. The cumsum writes
+        into graph-owned storage once per iteration; device-window graph
+        replay therefore updates values without changing the captured address.
+        """
+        if not self.is_ragged_verify or self.num_generations <= 0:
+            return None
+
+        num_contexts = self.num_contexts
+        num_generations = self.num_generations
+        cu_seqlens = getattr(self, "fused_q_gen_cu_seqlens", None)
+        seq_lens_cuda = getattr(self, "seq_lens_cuda", None)
+        if (
+            cu_seqlens is None
+            or seq_lens_cuda is None
+            or num_generations + 1 > cu_seqlens.shape[0]
+        ):
+            return None
+
+        if not self._fused_q_gen_cu_seqlens_valid:
+            torch.cumsum(
+                seq_lens_cuda[num_contexts : num_contexts + num_generations],
+                0,
+                dtype=torch.int32,
+                out=cu_seqlens[1 : num_generations + 1],
+            )
+            self._fused_q_gen_cu_seqlens_valid = True
+        return cu_seqlens[: num_generations + 1]
+
+    def apply_device_ragged_layout(
+        self,
+        verify_lens: torch.Tensor,
+        req_idx: torch.Tensor,
+        kv_correction: torch.Tensor,
+    ) -> None:
+        """Install device-selected windows and invalidate derived Q prefixes."""
+        super().apply_device_ragged_layout(verify_lens, req_idx, kv_correction)
+        # This call precedes the first model layer. Its fixed-address cumsum is
+        # therefore captured once after the layout update and replayed in order.
+        self._invalidate_mla_scheduler_buffers()
 
     def prepare_for_indexer_k_cache(self):
         """Prepare the shared indexer K-cache decode table for DSA kernels."""
