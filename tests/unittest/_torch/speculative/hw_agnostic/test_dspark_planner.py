@@ -1018,6 +1018,35 @@ def test_exact_allocator_spends_the_modeled_real_target():
     assert budget == 12
     assert pad_tokens == 4
     assert sum(value + 1 for value in lens) + pad_tokens == 22
+    assert "predicted_steps" not in planner.stats
+    assert "predicted_ms_sum" not in planner.stats
+    assert "exact_cell_hist" not in planner.stats
+    assert not hasattr(planner, "last_predicted_step_ms")
+
+
+def test_exact_planner_does_not_record_fallbacks_without_detailed_stats():
+    table = ExactSpsCostTable(
+        tables={4: SpsCostTable(token_counts=(0, 12), step_time_ms=(8.0, 7.0))},
+        max_draft_len=5,
+    )
+    planner = DSparkVerifyPlanner(
+        cfg=DSparkScheduleConfig(block_size=5, min_verify_len=1),
+        cost_table=table,
+        tiers=[1, 3, 5],
+    )
+
+    assert planner.prepare_exact_sps_decision(num_gen_requests=-1) is None
+    assert planner.prepare_exact_sps_decision(num_gen_requests=1) is None
+    assert planner.stats == {
+        "decisions": 0,
+        "fallback_no_snapshot": 0,
+        "fallback_flat_cost": 0,
+        "fallback_no_confidence": 0,
+        "fallback_short_snapshot": 0,
+        "fallback_no_gen_requests": 0,
+        "fallback_full_k": 0,
+        "forced_steps": 0,
+    }
 
 
 # --------------------------------------------------------------------------
@@ -1259,6 +1288,7 @@ def test_cross_rank_full_bucket_routes_to_native_static_k():
     planner = types.SimpleNamespace(
         forced_verify_len=None,
         forced_budget_frac=None,
+        detailed_stats=True,
         stats={},
     )
     runner = types.SimpleNamespace(

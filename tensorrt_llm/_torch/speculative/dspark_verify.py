@@ -271,13 +271,15 @@ class DSparkVerifyPlanner:
         have no expected output and initially consume one anchor token; any V
         above real-row capacity is feasible but adds no yield.
         """
-        self.stats["decisions"] += 1
+        if self.detailed_stats:
+            self.stats["decisions"] += 1
         table = self.exact_cost_table
         if table is None:
             raise RuntimeError("prepare_exact_sps_decision requires an exact SPS table")
         n = int(num_gen_requests)
         if n < 0:
-            self.stats["fallback_no_gen_requests"] += 1
+            if self.detailed_stats:
+                self.stats["fallback_no_gen_requests"] += 1
             return None
         if self._forced_verify_len is not None or self._forced_budget_frac is not None:
             raise RuntimeError("profiling overrides must use the legacy pinned decision path")
@@ -314,12 +316,22 @@ class DSparkVerifyPlanner:
         if self.device_windows:
             snapshot = self._ready_older_snapshot()
             if snapshot is None:
-                self.stats["fallback_no_snapshot"] += 1
+                if self.detailed_stats:
+                    self.stats["fallback_no_snapshot"] += 1
                 return None
-            selected = self._gather_rows(num_gen_requests=n, rows=rows, snapshot=snapshot)
+            selected = self._gather_rows(
+                num_gen_requests=n,
+                rows=rows,
+                snapshot=snapshot,
+                record_stats=self.detailed_stats,
+            )
             stamps, staged_seq = self._prev_stamps, self._prev_seq
         else:
-            selected = self._gather_rows(num_gen_requests=n, rows=rows)
+            selected = self._gather_rows(
+                num_gen_requests=n,
+                rows=rows,
+                record_stats=self.detailed_stats,
+            )
             stamps, staged_seq = None, None
         if selected is None:
             return None
@@ -394,16 +406,16 @@ class DSparkVerifyPlanner:
         if n == 0:
             if real_tokens != 0 or budget != 0:
                 raise RuntimeError("zero-real exact SPS geometry assigned real-row work")
-            predicted = table.step_time(verifier_budget, graph_batch_size)
-            self.last_predicted_step_ms = float(predicted)
-            self.stats["predicted_ms_sum"] = self.stats.get(
-                "predicted_ms_sum", 0.0
-            ) + float(predicted)
-            self.stats["predicted_steps"] = self.stats.get("predicted_steps", 0) + 1
-            cell_hist = self.stats.setdefault("exact_cell_hist", {})
-            cell = f"G{graph_batch_size}V{verifier_budget}"
-            cell_hist[cell] = cell_hist.get(cell, 0) + 1
             if self.detailed_stats:
+                predicted = table.step_time(verifier_budget, graph_batch_size)
+                self.last_predicted_step_ms = float(predicted)
+                self.stats["predicted_ms_sum"] = self.stats.get(
+                    "predicted_ms_sum", 0.0
+                ) + float(predicted)
+                self.stats["predicted_steps"] = self.stats.get("predicted_steps", 0) + 1
+                cell_hist = self.stats.setdefault("exact_cell_hist", {})
+                cell = f"G{graph_batch_size}V{verifier_budget}"
+                cell_hist[cell] = cell_hist.get(cell, 0) + 1
                 self.stats["exact_zero_real_selected_steps"] = self.stats.get(
                     "exact_zero_real_selected_steps", 0
                 ) + 1
@@ -420,13 +432,16 @@ class DSparkVerifyPlanner:
         ).tolist()
         if sum(int(value) + 1 for value in lens) != real_tokens:
             raise RuntimeError("Exact SPS allocation did not spend its real-row token target")
-        predicted = table.step_time(verifier_budget, graph_batch_size)
-        self.last_predicted_step_ms = float(predicted)
-        self.stats["predicted_ms_sum"] = self.stats.get("predicted_ms_sum", 0.0) + float(predicted)
-        self.stats["predicted_steps"] = self.stats.get("predicted_steps", 0) + 1
-        cell_hist = self.stats.setdefault("exact_cell_hist", {})
-        cell = f"G{graph_batch_size}V{verifier_budget}"
-        cell_hist[cell] = cell_hist.get(cell, 0) + 1
+        if self.detailed_stats:
+            predicted = table.step_time(verifier_budget, graph_batch_size)
+            self.last_predicted_step_ms = float(predicted)
+            self.stats["predicted_ms_sum"] = self.stats.get(
+                "predicted_ms_sum", 0.0
+            ) + float(predicted)
+            self.stats["predicted_steps"] = self.stats.get("predicted_steps", 0) + 1
+            cell_hist = self.stats.setdefault("exact_cell_hist", {})
+            cell = f"G{graph_batch_size}V{verifier_budget}"
+            cell_hist[cell] = cell_hist.get(cell, 0) + 1
         return [int(value) for value in lens], int(budget), int(pad_tokens)
 
     @property
@@ -698,6 +713,7 @@ class DSparkVerifyPlanner:
         num_gen_requests: int,
         rows: Optional[Sequence[int]],
         snapshot: Optional[torch.Tensor] = None,
+        record_stats: bool = True,
     ) -> Optional[torch.Tensor]:
         """This step's confidence, one row per generation request, or None.
 
@@ -712,20 +728,24 @@ class DSparkVerifyPlanner:
         if snapshot is None:
             snapshot = self._ready_snapshot()
         if snapshot is None:
-            self.stats["fallback_no_snapshot"] += 1
+            if record_stats:
+                self.stats["fallback_no_snapshot"] += 1
             return None
         if rows is None:
             if snapshot.shape[0] < num_gen_requests:
-                self.stats["fallback_short_snapshot"] += 1
+                if record_stats:
+                    self.stats["fallback_short_snapshot"] += 1
                 return None
             selected = snapshot[:num_gen_requests]
         else:
             if len(rows) != num_gen_requests:
-                self.stats["fallback_short_snapshot"] += 1
+                if record_stats:
+                    self.stats["fallback_short_snapshot"] += 1
                 return None
             selected = snapshot[torch.as_tensor(list(rows), dtype=torch.long)]
         if selected.numel() == 0:
-            self.stats["fallback_no_confidence"] += 1
+            if record_stats:
+                self.stats["fallback_no_confidence"] += 1
             return None
         return selected
 

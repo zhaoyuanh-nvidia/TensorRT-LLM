@@ -3986,7 +3986,8 @@ class PyExecutor:
                         cost_table=exact_table,
                     )
                     if selected_verifier_budget == 0:
-                        planner.stats["fallback_full_k"] += 1
+                        if planner.detailed_stats:
+                            planner.stats["fallback_full_k"] += 1
                         fallback_reason = "exact_native_k"
                         exact_local = None
                     elif not _dspark_exact_secondary_padding_ready(
@@ -3997,7 +3998,8 @@ class PyExecutor:
                                 secondary_padding_dummy_index)):
                         # Only a zero-real quotient/remainder layout with more
                         # than row zero high needs the second cached dummy.
-                        planner.stats["fallback_full_k"] += 1
+                        if planner.detailed_stats:
+                            planner.stats["fallback_full_k"] += 1
                         fallback_reason = "secondary_padding_not_ready"
                         exact_local = None
                     else:

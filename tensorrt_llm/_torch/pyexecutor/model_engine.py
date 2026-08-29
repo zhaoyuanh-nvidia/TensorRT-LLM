@@ -5443,7 +5443,7 @@ class PyTorchModelEngine(ModelEngine):
             # the full-K graph. At that point ragged execution saves no target
             # work, so preserve the native static path (and its efficient
             # multi-G tail handling) rather than paying ragged bookkeeping.
-            if planner is not None:
+            if planner is not None and getattr(planner, "detailed_stats", False):
                 planner.stats["fallback_full_k"] = (
                     planner.stats.get("fallback_full_k", 0) + 1)
             return None
