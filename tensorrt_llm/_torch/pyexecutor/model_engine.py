@@ -1564,6 +1564,8 @@ class PyTorchModelEngine(ModelEngine):
                 self.cuda_graph_runner.ragged_zero_real_high_rows = 0
                 self._run_cuda_graph_warmup(resource_manager)
         log_mem_snapshot("warmup/after_cuda_graph_capture")
+        self._warmup_dspark_ragged_compressor_metadata()
+        log_mem_snapshot("warmup/after_dspark_ragged_compressor_metadata")
         # Pre-compile DeepGEMM paged_mqa_logits_metadata for every 32-aligned
         # batch bucket the runtime can produce (max_batch_size scaled by the
         # MTP / DSL expansion factor when applicable). CUDA-graph warmup only
@@ -1598,6 +1600,135 @@ class PyTorchModelEngine(ModelEngine):
         # .fdata reflects steady-state serving only. No-op on normal builds.
         from ..bolt_profiling import maybe_bolt_clear_counters
         maybe_bolt_clear_counters()
+
+    @torch.inference_mode()
+    def _warmup_dspark_ragged_compressor_metadata(self) -> None:
+        """Compile DSv4 ragged metadata for a non-CUDA-graph batch size.
+
+        Whole-model CUDA-graph warmup exercises only configured graph batch
+        sizes. The first mixed attention-DP iteration can contain an
+        intermediate number of generation requests, which otherwise triggers
+        a long ``torch.compile`` specialization immediately before a TP
+        collective. Ranks without generation work reach the collective first
+        and can trip the executor hang detector while their peers compile.
+
+        One non-bucket probe forces the dynamic specialization during engine
+        warmup, before the hang detector starts. It uses the metadata's real
+        persistent buffers so the tensor shape and stride guards match serving.
+        Those buffers are created under inference mode, so all probe and
+        cleanup mutations must run under the same mode.
+        """
+        if (not self._dspark_confidence_enabled
+                or not self._dspark_trims_submitted_tokens):
+            return
+
+        metadata = getattr(self, "attn_metadata", None)
+        required_attributes = (
+            "_compute_compressed_mask",
+            "_compute_gen_compressed_position_ids",
+            "_compress_ratios_sorted",
+            "compressed_mask_cuda",
+            "compressed_position_ids_cuda",
+            "cu_new_comp_kv_cuda",
+            "max_draft_tokens",
+            "new_comp_kv_lens_cuda",
+            "past_kv_lens_cuda",
+        )
+        missing_attributes = [
+            name for name in required_attributes
+            if metadata is None or not hasattr(metadata, name)
+        ]
+        if missing_attributes:
+            raise RuntimeError(
+                "DSpark ragged metadata warmup requires the DSv4 compressor "
+                "contract; missing " + ", ".join(missing_attributes))
+
+        graph_batch_sizes = {
+            int(batch_size)
+            for batch_size in self._cuda_graph_batch_sizes
+        }
+        num_generations = next(
+            (candidate for candidate in range(int(self.batch_size) - 1, 0, -1)
+             if candidate not in graph_batch_sizes), None)
+        if num_generations is None:
+            return
+
+        compress_ratios = [
+            int(ratio) for ratio in metadata._compress_ratios_sorted
+        ]
+        tokens_per_generation = 1 + int(metadata.max_draft_tokens)
+        total_compressed_tokens = {}
+        gen_output_offsets = {ratio: 0 for ratio in compress_ratios}
+        prepared_ratios = []
+        try:
+            for ratio in compress_ratios:
+                compressed_tokens_per_generation = (tokens_per_generation +
+                                                    ratio - 1) // ratio
+                total_tokens = (num_generations *
+                                compressed_tokens_per_generation)
+                past_kv_lens = metadata.past_kv_lens_cuda[ratio]
+                cu_new_comp = metadata.cu_new_comp_kv_cuda[ratio]
+                new_comp = metadata.new_comp_kv_lens_cuda[ratio]
+                compressed_positions = (
+                    metadata.compressed_position_ids_cuda[ratio])
+                compressed_mask = metadata.compressed_mask_cuda[ratio]
+                if (past_kv_lens.numel() < num_generations
+                        or cu_new_comp.numel() < num_generations + 1
+                        or new_comp.numel() < num_generations
+                        or compressed_positions.numel() < total_tokens
+                        or compressed_mask.numel() < total_tokens):
+                    raise RuntimeError(
+                        "DSpark ragged compressor metadata buffers cannot "
+                        f"hold the compile probe with {num_generations} "
+                        "generation requests and compression ratio "
+                        f"{ratio}")
+
+                total_compressed_tokens[ratio] = total_tokens
+                prepared_ratios.append(ratio)
+                past_kv_lens[:num_generations].zero_()
+                new_comp[:num_generations].fill_(
+                    compressed_tokens_per_generation)
+                cu_new_comp[:num_generations + 1].copy_(
+                    torch.arange(num_generations + 1,
+                                 dtype=cu_new_comp.dtype,
+                                 device=cu_new_comp.device))
+                cu_new_comp[:num_generations +
+                            1].mul_(compressed_tokens_per_generation)
+
+            logger.info(
+                "DSpark ragged metadata warmup: compiling one non-graph "
+                f"shape with {num_generations} generation requests")
+            metadata._compute_gen_compressed_position_ids(
+                metadata.past_kv_lens_cuda,
+                metadata.cu_new_comp_kv_cuda,
+                metadata.compressed_position_ids_cuda,
+                0,
+                num_generations,
+                tokens_per_generation,
+                compress_ratios,
+                gen_output_offsets,
+            )
+            metadata._compute_compressed_mask(
+                metadata.new_comp_kv_lens_cuda,
+                metadata.cu_new_comp_kv_cuda,
+                metadata.compressed_mask_cuda,
+                num_generations,
+                total_compressed_tokens,
+                compress_ratios,
+            )
+            torch.cuda.synchronize()
+        finally:
+            for ratio in prepared_ratios:
+                total_tokens = total_compressed_tokens[ratio]
+                metadata.past_kv_lens_cuda[ratio][:num_generations].zero_()
+                metadata.new_comp_kv_lens_cuda[ratio][:num_generations].zero_()
+                metadata.cu_new_comp_kv_cuda[ratio][:num_generations +
+                                                    1].zero_()
+                metadata.compressed_position_ids_cuda[
+                    ratio][:total_tokens].zero_()
+                metadata.compressed_mask_cuda[ratio][:total_tokens].zero_()
+            torch.cuda.synchronize()
+        logger.info("DSpark ragged metadata warmup complete")
 
     def _warmup_dg_paged_mqa_logits_metadata(self) -> None:
         """Pre-compile DeepGEMM's `get_paged_mqa_logits_metadata` helper for

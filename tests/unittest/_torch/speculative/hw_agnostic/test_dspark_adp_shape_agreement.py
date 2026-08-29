@@ -570,6 +570,232 @@ def test_zero_real_fit_rejects_lost_secondary_dummy_after_agreement():
         )
 
 
+def test_ragged_compressor_warmup_primes_intermediate_generation_count(
+        monkeypatch):
+    import torch
+
+    from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
+
+    position_calls = []
+    mask_calls = []
+    ratios = [1, 4]
+
+    def record_positions(*args):
+        position_calls.append({
+            "inference_mode": torch.is_inference_mode_enabled(),
+            "tail": args[3:],
+            "cu_new": {
+                ratio: args[1][ratio][:8].tolist()
+                for ratio in ratios
+            },
+        })
+
+    def record_mask(*args):
+        mask_calls.append({
+            "inference_mode": torch.is_inference_mode_enabled(),
+            "tail": args[3:],
+            "new_comp": {
+                ratio: args[0][ratio][:7].tolist()
+                for ratio in ratios
+            },
+        })
+
+    metadata = SimpleNamespace(
+        _compress_ratios_sorted=ratios,
+        max_draft_tokens=5,
+        past_kv_lens_cuda={
+            ratio: torch.empty(8, dtype=torch.int32)
+            for ratio in ratios
+        },
+        cu_new_comp_kv_cuda={
+            ratio: torch.empty(9, dtype=torch.int32)
+            for ratio in ratios
+        },
+        new_comp_kv_lens_cuda={
+            ratio: torch.empty(8, dtype=torch.int32)
+            for ratio in ratios
+        },
+        compressed_position_ids_cuda={
+            ratio: torch.empty(48, dtype=torch.int32)
+            for ratio in ratios
+        },
+        compressed_mask_cuda={
+            ratio: torch.empty(48, dtype=torch.bool)
+            for ratio in ratios
+        },
+        _compute_gen_compressed_position_ids=record_positions,
+        _compute_compressed_mask=record_mask,
+    )
+    engine = SimpleNamespace(
+        _dspark_confidence_enabled=True,
+        _dspark_trims_submitted_tokens=True,
+        attn_metadata=metadata,
+        batch_size=8,
+        _cuda_graph_batch_sizes=[1, 4, 8],
+    )
+    sync_calls = []
+    monkeypatch.setattr(torch.cuda, "synchronize",
+                        lambda: sync_calls.append(True))
+
+    PyTorchModelEngine._warmup_dspark_ragged_compressor_metadata(engine)
+
+    assert len(position_calls) == 1
+    assert position_calls[0]["inference_mode"]
+    assert position_calls[0]["tail"][1:4] == (7, 6, ratios)
+    assert position_calls[0]["tail"][4] == {1: 0, 4: 0}
+    assert position_calls[0]["cu_new"][1] == list(range(0, 43, 6))
+    assert position_calls[0]["cu_new"][4] == list(range(0, 15, 2))
+    assert len(mask_calls) == 1
+    assert mask_calls[0]["inference_mode"]
+    assert mask_calls[0]["tail"] == (7, {1: 42, 4: 14}, ratios)
+    assert mask_calls[0]["new_comp"][1] == [6] * 7
+    assert mask_calls[0]["new_comp"][4] == [2] * 7
+    total_tokens = {1: 42, 4: 14}
+    for ratio in ratios:
+        assert not metadata.past_kv_lens_cuda[ratio][:7].any()
+        assert not metadata.new_comp_kv_lens_cuda[ratio][:7].any()
+        assert not metadata.cu_new_comp_kv_cuda[ratio][:8].any()
+        assert not metadata.compressed_position_ids_cuda[
+            ratio][:total_tokens[ratio]].any()
+        assert not metadata.compressed_mask_cuda[
+            ratio][:total_tokens[ratio]].any()
+    assert sync_calls == [True, True]
+
+
+def test_ragged_compressor_warmup_cleans_buffers_after_helper_error(
+        monkeypatch):
+    import torch
+
+    from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
+
+    ratio = 1
+    num_generations = 3
+    total_tokens = 18
+    compressed_masks = {ratio: torch.ones(24, dtype=torch.bool)}
+
+    def raise_during_positions(*args):
+        assert torch.is_inference_mode_enabled()
+        args[2][ratio][:total_tokens].fill_(7)
+        raise RuntimeError("compile boom")
+
+    metadata = SimpleNamespace(
+        _compress_ratios_sorted=[ratio],
+        max_draft_tokens=5,
+        past_kv_lens_cuda={ratio: torch.full((4, ), 9, dtype=torch.int32)},
+        cu_new_comp_kv_cuda={ratio: torch.empty(5, dtype=torch.int32)},
+        new_comp_kv_lens_cuda={ratio: torch.empty(4, dtype=torch.int32)},
+        compressed_position_ids_cuda={
+            ratio: torch.empty(24, dtype=torch.int32)
+        },
+        compressed_mask_cuda=compressed_masks,
+        _compute_gen_compressed_position_ids=raise_during_positions,
+        _compute_compressed_mask=lambda *args: None,
+    )
+    engine = SimpleNamespace(
+        _dspark_confidence_enabled=True,
+        _dspark_trims_submitted_tokens=True,
+        attn_metadata=metadata,
+        batch_size=4,
+        _cuda_graph_batch_sizes=[1, 4],
+    )
+    sync_calls = []
+    monkeypatch.setattr(torch.cuda, "synchronize",
+                        lambda: sync_calls.append(True))
+
+    with pytest.raises(RuntimeError, match="compile boom"):
+        PyTorchModelEngine._warmup_dspark_ragged_compressor_metadata(engine)
+
+    assert not metadata.past_kv_lens_cuda[ratio][:num_generations].any()
+    assert not metadata.new_comp_kv_lens_cuda[ratio][:num_generations].any()
+    assert not metadata.cu_new_comp_kv_cuda[ratio][:num_generations + 1].any()
+    assert not metadata.compressed_position_ids_cuda[
+        ratio][:total_tokens].any()
+    assert not metadata.compressed_mask_cuda[ratio][:total_tokens].any()
+    assert sync_calls == [True]
+
+
+def test_ragged_compressor_warmup_is_disabled_without_trimmed_tokens():
+    from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
+
+    engine = SimpleNamespace(
+        _dspark_confidence_enabled=True,
+        _dspark_trims_submitted_tokens=False,
+    )
+
+    PyTorchModelEngine._warmup_dspark_ragged_compressor_metadata(engine)
+
+
+def test_ragged_compressor_warmup_rejects_missing_metadata_contract():
+    from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
+
+    engine = SimpleNamespace(
+        _dspark_confidence_enabled=True,
+        _dspark_trims_submitted_tokens=True,
+        attn_metadata=SimpleNamespace(),
+    )
+
+    with pytest.raises(RuntimeError, match="missing .*max_draft_tokens"):
+        PyTorchModelEngine._warmup_dspark_ragged_compressor_metadata(engine)
+
+
+def test_ragged_compressor_warmup_skips_when_every_shape_has_a_graph():
+    from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
+
+    metadata = SimpleNamespace(
+        _compute_compressed_mask=object(),
+        _compute_gen_compressed_position_ids=object(),
+        _compress_ratios_sorted=[],
+        compressed_mask_cuda={},
+        compressed_position_ids_cuda={},
+        cu_new_comp_kv_cuda={},
+        max_draft_tokens=5,
+        new_comp_kv_lens_cuda={},
+        past_kv_lens_cuda={},
+    )
+    engine = SimpleNamespace(
+        _dspark_confidence_enabled=True,
+        _dspark_trims_submitted_tokens=True,
+        attn_metadata=metadata,
+        batch_size=3,
+        _cuda_graph_batch_sizes=[1, 2, 3],
+    )
+
+    PyTorchModelEngine._warmup_dspark_ragged_compressor_metadata(engine)
+
+
+def test_ragged_compressor_warmup_rejects_undersized_buffers(monkeypatch):
+    import torch
+
+    from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
+
+    reject_call = lambda *args: pytest.fail("compile helper must not run")
+    metadata = SimpleNamespace(
+        _compute_compressed_mask=reject_call,
+        _compute_gen_compressed_position_ids=reject_call,
+        _compress_ratios_sorted=[1],
+        compressed_mask_cuda={1: torch.empty(1, dtype=torch.bool)},
+        compressed_position_ids_cuda={1: torch.empty(1, dtype=torch.int32)},
+        cu_new_comp_kv_cuda={1: torch.empty(1, dtype=torch.int32)},
+        max_draft_tokens=5,
+        new_comp_kv_lens_cuda={1: torch.empty(1, dtype=torch.int32)},
+        past_kv_lens_cuda={1: torch.empty(1, dtype=torch.int32)},
+    )
+    engine = SimpleNamespace(
+        _dspark_confidence_enabled=True,
+        _dspark_trims_submitted_tokens=True,
+        attn_metadata=metadata,
+        batch_size=8,
+        _cuda_graph_batch_sizes=[8],
+    )
+    sync_calls = []
+    monkeypatch.setattr(torch.cuda, "synchronize",
+                        lambda: sync_calls.append(True))
+
+    with pytest.raises(RuntimeError, match="cannot hold the compile probe"):
+        PyTorchModelEngine._warmup_dspark_ragged_compressor_metadata(engine)
+    assert sync_calls == [True]
+
+
 def test_rebalance_suspends_both_dummy_variants_and_releases_pair_once():
     low = SimpleNamespace(py_request_id=10)
     high = SimpleNamespace(py_request_id=11)
