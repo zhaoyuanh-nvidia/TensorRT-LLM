@@ -4355,6 +4355,7 @@ class TestDSparkConfidenceScheduling:
     def test_defaults_are_off(self):
         c = self._cfg()
         assert c.enable_confidence_scheduling is False
+        assert c.enable_fused_confidence_scheduler is False
         assert c.confidence_verify_len_tiers is None
         # With scheduling off the ladder is just the static length.
         assert c.verify_len_tiers == [5]
@@ -4387,3 +4388,10 @@ class TestDSparkConfidenceScheduling:
     def test_ladder_is_deduped_and_sorted(self):
         c = self._scheduled(confidence_verify_len_tiers=[5, 1, 3, 3])
         assert c.verify_len_tiers == [1, 3, 5]
+
+    def test_fused_scheduler_is_independently_gated(self):
+        with pytest.raises(ValueError,
+                           match="enable_fused_confidence_scheduler"):
+            self._cfg(enable_fused_confidence_scheduler=True)
+        c = self._scheduled(enable_fused_confidence_scheduler=True)
+        assert c.enable_fused_confidence_scheduler is True

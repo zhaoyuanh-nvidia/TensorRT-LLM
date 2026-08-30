@@ -3020,6 +3020,16 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         "graph axis and costs more graph memory than uniform scheduling.",
         status="prototype")
 
+    enable_fused_confidence_scheduler: bool = Field(
+        default=False,
+        description=
+        "Use the optional policy-neutral Triton implementation of confidence "
+        "top-k allocation plus exact CUDA-graph bucket fill. This changes only "
+        "the scheduler launch path: budgets, survival thresholds, selected "
+        "windows, and fallback behavior remain identical. It is independently "
+        "default-off and requires confidence scheduling with ragged verify.",
+        status="prototype")
+
     decoding_type: Literal["DSpark"] = Field(default="DSpark")
 
     attention_backend: Literal["VANILLA", "TRTLLM"] = Field(
@@ -3037,6 +3047,12 @@ class DSparkDecodingConfig(DecodingBaseConfig):
 
     @model_validator(mode="after")
     def validate_ragged_verify(self):
+        if self.enable_fused_confidence_scheduler and not (
+                self.enable_confidence_scheduling and self.enable_ragged_verify):
+            raise ValueError(
+                "enable_fused_confidence_scheduler requires both "
+                "enable_confidence_scheduling=True and "
+                "enable_ragged_verify=True")
         if self.enable_ragged_verify and not self.enable_confidence_scheduling:
             raise ValueError(
                 "enable_ragged_verify requires enable_confidence_scheduling=True: "
