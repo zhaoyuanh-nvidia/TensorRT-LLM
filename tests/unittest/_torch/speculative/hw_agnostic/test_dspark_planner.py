@@ -798,6 +798,7 @@ def test_exact_selector_keeps_native_on_tie_or_below_threshold():
             graph_batch_size=128,
             native_expected_yield=10.0,
             compact_expected_yields={704: 8.0},
+            compact_max_yield_losses_per_request={704: 2.0},
             cost_table=table,
         )
         == 0
@@ -807,6 +808,7 @@ def test_exact_selector_keeps_native_on_tie_or_below_threshold():
             graph_batch_size=128,
             native_expected_yield=10.0,
             compact_expected_yields={704: 8.08},
+            compact_max_yield_losses_per_request={704: 1.92},
             cost_table=table,
         )
         == 0
@@ -816,6 +818,7 @@ def test_exact_selector_keeps_native_on_tie_or_below_threshold():
             graph_batch_size=128,
             native_expected_yield=10.0,
             compact_expected_yields={704: 8.24},
+            compact_max_yield_losses_per_request={704: 1.76},
             cost_table=table,
         )
         == 704
@@ -825,6 +828,7 @@ def test_exact_selector_keeps_native_on_tie_or_below_threshold():
             graph_batch_size=128,
             native_expected_yield=10.0,
             compact_expected_yields={0: 10.0, 704: 8.24},
+            compact_max_yield_losses_per_request={704: 1.76},
             cost_table=table,
         )
 
@@ -843,6 +847,7 @@ def test_exact_selector_fails_closed_without_iteration_drain_metadata():
             graph_batch_size=128,
             native_expected_yield=10.0,
             compact_expected_yields={512: 8.5},
+            compact_max_yield_losses_per_request={512: 1.5},
             cost_table=table,
         )
         == 0
@@ -872,6 +877,7 @@ def test_exact_selector_applies_strict_iteration_drain_group_value():
             graph_batch_size=128,
             native_expected_yield=10.0,
             compact_expected_yields={512: 8.5},
+            compact_max_yield_losses_per_request={512: 1.5},
             cost_table=table,
         )
         == 0
@@ -882,9 +888,56 @@ def test_exact_selector_applies_strict_iteration_drain_group_value():
             graph_batch_size=128,
             native_expected_yield=10.0,
             compact_expected_yields={512: 8.6},
+            compact_max_yield_losses_per_request={512: 1.4},
             cost_table=table,
         )
         == 512
+    )
+
+
+@pytest.mark.parametrize("graph_batch_size", [16, 32, 64, 128])
+def test_exact_selector_reranks_every_g_by_guarded_group_value(graph_batch_size):
+    table = ExactSpsCostTable(
+        tables={
+            graph_batch_size: SpsCostTable(
+                token_counts=(
+                    0,
+                    3 * graph_batch_size,
+                    4 * graph_batch_size,
+                    5 * graph_batch_size,
+                ),
+                step_time_ms=(100.0, 60.0, 70.0, 80.0),
+            )
+        },
+        max_draft_len=5,
+        minimum_predicted_gain=0.01,
+        iteration_drain_guard=_drain_guard(
+            tail_graph_batch_size=graph_batch_size,
+            mean_output_tokens_per_request_iteration=20.0,
+            minimum_group_value_ms=20.0,
+        ),
+    )
+
+    # V=4G wins aggregate immediate goodput, but its worst active rank loses
+    # enough yield per request to miss the E2E guard. V=3G is the best guarded
+    # tier. V=5G does not clear the aggregate immediate-goodput threshold.
+    assert (
+        select_exact_sps_candidate(
+            graph_batch_size=graph_batch_size,
+            native_expected_yield=10.0,
+            compact_expected_yields={
+                3 * graph_batch_size: 6.2,
+                4 * graph_batch_size: 7.5,
+                5 * graph_batch_size: 8.0,
+            },
+            compact_max_yield_losses_per_request={
+                3 * graph_batch_size: 0.5,
+                4 * graph_batch_size: 3.0,
+                5 * graph_batch_size: 0.0,
+            },
+            cost_table=table,
+        )
+        == 3 * graph_batch_size
     )
 
 
@@ -907,6 +960,7 @@ def test_exact_selector_fails_closed_without_measured_compact_cell(graph_batch_s
             graph_batch_size=graph_batch_size,
             native_expected_yield=10.0,
             compact_expected_yields={},
+            compact_max_yield_losses_per_request={},
             cost_table=table,
         )
         == 0
@@ -974,8 +1028,7 @@ def test_exact_zero_real_rank_advertises_pad_only_cells_without_yield():
         detailed_stats=True,
     )
 
-    decision = planner.prepare_exact_sps_decision(
-        num_gen_requests=0, rows=[])
+    decision = planner.prepare_exact_sps_decision(num_gen_requests=0, rows=[])
 
     assert decision is not None
     assert decision.num_requests == 0
@@ -983,16 +1036,62 @@ def test_exact_zero_real_rank_advertises_pad_only_cells_without_yield():
     assert decision.native_expected_yield == 0.0
     assert decision.compact_expected_yields == (0.0, 0.0)
     lens, budget, pad_tokens = planner.allocate_exact_sps_candidate(
-        decision, graph_batch_size=4, verifier_budget=14)
+        decision, graph_batch_size=4, verifier_budget=14
+    )
     assert lens == []
     assert budget == 0
     assert pad_tokens == 3
     assert planner.stats["exact_cell_hist"] == {"G4V14": 1}
     assert planner.stats["exact_zero_real_ready_steps"] == 1
     assert planner.stats["exact_zero_real_selected_steps"] == 1
-    assert planner.stats["exact_zero_real_dummy_row_split_hist"] == {
-        "q3r2G4": 1
-    }
+    assert planner.stats["exact_zero_real_dummy_row_split_hist"] == {"q3r2G4": 1}
+
+
+def test_exact_saturated_cell_cannot_exceed_native_from_mixed_reductions():
+    raw = bytes.fromhex(
+        "082c583f4d09423fe6e2023f0555d73ebc90843e06a7483f8658153f8404f43e"
+        "8753cf3ece4b9b3e167a683f627c413f6e4d1e3f2833013f0d4d903ed4977b3f"
+        "21e5683f59f4663f666a4f3f5e42803e441a663f41d63a3f92192f3fb1bcf13e"
+        "aacb9e3e8473773f18bb693f17631c3fc54bde3e6f3cce3df4845d3f4e164e3f"
+        "8f770c3fa03af43e405f853e0a29533f913e383f170c2b3f9932cc3e290f663c")
+    survival = torch.frombuffer(bytearray(raw),
+                                dtype=torch.float32).clone().reshape(8, 5)
+    assert survival.numpy().tobytes() == raw
+
+    legacy_native = 8.0 + float(survival.sum())
+    legacy_base = 8.0 + float(survival[:, :3].sum())
+    legacy_optional = np.sort(
+        survival[:, 3:5].numpy().astype(np.float64).reshape(-1))[::-1]
+    legacy_compact = legacy_base + float(
+        np.cumsum(legacy_optional, dtype=np.float64)[-1])
+    assert int(np.ceil(legacy_native * 1_000_000)) == 31_971_823
+    assert int(np.floor(legacy_compact * 1_000_000)) == 31_971_824
+
+    table = ExactSpsCostTable(
+        tables={
+            16:
+            SpsCostTable(token_counts=(0, 64, 96),
+                         step_time_ms=(8.0, 7.0, 8.1))
+        },
+        max_draft_len=5)
+    planner = DSparkVerifyPlanner(
+        cfg=DSparkScheduleConfig(block_size=5, min_verify_len=3),
+        cost_table=table,
+        tiers=[3, 4, 5])
+    with (patch.object(planner,
+                       "_gather_rows",
+                       return_value=torch.zeros((8, 5))),
+          patch(
+              "tensorrt_llm._torch.speculative.dspark_verify.compute_survival",
+              return_value=survival)):
+        decision = planner.prepare_exact_sps_decision(num_gen_requests=8)
+
+    assert decision is not None
+    assert decision.compact_expected_yields == (decision.native_expected_yield, )
+    native_wire = int(np.ceil(decision.native_expected_yield * 1_000_000))
+    compact_wire = int(
+        np.floor(decision.compact_expected_yields[0] * 1_000_000))
+    assert compact_wire <= native_wire
 
 
 def test_exact_allocator_spends_the_modeled_real_target():

@@ -337,15 +337,21 @@ class DSparkVerifyPlanner:
             return None
         self._note_snapshot_stats(selected, rows, stamps=stamps, staged_seq=staged_seq)
         survival = compute_survival(self.apply_calibration(selected))
-        native_expected_yield = float(n) + float(survival.sum())
-
         floor = int(self.cfg.min_verify_len)
         max_verify_len = int(self.cfg.resolved_max_verify_len)
-        base_expected_yield = float(n) + float(survival[:, :floor].sum())
+        # Build every exact-cell yield from one float64 decomposition. Mixing
+        # torch float32 native/base reductions with a NumPy float64 optional
+        # prefix can make a saturated compact cell appear better than native
+        # solely because of reduction order.
+        survival_values = survival.numpy().astype(np.float64, copy=False)
+        base_expected_yield = float(n) + float(
+            survival_values[:, :floor].sum(dtype=np.float64))
         candidates = np.sort(
-            survival[:, floor:max_verify_len].numpy().astype(np.float64).reshape(-1)
+            survival_values[:, floor:max_verify_len].reshape(-1)
         )[::-1]
-        prefix = np.concatenate(([0.0], np.cumsum(candidates)))
+        prefix = np.concatenate(([0.0], np.cumsum(candidates, dtype=np.float64)))
+        native_expected_yield = base_expected_yield + float(prefix[-1]) + float(
+            survival_values[:, max_verify_len:].sum(dtype=np.float64))
         compact_expected_yields = []
         for graph_batch_size, verifier_budget in table.candidate_cells():
             geometry = _exact_cell_geometry(

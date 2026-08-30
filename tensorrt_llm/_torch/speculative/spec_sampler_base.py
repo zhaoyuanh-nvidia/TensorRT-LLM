@@ -23,7 +23,7 @@ requests host-side. Buffer shapes derive entirely from ``TorchSampler.Args``.
 """
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 
@@ -45,6 +45,8 @@ from ..pyexecutor.sampler.penalties import has_occurrence_penalty
 from ..pyexecutor.sampler.sampler_common import _request_get_sampling_params, top_p_decay_active
 from ..pyexecutor.sampler.sampler_features import handle_stop_criteria
 from ..pyexecutor.scheduler import ScheduledRequests
+from .dspark_schedule import (HOST_POLICY_WINDOWS_SNAPSHOT_OUTPUT,
+                              NATIVE_UNIFORM_VERIFY_OUTPUT)
 
 
 @dataclass(kw_only=True)
@@ -325,10 +327,6 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
     #: Optional observability sink, attached by the DSpark worker. Left None
     #: everywhere else so this costs one attribute read per request.
     acceptance_stats = None
-    #: Correctness marker for overlap-safe policy-window snapshots. This is
-    #: deliberately separate from optional detailed telemetry: production may
-    #: disable acceptance_stats, but mixed ragged steps still need snapshots.
-    policy_windows_enabled = False
     #: STS calibration collection; attached alongside `acceptance_stats` and
     #: None everywhere else. `sts_row_for` resolves a py_request_id to its row
     #: in the worker's confidence buffer through the worker's OWN allocator --
@@ -393,6 +391,42 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
                 if verify_caps_snapshot is None:
                     verify_caps_snapshot = {}
                 verify_caps_snapshot[request.py_request_id] = int(cap)
+        return verify_lens_snapshot, verify_caps_snapshot
+
+    @classmethod
+    def _snapshot_policy_windows_for_step(
+        cls,
+        requests,
+        *,
+        native_uniform: bool,
+        host_snapshot_required: bool,
+        device_verify_lens_available: bool,
+        cap_trim_available: bool,
+    ) -> tuple[Optional[dict], Optional[dict]]:
+        """Select one authoritative, iteration-scoped verify-window source."""
+        if type(native_uniform) is not bool:
+            raise RuntimeError(
+                "DSpark native-uniform verify marker must be boolean")
+        if type(host_snapshot_required) is not bool:
+            raise RuntimeError(
+                "DSpark host policy-window snapshot marker must be boolean")
+        if native_uniform and (host_snapshot_required
+                               or device_verify_lens_available):
+            raise RuntimeError(
+                "DSpark step published native-uniform verification together "
+                "with compact verify-window state")
+        if host_snapshot_required and device_verify_lens_available:
+            raise RuntimeError(
+                "DSpark step published both device verify windows and a host "
+                "policy-window snapshot requirement")
+        if native_uniform and not cap_trim_available:
+            return {}, None
+        if not host_snapshot_required and not cap_trim_available:
+            return None, None
+        verify_lens_snapshot, verify_caps_snapshot = (
+            cls._snapshot_policy_windows(requests))
+        if cap_trim_available:
+            verify_lens_snapshot = {}
         return verify_lens_snapshot, verify_caps_snapshot
 
     def update_requests(
@@ -495,7 +529,7 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
     def sample_async(
         self,
         scheduled_requests: ScheduledRequests,
-        outputs: dict[str, torch.Tensor],
+        outputs: dict[str, Any],
         num_context_logits_prefix_sum: list[int],
     ) -> SampleStateSpec:
         """
@@ -620,18 +654,17 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         for request in finished_context_requests:
             request.py_draft_tokens = [1] * self.draft_len
 
-        # Cheap (a few ints) and only populated when the policy path is live.
-        # Mixed context/generation compact steps intentionally omit the
-        # generation-indexed verify_lens device output, but still need this
-        # overlap-safe host snapshot. policy_windows_enabled is attached
-        # whenever confidence scheduling is active and therefore supplies the
-        # marker those mixed steps cannot carry in outputs.
-        verify_lens_snapshot = None
-        verify_caps_snapshot = None
-        if (self.policy_windows_enabled or o_verify_lens is not None
-                or o_cap_trim is not None):
-            verify_lens_snapshot, verify_caps_snapshot = (
-                self._snapshot_policy_windows(sampling_requests))
+        host_snapshot_required = outputs.get(
+            HOST_POLICY_WINDOWS_SNAPSHOT_OUTPUT, False)
+        native_uniform = outputs.get(NATIVE_UNIFORM_VERIFY_OUTPUT, False)
+        verify_lens_snapshot, verify_caps_snapshot = (
+            self._snapshot_policy_windows_for_step(
+                sampling_requests,
+                native_uniform=native_uniform,
+                host_snapshot_required=host_snapshot_required,
+                device_verify_lens_available=o_verify_lens is not None,
+                cap_trim_available=o_cap_trim is not None,
+            ))
 
         return SampleStateSpec(
             requests=sampling_requests,

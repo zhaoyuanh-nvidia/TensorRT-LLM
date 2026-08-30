@@ -32,6 +32,8 @@ import torch
 
 __all__ = [
     "DSparkScheduleConfig",
+    "HOST_POLICY_WINDOWS_SNAPSHOT_OUTPUT",
+    "NATIVE_UNIFORM_VERIFY_OUTPUT",
     "compute_survival",
     "schedule_verify_lens_topk",
 ]
@@ -42,6 +44,15 @@ __all__ = [
 # -- optimistic by design. Lives here because the worker (writes it) and the
 # planner (counts it) cannot import each other.
 NEUTRAL_CONFIDENCE_LOGIT = 30.0
+
+# Per-forward host protocol marker. DSpark emits it only when a compact mixed
+# context/generation step cannot return a batch-aligned ``verify_lens`` tensor.
+HOST_POLICY_WINDOWS_SNAPSHOT_OUTPUT = "host_policy_windows_snapshot"
+
+# Per-forward marker for an authoritative native-uniform K window. An empty
+# request-id snapshot (``{}``) tells overlap rewind to use this iteration's
+# runtime draft length, never mutable request state from the next iteration.
+NATIVE_UNIFORM_VERIFY_OUTPUT = "native_uniform_verify"
 
 
 @dataclass(frozen=True)

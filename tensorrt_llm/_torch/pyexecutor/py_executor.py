@@ -112,20 +112,69 @@ _DSPARK_ADP_WIRE_TRAILER_LEN = 4
 _DSPARK_EXACT_NATIVE_YIELD_INDEX = _DSPARK_EXACT_WIRE_PREFIX_LEN - 1
 
 
+def _encode_dspark_exact_expected_yields(
+    *, exact_local, num_cells: int, yield_scale: int
+) -> Tuple[int, Tuple[int, ...]]:
+    """Encode one rank's exact yields without risking a split collective.
+
+    Invalid or locally optimistic compact yields become the existing ``-1``
+    infeasible sentinel.  Every rank can therefore finish the allgather and
+    make the cell globally ineligible instead of one rank raising before its
+    peers enter the collective.  The decoder still treats a positive gathered
+    compact value above native as wire corruption.
+    """
+    if yield_scale <= 0:
+        raise ValueError("DSpark exact-policy yield scale must be positive")
+    num_cells = int(num_cells)
+    if num_cells < 0:
+        raise ValueError("DSpark exact-policy cell count must be nonnegative")
+    if exact_local is None:
+        return 0, tuple(-1 for _ in range(num_cells))
+
+    native = float(exact_local.native_expected_yield)
+    native_valid = math.isfinite(native) and native >= 0.0
+    native_wire = int(math.ceil(native * yield_scale)) if native_valid else 0
+    local_values = tuple(exact_local.compact_expected_yields)
+    compact_wires = []
+    for cell_index in range(num_cells):
+        value = (
+            float(local_values[cell_index])
+            if cell_index < len(local_values)
+            else math.nan
+        )
+        if (
+            not native_valid
+            or not math.isfinite(value)
+            or value < 0.0
+            or value > native
+        ):
+            compact_wires.append(-1)
+        else:
+            compact_wires.append(int(math.floor(value * yield_scale)))
+    return native_wire, tuple(compact_wires)
+
+
 def _decode_dspark_exact_expected_yields(
     *,
     payloads: List[List[int]],
     exact_cells: Iterable[Tuple[int, int]],
     graph_batch_size: int,
     yield_scale: int,
-) -> Tuple[float, Dict[int, float]]:
-    """Decode globally aggregated exact-policy yields from the ADP wire."""
+) -> Tuple[float, Dict[int, float], Dict[int, float]]:
+    """Decode aggregate yields and worst-rank losses from the ADP wire.
+
+    Aggregate yields retain the existing immediate-goodput semantics.  The
+    loss curve is normalized per real request on each active rank before
+    taking the maximum, so one synchronized step saving is not charged for
+    the sum of every attention-DP rank's drain risk.
+    """
     if yield_scale <= 0:
         raise ValueError("DSpark exact-policy yield scale must be positive")
     native_expected_yield = sum(
         float(payload[_DSPARK_EXACT_NATIVE_YIELD_INDEX])
         for payload in payloads) / yield_scale
     compact_expected_yields = {}
+    compact_max_yield_losses_per_request = {}
     for cell_index, (cell_graph_batch_size,
                      verifier_budget) in enumerate(exact_cells):
         if cell_graph_batch_size != graph_batch_size:
@@ -136,10 +185,32 @@ def _decode_dspark_exact_expected_yields(
         ]
         # A negative local value marks a cell that cannot fit that rank's
         # mandatory real-row floor. Zero aggregate yield makes it ineligible.
-        compact_expected_yields[verifier_budget] = (0.0 if any(
-            value < 0.0
-            for value in rank_yields) else sum(rank_yields) / yield_scale)
-    return native_expected_yield, compact_expected_yields
+        infeasible = any(value < 0.0 for value in rank_yields)
+        compact_expected_yields[verifier_budget] = (0.0 if infeasible else
+                                                    sum(rank_yields) /
+                                                    yield_scale)
+        active_rank_losses = []
+        if not infeasible:
+            for payload, compact_yield_wire in zip(payloads, rank_yields):
+                num_real_requests = int(payload[1])
+                if num_real_requests <= 0:
+                    continue
+                native_yield_wire = float(
+                    payload[_DSPARK_EXACT_NATIVE_YIELD_INDEX])
+                if compact_yield_wire > native_yield_wire:
+                    raise RuntimeError(
+                        "DSpark exact-policy compact yield exceeds native "
+                        "yield on an active rank")
+                active_rank_losses.append(
+                    (native_yield_wire - compact_yield_wire) / yield_scale /
+                    num_real_requests)
+        compact_max_yield_losses_per_request[verifier_budget] = (max(
+            active_rank_losses, default=0.0))
+    return (
+        native_expected_yield,
+        compact_expected_yields,
+        compact_max_yield_losses_per_request,
+    )
 
 
 def _validate_dspark_exact_bucket(*, exact_shape, bucket,
@@ -190,6 +261,13 @@ def _classify_dspark_exact_generation_rows(
     generation_requests: List[LlmRequest],
 ) -> Tuple[Optional[List[LlmRequest]], bool]:
     """Return logical exact rows and whether one idle ADP dummy is scheduled."""
+    # No generation row is not a priced exact-policy geometry. In particular,
+    # an attention-DP peer carrying context-only work must decline locally and
+    # ride the existing all-or-nothing agreement back to native K5; advertising
+    # a supported zero-real decision would let it fail rank-locally after the
+    # collective while generation peers continue.
+    if not generation_requests:
+        return None, False
     real_requests = [request for request in generation_requests
                      if not request.is_dummy]
     if len(real_requests) == len(generation_requests):
@@ -3641,11 +3719,6 @@ class PyExecutor:
         # The mode, not the config flag, decides whether windows are computed;
         # every counter below is keyed off the same decision.
         stats = worker.ragged_stats
-        if self.sampler is not None:
-            # Correctness, not observability: mixed ragged steps omit the
-            # device verify-lens output and need the overlap-safe host snapshot
-            # even when detailed counters are disabled in production.
-            self.sampler.policy_windows_enabled = True
         # Wire the worker's counters into the sampler here, where both are
         # reachable: acceptance is only observable host-side in the sampler.
         if (stats is not None and self.sampler is not None
@@ -3693,10 +3766,13 @@ class PyExecutor:
         # would re-rank a batch it was never computed for.
         self.model_engine._dspark_device_budget = None
         if compute_windows:
-            if planner.skip_mixed_trim and scheduled_batch.context_requests:
-                # Mixed-step guard (experiment): prefill work shares this
-                # step, so the pure-decode cost table cannot price the trim.
-                # Declining here rides the normal all-or-nothing gate below.
+            if (scheduled_batch.context_requests
+                    and (exact_policy or planner.skip_mixed_trim)):
+                # Exact (G,V) tables price pure generation rows, while the CUDA
+                # graph agreement G counts all scheduled rows. Until the cost
+                # schema represents mixed geometry, every exact-policy mixed
+                # step must decline. The local decision rides the normal
+                # all-or-nothing attention-DP agreement below.
                 fallback_reason = "mixed_step_declined"
             elif exact_policy:
                 # Produce the whole measured yield grid locally. The common G
@@ -3802,13 +3878,13 @@ class PyExecutor:
                                            "_dspark_exact_identity_words", None)
             if exact_identity_words is None:
                 exact_identity_words = exact_table.collective_identity_words
-        native_yield_wire = (int(
-            math.ceil(exact_local.native_expected_yield *
-                      exact_yield_scale)) if exact_local is not None else 0)
-        compact_yields_wire = (tuple(
-            -1 if value < 0.0 else int(math.floor(value * exact_yield_scale))
-            for value in exact_local.compact_expected_yields) if exact_local
-                               is not None else tuple(-1 for _ in exact_cells))
+        native_yield_wire, compact_yields_wire = (
+            _encode_dspark_exact_expected_yields(
+                exact_local=exact_local,
+                num_cells=len(exact_cells),
+                yield_scale=exact_yield_scale,
+            )
+        )
         local_payload.extend([
             1 if exact_table is not None else 0,
             1 if exact_local is not None else 0,
@@ -3968,21 +4044,25 @@ class PyExecutor:
                     from ..speculative.dspark_planner import \
                         select_exact_sps_candidate
 
-                    # Goodput ratios were invariant to the fixed-point wire
-                    # scale, but the iteration/drain shadow price is in
-                    # milliseconds per predicted output token. Normalize the
-                    # already aggregated yields before applying that policy.
-                    (native_expected_yield, compact_expected_yields
-                     ) = _decode_dspark_exact_expected_yields(
-                         payloads=payloads,
-                         exact_cells=exact_cells,
-                         graph_batch_size=common_graph_batch_size,
-                         yield_scale=exact_yield_scale,
-                     )
+                    # Goodput uses aggregate yields, while drain pricing uses
+                    # the worst active rank's loss per real request. Decode
+                    # both from the existing fixed-point agreement payload.
+                    (
+                        native_expected_yield,
+                        compact_expected_yields,
+                        compact_max_yield_losses_per_request,
+                    ) = _decode_dspark_exact_expected_yields(
+                        payloads=payloads,
+                        exact_cells=exact_cells,
+                        graph_batch_size=common_graph_batch_size,
+                        yield_scale=exact_yield_scale,
+                    )
                     selected_verifier_budget = select_exact_sps_candidate(
                         graph_batch_size=common_graph_batch_size,
                         native_expected_yield=native_expected_yield,
                         compact_expected_yields=compact_expected_yields,
+                        compact_max_yield_losses_per_request=(
+                            compact_max_yield_losses_per_request),
                         cost_table=exact_table,
                     )
                     if selected_verifier_budget == 0:

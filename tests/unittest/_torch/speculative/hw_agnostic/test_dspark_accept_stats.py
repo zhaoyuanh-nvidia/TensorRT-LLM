@@ -258,23 +258,136 @@ def test_static_sampler_path_skips_optional_dspark_device_and_host_work():
     assert 'if o_verify_lens is not None:' in src
     assert 'cap_trim_lens=host_cap_trim_lens' in src
     assert 'verify_lens=host_verify_lens' in src
-    assert 'self.policy_windows_enabled or o_verify_lens is not None' in src
+    assert 'HOST_POLICY_WINDOWS_SNAPSHOT_OUTPUT' in src
+    assert 'NATIVE_UNIFORM_VERIFY_OUTPUT' in src
+
+
+class _RequestsMustNotBeScanned:
+
+    def __iter__(self):
+        raise AssertionError("policy-window request scan reached the hot path")
+
+
+def test_native_policy_fallback_is_an_authoritative_empty_snapshot():
+    from tensorrt_llm._torch.speculative.dspark import _publish_policy_window_output
+    from tensorrt_llm._torch.speculative.dspark_schedule import (
+        NATIVE_UNIFORM_VERIFY_OUTPUT,
+    )
+    from tensorrt_llm._torch.speculative.spec_sampler_base import SpecSampler
+
+    outputs = {}
+    _publish_policy_window_output(outputs, None, batch_size=2)
+    assert outputs == {NATIVE_UNIFORM_VERIFY_OUTPUT: True}
+    verify_lens, caps = SpecSampler._snapshot_policy_windows_for_step(
+        _RequestsMustNotBeScanned(),
+        native_uniform=True,
+        host_snapshot_required=False,
+        device_verify_lens_available=False,
+        cap_trim_available=False,
+    )
+    assert verify_lens == {}
+    assert caps is None
+
+
+def test_native_snapshot_ignores_next_compact_live_window():
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.speculative.spec_sampler_base import SpecSampler
+
+    snapshot, _ = SpecSampler._snapshot_policy_windows_for_step(
+        _RequestsMustNotBeScanned(),
+        native_uniform=True,
+        host_snapshot_required=False,
+        device_verify_lens_available=False,
+        cap_trim_available=False,
+    )
+    request = SimpleNamespace(py_request_id=61,
+                              py_seq_slot=4,
+                              py_verify_len=2)
+    assert SpecSampler._verified_len(request, 5, snapshot) == 5
+
+
+def test_device_window_complete_step_does_not_scan_requests():
+    from tensorrt_llm._torch.speculative.spec_sampler_base import SpecSampler
+
+    verify_lens, caps = SpecSampler._snapshot_policy_windows_for_step(
+        _RequestsMustNotBeScanned(),
+        native_uniform=False,
+        host_snapshot_required=False,
+        device_verify_lens_available=True,
+        cap_trim_available=False,
+    )
+    assert verify_lens is None
+    assert caps is None
 
 
 def test_mixed_ragged_step_snapshots_windows_without_device_output():
     """Mixed compact steps rely on host snapshots under overlap scheduling."""
     from types import SimpleNamespace
 
+    from tensorrt_llm._torch.speculative.dspark import _publish_policy_window_output
+    from tensorrt_llm._torch.speculative.dspark_schedule import (
+        HOST_POLICY_WINDOWS_SNAPSHOT_OUTPUT,
+    )
     from tensorrt_llm._torch.speculative.spec_sampler_base import SpecSampler
+
+    outputs = {}
+    _publish_policy_window_output(outputs, torch.tensor([3, 5]), batch_size=3)
+    assert outputs == {HOST_POLICY_WINDOWS_SNAPSHOT_OUTPUT: True}
 
     requests = [
         SimpleNamespace(py_request_id=10, py_verify_len=None, py_verify_cap=None),
         SimpleNamespace(py_request_id=11, py_verify_len=2, py_verify_cap=None),
         SimpleNamespace(py_request_id=12, py_verify_len=4, py_verify_cap=None),
     ]
-    verify_lens, caps = SpecSampler._snapshot_policy_windows(requests)
+    verify_lens, caps = SpecSampler._snapshot_policy_windows_for_step(
+        requests,
+        native_uniform=False,
+        host_snapshot_required=True,
+        device_verify_lens_available=False,
+        cap_trim_available=False,
+    )
     assert verify_lens == {11: 2, 12: 4}
     assert caps is None
+
+
+def test_cap_accept_preserves_cap_but_rewinds_full_native_k():
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.speculative.spec_sampler_base import SpecSampler
+
+    request = SimpleNamespace(py_request_id=51,
+                              py_verify_len=None,
+                              py_verify_cap=3)
+    verify_lens, caps = SpecSampler._snapshot_policy_windows_for_step(
+        [request],
+        native_uniform=True,
+        host_snapshot_required=False,
+        device_verify_lens_available=False,
+        cap_trim_available=True,
+    )
+    request.py_verify_len = 2
+    request.py_verify_cap = 1
+    assert verify_lens == {}
+    assert caps == {51: 3}
+    assert SpecSampler._verified_len(request, 5, verify_lens) == 5
+
+
+def test_conflicting_policy_window_sources_fail_closed():
+    from tensorrt_llm._torch.speculative.spec_sampler_base import SpecSampler
+
+    with pytest.raises(RuntimeError, match="both device verify windows"):
+        SpecSampler._snapshot_policy_windows_for_step(
+            [], native_uniform=False, host_snapshot_required=True,
+            device_verify_lens_available=True, cap_trim_available=False)
+    with pytest.raises(RuntimeError, match="native-uniform verification"):
+        SpecSampler._snapshot_policy_windows_for_step(
+            [], native_uniform=True, host_snapshot_required=False,
+            device_verify_lens_available=True, cap_trim_available=False)
+    with pytest.raises(RuntimeError, match="marker must be boolean"):
+        SpecSampler._snapshot_policy_windows_for_step(
+            [], native_uniform=1, host_snapshot_required=False,
+            device_verify_lens_available=False, cap_trim_available=False)
 
 
 def test_the_cuda_graph_padding_dummy_carries_a_cap():

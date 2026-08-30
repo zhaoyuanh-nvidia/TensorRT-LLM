@@ -1103,6 +1103,7 @@ def select_exact_sps_candidate(
     graph_batch_size: int,
     native_expected_yield: float,
     compact_expected_yields: dict[int, float],
+    compact_max_yield_losses_per_request: dict[int, float],
     cost_table: ExactSpsCostTable,
 ) -> int:
     """Choose a measured V, retaining native V=0 on weak group-E2E value.
@@ -1110,11 +1111,14 @@ def select_exact_sps_candidate(
     The caller supplies globally agreed expected yields after the phase-2
     allgather. This pure layer only compares exact measured cells; it cannot
     create a ragged budget or synchronize ranks. Compact serving fails closed
-    until the exact table carries matched iteration/drain metadata. The
-    immediate-goodput winner must then also satisfy, strictly::
+    until the exact table carries matched iteration/drain metadata. Every
+    measured tier that clears the aggregate immediate-goodput guard is reranked
+    by its guarded group-E2E value. Drain loss is the maximum expected loss per
+    real request on any active attention-DP rank, derived from the same
+    allgather as the aggregate yields. A selected tier must satisfy, strictly::
 
         T(G, 0) - T(G, V)
-        - loss_multiplier * (Y_native - Y_V)
+        - loss_multiplier * max_rank((Y_native - Y_V) / N_real)
           * T(tail_G, 0) / mean_output_tokens_per_request_iteration
         > minimum_group_value_ms
     """
@@ -1131,9 +1135,25 @@ def select_exact_sps_candidate(
         raise ValueError(
             f"compact_expected_yields must cover every positive measured V for G={graph_batch_size}"
         )
+    if any(type(value) is not int for value in compact_max_yield_losses_per_request):
+        raise TypeError("compact_max_yield_losses_per_request keys must be integer V values")
+    if 0 in compact_max_yield_losses_per_request:
+        raise ValueError("compact_max_yield_losses_per_request must not include native V=0")
+    if set(compact_max_yield_losses_per_request) != set(measured_budgets):
+        raise ValueError(
+            "compact_max_yield_losses_per_request must cover every positive "
+            f"measured V for G={graph_batch_size}"
+        )
     compact_yields = {
         budget: _require_nonnegative_finite_number(
             compact_expected_yields[budget], field=f"expected yield for compact V={budget}"
+        )
+        for budget in measured_budgets
+    }
+    max_yield_losses_per_request = {
+        budget: _require_nonnegative_finite_number(
+            compact_max_yield_losses_per_request[budget],
+            field=(f"maximum expected yield loss per request for compact V={budget}"),
         )
         for budget in measured_budgets
     }
@@ -1149,10 +1169,13 @@ def select_exact_sps_candidate(
     }
     if not compact_scores:
         return 0
-    best_budget = max(compact_scores, key=lambda budget: (compact_scores[budget], budget))
-    best_score = compact_scores[best_budget]
     required_score = native_score * (1.0 + cost_table.minimum_predicted_gain)
-    if best_score <= native_score or best_score < required_score:
+    goodput_budgets = [
+        budget
+        for budget in measured_budgets
+        if compact_scores[budget] > native_score and compact_scores[budget] >= required_score
+    ]
+    if not goodput_budgets:
         return 0
     drain_guard = cost_table.iteration_drain_guard
     if drain_guard is None:
@@ -1161,20 +1184,32 @@ def select_exact_sps_candidate(
         # valid native-static control but is not allowed to enable compact V.
         return 0
     native_step_ms = cost_table.step_time(0, graph_batch_size)
-    compact_step_ms = cost_table.step_time(best_budget, graph_batch_size)
     tail_step_ms = cost_table.step_time(0, drain_guard.tail_graph_batch_size)
-    predicted_yield_loss = native_yield - compact_yields[best_budget]
-    group_value_ms = (
-        native_step_ms
-        - compact_step_ms
-        - drain_guard.loss_multiplier
-        * predicted_yield_loss
-        * tail_step_ms
-        / drain_guard.mean_output_tokens_per_request_iteration
-    )
-    if group_value_ms <= drain_guard.minimum_group_value_ms:
+    group_values_ms = {}
+    for budget in goodput_budgets:
+        compact_step_ms = cost_table.step_time(budget, graph_batch_size)
+        group_value_ms = (
+            native_step_ms
+            - compact_step_ms
+            - drain_guard.loss_multiplier
+            * max_yield_losses_per_request[budget]
+            * tail_step_ms
+            / drain_guard.mean_output_tokens_per_request_iteration
+        )
+        if group_value_ms > drain_guard.minimum_group_value_ms:
+            group_values_ms[budget] = group_value_ms
+    if not group_values_ms:
         return 0
-    return int(best_budget)
+    return int(
+        max(
+            group_values_ms,
+            key=lambda budget: (
+                group_values_ms[budget],
+                compact_scores[budget],
+                budget,
+            ),
+        )
+    )
 
 
 def compute_verify_token_budget(

@@ -22,6 +22,7 @@ from tensorrt_llm._torch.pyexecutor.py_executor import (
     _DSPARK_EXACT_WIRE_PREFIX_LEN,
     _dspark_exact_common_graph_batch_size,
     _dspark_exact_secondary_padding_ready,
+    _encode_dspark_exact_expected_yields,
     PyExecutor,
     _decode_dspark_exact_expected_yields,
     _validate_dspark_adp_acceptance_gate,
@@ -114,6 +115,7 @@ def _request(*, adp_dummy=False, cuda_dummy=False, generic_dummy=False):
 def test_exact_row_classifier_keeps_idle_adp_dummy_out_of_logical_work():
     real = [_request(), _request()]
     assert _classify_dspark_exact_generation_rows(real) == (real, False)
+    assert _classify_dspark_exact_generation_rows([]) == (None, False)
     adp_dummy = _request(adp_dummy=True)
     assert _classify_dspark_exact_generation_rows([adp_dummy]) == ([], True)
     assert _classify_dspark_exact_generation_rows(
@@ -279,16 +281,18 @@ def test_exact_yield_decode_stops_before_four_field_adp_trailer():
     payloads[0][trailer_start:] = [128, 1, 1, 1]
     payloads[1][trailer_start:] = [64, 0, 0, 1]
 
-    native_yield, compact_yields = _decode_dspark_exact_expected_yields(
+    decoded = _decode_dspark_exact_expected_yields(
         payloads=payloads,
         exact_cells=exact_cells,
         graph_batch_size=128,
         yield_scale=1_000_000,
     )
+    native_yield, compact_yields, max_losses = decoded
 
     assert payload_len == 23 + len(exact_cells)
     assert native_yield == 30.0
     assert compact_yields == {704: 11.0}
+    assert max_losses == {704: 0.0}
 
 
 def test_exact_yield_decode_fails_closed_on_any_rank_sentinel():
@@ -298,7 +302,7 @@ def test_exact_yield_decode_fails_closed_on_any_rank_sentinel():
     payloads[0][_DSPARK_EXACT_WIRE_PREFIX_LEN] = 5_000_000
     payloads[1][_DSPARK_EXACT_WIRE_PREFIX_LEN] = -1
 
-    _, compact_yields = _decode_dspark_exact_expected_yields(
+    _, compact_yields, max_losses = _decode_dspark_exact_expected_yields(
         payloads=payloads,
         exact_cells=exact_cells,
         graph_batch_size=128,
@@ -306,6 +310,64 @@ def test_exact_yield_decode_fails_closed_on_any_rank_sentinel():
     )
 
     assert compact_yields == {704: 0.0}
+    assert max_losses == {704: 0.0}
+
+
+@pytest.mark.parametrize("invalid", [float("nan"), float("inf"), -0.1, 10.1])
+def test_exact_yield_encode_marks_invalid_compact_cell_infeasible(invalid):
+    exact_local = SimpleNamespace(
+        native_expected_yield=10.0,
+        compact_expected_yields=(9.0, invalid),
+    )
+
+    native_wire, compact_wires = _encode_dspark_exact_expected_yields(
+        exact_local=exact_local, num_cells=2, yield_scale=1_000_000
+    )
+
+    assert native_wire == 10_000_000
+    assert compact_wires == (9_000_000, -1)
+
+
+def test_exact_yield_encode_pads_a_short_local_curve_with_sentinels():
+    exact_local = SimpleNamespace(
+        native_expected_yield=10.0,
+        compact_expected_yields=(9.0,),
+    )
+
+    native_wire, compact_wires = _encode_dspark_exact_expected_yields(
+        exact_local=exact_local, num_cells=3, yield_scale=1_000_000
+    )
+
+    assert native_wire == 10_000_000
+    assert compact_wires == (9_000_000, -1, -1)
+
+
+def test_exact_yield_decode_prices_maximum_active_rank_loss_per_real_request():
+    exact_cells = ((128, 512), (128, 640))
+    payload_len = (_DSPARK_EXACT_WIRE_PREFIX_LEN + len(exact_cells)
+                   + _DSPARK_ADP_WIRE_TRAILER_LEN)
+    payloads = [[0] * payload_len for _ in range(3)]
+    payloads[0][1] = 2
+    payloads[1][1] = 4
+    payloads[2][1] = 0
+    payloads[0][_DSPARK_EXACT_NATIVE_YIELD_INDEX] = 10_000_000
+    payloads[1][_DSPARK_EXACT_NATIVE_YIELD_INDEX] = 20_000_000
+    payloads[0][_DSPARK_EXACT_WIRE_PREFIX_LEN] = 8_000_000
+    payloads[1][_DSPARK_EXACT_WIRE_PREFIX_LEN] = 18_000_000
+    payloads[0][_DSPARK_EXACT_WIRE_PREFIX_LEN + 1] = 9_000_000
+    payloads[1][_DSPARK_EXACT_WIRE_PREFIX_LEN + 1] = 14_000_000
+
+    decoded = _decode_dspark_exact_expected_yields(
+        payloads=payloads,
+        exact_cells=exact_cells,
+        graph_batch_size=128,
+        yield_scale=1_000_000,
+    )
+    native_yield, compact_yields, max_losses = decoded
+
+    assert native_yield == 30.0
+    assert compact_yields == {512: 26.0, 640: 23.0}
+    assert max_losses == {512: 1.0, 640: 1.5}
 
 
 def test_debug_flag_disagreement_fails_identically_after_policy_collective():
