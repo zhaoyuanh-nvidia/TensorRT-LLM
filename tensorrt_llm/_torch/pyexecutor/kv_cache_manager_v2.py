@@ -791,6 +791,29 @@ class KVCacheManagerV2(BaseResourceManager):
     # Declared on the class so it is present even when an instance is built without running __init__.
     _cold_pool_group_membership_cache: Optional[tuple[tuple[int, frozenset[int]], ...]] = None
 
+    @staticmethod
+    def _resolve_num_reserved_index_slots(
+        configured_slots: Optional[int],
+        spec_config,
+        is_estimating_kv_cache: bool,
+    ) -> int:
+        """Return stable IndexMapper headroom for retained graph dummies."""
+        requires_secondary_dummy = bool(
+            not is_estimating_kv_cache
+            and spec_config is not None
+            and getattr(spec_config, "enable_confidence_scheduling", False))
+        required_slots = (
+            0 if is_estimating_kv_cache else 2 if requires_secondary_dummy else 1)
+        if configured_slots is None:
+            return required_slots
+        if configured_slots < 0:
+            raise ValueError("num_reserved_index_slots must be non-negative")
+        if configured_slots < required_slots:
+            raise ValueError(
+                "num_reserved_index_slots is smaller than the CUDA-graph "
+                f"padding requirement ({configured_slots} < {required_slots})")
+        return configured_slots
+
     def __init__(
         self,
         kv_cache_config: KvCacheConfig,
@@ -817,7 +840,7 @@ class KVCacheManagerV2(BaseResourceManager):
         execution_stream: Optional[torch.cuda.Stream] = None,
         is_disagg: bool = False,
         enable_stats: bool = False,
-        num_reserved_index_slots: int = 1,
+        num_reserved_index_slots: Optional[int] = None,
         is_estimating_kv_cache: bool = False,
         **kwargs,
     ) -> None:
@@ -1308,7 +1331,11 @@ class KVCacheManagerV2(BaseResourceManager):
         # capacity lets the next batch of active requests acquire slots without
         # waiting for the previous batch's transfers to finish.
         max_num_sequences = max_batch_size * mapping.pp_size
-        assert num_reserved_index_slots >= 0, "num_reserved_index_slots must be non-negative"
+        num_reserved_index_slots = self._resolve_num_reserved_index_slots(
+            num_reserved_index_slots,
+            spec_config,
+            is_estimating_kv_cache,
+        )
         index_mapper_capacity = (
             max_num_sequences * (2 if is_disagg else 1) + num_reserved_index_slots
         )
@@ -1861,6 +1888,54 @@ class KVCacheManagerV2(BaseResourceManager):
             self._device_scratch_slots_staging,
         )
 
+    def _stage_host_block_offsets_for_copy(self) -> torch.Tensor:
+        """Snapshot the persistent host block-offset buffer into a fresh pinned
+        buffer to serve as the private source of an asynchronous H2D copy.
+
+        Same bug and same fix as nvbug 6293536 in KVCacheManager
+        (``_stage_block_offsets_for_copy``): the persistent buffer is rewritten
+        whenever blocks are allocated or freed, which happens at *scheduling*
+        time -- and with the overlap scheduler that is while the previous
+        step's H2D from this buffer can still be queued behind an in-flight
+        forward. The queued copy then reads the next step's block layout and
+        the attention kernels walk freed or reassigned blocks.
+
+        Lifetime: for the per-layer branch the consumer is a torch ``copy_``,
+        which records the pinned block's use with the caching host allocator,
+        so dropping the Python reference is safe. The flat branch hands the
+        snapshot to a C++ op torch knows nothing about -- its caller must keep
+        the snapshot referenced until the op's stream has drained past it
+        (see ``_retain_flat_snapshot``).
+        """
+        src = self.host_kv_cache_block_offsets
+        host_block_offsets = torch.empty(
+            src.shape,
+            dtype=src.dtype,
+            device="cpu",
+            pin_memory=prefer_pinned(),
+        )
+        host_block_offsets.copy_(src)
+        return host_block_offsets
+
+    def _retain_flat_snapshot(self, snapshot: torch.Tensor) -> None:
+        """Keep a pinned snapshot alive until the C++ copy op has consumed it.
+
+        The op reads the host buffer at *execution* time on ``self._stream``,
+        and torch records no event for it, so the caching host allocator would
+        otherwise hand the block to the next same-size pinned allocation while
+        the op is still queued. Hold (event, snapshot) pairs and drop the ones
+        whose event has completed -- no synchronization, bounded by the
+        scheduler's run-ahead depth.
+        """
+        retained = getattr(self, "_flat_snapshots_in_flight", None)
+        if retained is None:
+            retained = self._flat_snapshots_in_flight = []
+        event = torch.cuda.Event()
+        with torch.cuda.stream(self._stream):
+            event.record()
+        retained.append((event, snapshot))
+        retained[:] = [(e, t) for e, t in retained if not e.query()]
+
     def _copy_batch_block_offsets_per_layer(
         self,
         dst_tensor: torch.Tensor,
@@ -1870,8 +1945,9 @@ class KVCacheManagerV2(BaseResourceManager):
         num_seqs: int,
     ) -> None:
         device_copy_idx = self._copy_idx_to_device(copy_idx)
+        host_block_offsets = self._stage_host_block_offsets_for_copy()
         self._device_kv_cache_block_offsets_input.copy_(
-            self.host_kv_cache_block_offsets,
+            host_block_offsets,
             non_blocking=True,
         )
         scratch_begs, scratch_ends, scratch_slots = self._copy_scratch_metadata_to_device(
@@ -3978,14 +4054,33 @@ class KVCacheManagerV2(BaseResourceManager):
             if not kv_cache.is_active:
                 continue
             rewind_len = req.py_rewind_len
+            # Tokens this step actually claims: rejections inside the verify
+            # window plus the accepted ones.
+            runtime_draft_len = req.py_rewind_len + req.py_num_accepted_draft_tokens
             if self.is_draft:
-                runtime_draft_len = req.py_rewind_len + req.py_num_accepted_draft_tokens
                 # Dynamic-tree draft managers reserve K * max_draft_len slots,
                 # which can exceed the tree's runtime draft width. Reclaim that
                 # reserve slack together with rejected draft tokens; otherwise
                 # it accumulates in the draft KV cache after every generation
-                # step. Target managers do not allocate this reserve slack.
-                rewind_len += max(self._kv_reserve_draft_tokens - runtime_draft_len, 0)
+                # step.
+                reserved = self._kv_reserve_draft_tokens
+            else:
+                # The target manager reserves for the FULL drafted block --
+                # prepare_resources adds `max(draft_len, reserve)` tokens every
+                # generation step -- but ragged verification only ever writes
+                # `verified_len` of them, and py_rewind_len covers rejections
+                # *within that window* only. The positions the scheduler trimmed
+                # away were reserved and never reclaimed, leaking
+                # (draft_len - verified_len) tokens per step until the sequence
+                # demands more blocks than max_seq_len allows and the KV cache
+                # raises "User-provided base page indices is too short".
+                #
+                # Uniform speculation is unaffected: there verified_len ==
+                # draft_len, so this term is zero and the arithmetic is exactly
+                # what it was.
+                reserved = max(get_draft_token_length(req),
+                               self._kv_reserve_draft_tokens)
+            rewind_len += max(reserved - runtime_draft_len, 0)
             new_capacity = (
                 None
                 if req.state in (LlmRequestState.GENERATION_COMPLETE, LlmRequestState.CONTEXT_INIT)
@@ -4028,14 +4123,16 @@ class KVCacheManagerV2(BaseResourceManager):
             )
             return
 
+        host_block_offsets = self._stage_host_block_offsets_for_copy()
         copy_batch_block_offsets_to_device(
-            self.host_kv_cache_block_offsets,
+            host_block_offsets,
             dst_tensor,
             copy_idx,
             self.index_scales,
             self.kv_offset,
             self._stream.cuda_stream,
         )
+        self._retain_flat_snapshot(host_block_offsets)
 
     @staticmethod
     def _derive_reuse_salt(cache_salt: str | None) -> int | None:

@@ -61,7 +61,15 @@ __all__ = [
 # sleep() and wakeup() coordinate across all ranks via a dedicated control
 # communicator started in PyExecutor.start_worker(); rank-0 is the entry
 # point, so routing through the rank-0 RPC shim is correct.
-_MULTI_RANK_ALLOWED_METHODS: frozenset[str] = frozenset({"sleep", "wakeup"})
+# set_dspark_verify_len_pin() and set_dspark_budget_frac() need no control
+# communicator at all: they queue a scalar that the decode loop's own per-step
+# allgather hands to every rank, so rank-0 receiving it is sufficient and the
+# loop is never paused. get_dspark_ragged_stats() is explicitly rank-local and
+# returns rank 0's diagnostic snapshot without coordinating the worker world.
+_MULTI_RANK_ALLOWED_METHODS: frozenset[str] = frozenset({
+    "sleep", "wakeup", "get_dspark_ragged_stats", "set_dspark_verify_len_pin",
+    "set_dspark_budget_frac"
+})
 
 
 def _check_collective_rpc_guard(
@@ -976,12 +984,14 @@ class GenerationExecutorProxy(GenerationExecutor):
         """Execute a method call on the rank-0 GPU worker via the RPC client.
 
         Rank-0 RPC shim used for uniform dispatch from
-        :meth:`~tensorrt_llm.llmapi.llm.LLM._collective_rpc`.  Most methods
+        :meth:`~tensorrt_llm.llmapi.llm.LLM._collective_rpc`. Most methods
         require ``model_world_size == 1``; ``sleep`` and ``wakeup`` are
         explicitly allowed for multi-rank deployments because
         :meth:`~tensorrt_llm.executor.base_worker.BaseWorker.sleep` and
         :meth:`~tensorrt_llm.executor.base_worker.BaseWorker.wakeup` handle
-        cross-rank coordination internally via the control communicator.
+        cross-rank coordination internally via the control communicator. The
+        DSpark controls and rank-local stats snapshot are also explicitly
+        allowed because rank 0 is their defined entry point.
 
         Args:
             method: Name of the worker method to invoke.
@@ -999,9 +1009,8 @@ class GenerationExecutorProxy(GenerationExecutor):
         Raises:
             RuntimeError: If the RPC client has not been initialised yet.
             NotImplementedError: If ``model_world_size > 1`` and the method
-                is not in the allowed-methods set (currently ``sleep`` and
-                ``wakeup``), or if ``unique_reply_rank`` or ``target_ranks``
-                are provided.
+                is not in the allowed-methods set, or if ``unique_reply_rank``
+                or ``target_ranks`` are provided.
         """
         if self.rpc_client is None:
             raise RuntimeError(

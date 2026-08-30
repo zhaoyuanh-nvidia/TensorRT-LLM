@@ -4377,6 +4377,214 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
                 "TestDeepSeekV4ProDSpark::test_gsm8k_dep8_megamoe_deepgemm",
                 acceptance_length)
 
+    @pytest.mark.skip_less_mpi_world_size(8)
+    def test_gsm8k_dep8_megamoe_deepgemm_confidence_scheduling(self):
+        """Same accuracy bar with confidence-scheduled verification enabled.
+
+        The scheduler only decides how MANY drafted tokens are sent to the
+        target; acceptance still goes through the unchanged target verify, so
+        the output distribution must be untouched. Any drop here means the
+        dynamic draft length broke an invariant (KV rewind amount, the draft
+        hidden-state gather stride, or the per-token sampling-parameter stride)
+        rather than that the scheduler made a bad throughput call -- those are
+        silent-wrong-answer bugs, which is why this asserts the SAME reference
+        accuracy as the baseline above rather than a relaxed one.
+
+        Runs under attention-DP + TP8, so it also covers the cross-rank
+        agreement on the draft length: if ranks disagreed they would select
+        different CUDA graphs and the collectives would diverge.
+        """
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+                                        free_gpu_memory_fraction=0.5)
+        spec_config = DSparkDecodingConfig(max_draft_len=5,
+                                           speculative_model=self.MODEL_PATH,
+                                           enable_confidence_scheduling=True)
+        with LLM(self.MODEL_PATH,
+                 attn_backend="TRTLLM",
+                 tensor_parallel_size=8,
+                 moe_expert_parallel_size=8,
+                 enable_attention_dp=True,
+                 moe_config=MoeConfig(backend="MEGAMOE_DEEPGEMM"),
+                 max_batch_size=DEEPSEEKV4_TEST_MAX_BATCH_SIZE,
+                 max_seq_len=4096,
+                 max_num_tokens=4096,
+                 kv_cache_config=kv_cache_config,
+                 enable_chunked_prefill=False,
+                 disable_overlap_scheduler=True,
+                 custom_tokenizer="deepseek_v4",
+                 speculative_config=spec_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            acc_params = task.get_hypothesis_testing_params(
+                dtype=llm.args.dtype,
+                quant_algo=llm.args.quant_config.quant_algo,
+                kv_cache_quant_algo=llm.args.quant_config.kv_cache_quant_algo,
+                spec_dec_algo=llm.args.speculative_config.decoding_type)
+            assert acc_params.num_samples == GSM8K.NUM_SAMPLES
+            with mock.patch.dict(os.environ, {"INTEGRATION_TEST": "0"}):
+                score = task.evaluate(
+                    llm, extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+            assert score >= acc_params.ref_accuracy, (
+                f"GSM8K accuracy {score:.3f} with confidence scheduling is below "
+                f"the recorded reference {acc_params.ref_accuracy:.3f}; the "
+                f"scheduler must not change the output distribution")
+
+    def _run_gsm8k(self, llm):
+        task = GSM8K(self.MODEL_NAME)
+        acc_params = task.get_hypothesis_testing_params(
+            dtype=llm.args.dtype,
+            quant_algo=llm.args.quant_config.quant_algo,
+            kv_cache_quant_algo=llm.args.quant_config.kv_cache_quant_algo,
+            spec_dec_algo=llm.args.speculative_config.decoding_type)
+        assert acc_params.num_samples == GSM8K.NUM_SAMPLES
+        with mock.patch.dict(os.environ, {"INTEGRATION_TEST": "0"}):
+            score = task.evaluate(
+                llm, extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+        return score, acc_params
+
+    @pytest.mark.skip_less_mpi_world_size(8)
+    @parametrize_with_ids("moe_backend", ["MEGAMOE_DEEPGEMM", "TRTLLM"])
+    def test_gsm8k_dep8_static_verify_overlap(self, moe_backend):
+        """DSpark verifying the full block, with the overlap scheduler ON.
+
+        Kept, rather than deleted, because it is the STATIC reference the other
+        two modes are differenced against: same prompts, same seed, verify
+        everything. cap-accept must match it token for token (the schedule only
+        changes how many tokens are committed per step, never which), and
+        compact must then match cap-accept.
+
+        The sibling test above pins ``disable_overlap_scheduler=True``, which
+        makes it a weaker test than it looks: with overlap off,
+        ``_prepare_tp_inputs`` takes the branch that has no previous-batch
+        tensors, and the whole previous-step relay -- the KV-length correction,
+        the draft-token gather, the rewind -- is simply not exercised. Overlap
+        on is also the configuration anyone would actually serve.
+
+        Cross-rank agreement is the other reason this matters. Under
+        attention-DP the draft length is part of the CUDA-graph key but is not
+        covered by the graph-eligibility allgather, so ranks that disagree pick
+        different graphs and their collectives diverge into a hang rather than a
+        wrong answer.
+
+        Parameterized over both MoE backends. The scheduler changes how many
+        tokens reach the target, and the MoE chunks from that same count, so a
+        backend is a plausible place for a token-count assumption to hide even
+        though neither is supposed to know about speculation.
+        """
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+                                        free_gpu_memory_fraction=0.5)
+        # No scheduling at all: every request verifies its whole drafted block.
+        # There is nothing for a cost table to inform here, which is the point
+        # -- this run has to be reproducible without one so it can serve as the
+        # reference for the two scheduled modes.
+        spec_config = DSparkDecodingConfig(max_draft_len=5,
+                                           speculative_model=self.MODEL_PATH,
+                                           enable_confidence_scheduling=False)
+        with LLM(self.MODEL_PATH,
+                 attn_backend="TRTLLM",
+                 tensor_parallel_size=8,
+                 moe_expert_parallel_size=8,
+                 enable_attention_dp=True,
+                 moe_config=MoeConfig(backend=moe_backend),
+                 max_batch_size=DEEPSEEKV4_TEST_MAX_BATCH_SIZE,
+                 max_seq_len=4096,
+                 max_num_tokens=4096,
+                 kv_cache_config=kv_cache_config,
+                 cuda_graph_config=CudaGraphConfig(enable_padding=True),
+                 enable_chunked_prefill=False,
+                 disable_overlap_scheduler=False,
+                 custom_tokenizer="deepseek_v4",
+                 speculative_config=spec_config) as llm:
+            score, acc_params = self._run_gsm8k(llm)
+            assert score >= acc_params.ref_accuracy, (
+                f"GSM8K accuracy {score:.3f} with confidence scheduling and the "
+                f"overlap scheduler is below the recorded reference "
+                f"{acc_params.ref_accuracy:.3f}")
+
+    @pytest.mark.skip_less_mpi_world_size(8)
+    @parametrize_with_ids("moe_backend", ["MEGAMOE_DEEPGEMM", "TRTLLM"])
+    def test_gsm8k_dep8_ragged_verify(self, moe_backend, tmp_path, monkeypatch):
+        """Per-request verify windows, overlap scheduler on.
+
+        ``enable_padding=True`` is required rather than incidental: the ragged
+        token budget is planned against the padded batch and reserves tokens for
+        the padding rows, so without them the step's total misses its captured
+        bucket. The config validator refuses the combination outright, which is
+        what this passes.
+
+        Accuracy alone would not establish much here -- the planner declines to
+        trim without a profiled SPS cost table, and a run where it declined on
+        every step is a uniform baseline wearing a different config, scoring
+        exactly the same. The test therefore supplies its own valid non-flat
+        table, forces a fractional budget through the production rank-0 control
+        path, and asserts the live worker counters after generation.
+        """
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+                                        free_gpu_memory_fraction=0.5)
+        # Device-window selection is opt-in while the implementation is under
+        # validation. Set it before constructing LLM so every MPI worker
+        # inherits the same mode at planner initialization.
+        monkeypatch.setenv("TLLM_DSPARK_DEVICE_WINDOWS", "1")
+        # This test asserts diagnostic counters through the profiling RPC;
+        # production keeps their per-request aggregation disabled by default.
+        monkeypatch.setenv("TLLM_DSPARK_DETAILED_STATS", "1")
+        # The forced fraction below bypasses the economic argmax, so the table's
+        # values cannot affect this correctness run. It still has to be valid and
+        # non-flat because compact mode's production configuration contract
+        # requires a measured-cost surface rather than an accidental no-op.
+        sps_table_path = tmp_path / "dspark-ragged-correctness-sps.json"
+        sps_table_path.write_text(json.dumps({
+            "token_counts": [1, 768],
+            "step_time_ms": [1.0, 2.0],
+            "fixed_overhead_ms": 0.0,
+            "_meta": {
+                "lookup": "interp",
+                "encoding": "decomposed",
+            },
+        }),
+                                  encoding="utf-8")
+        spec_config = DSparkDecodingConfig(
+            max_draft_len=5,
+            speculative_model=self.MODEL_PATH,
+            enable_confidence_scheduling=True,
+            enable_ragged_verify=True,
+            confidence_sps_table_path=str(sps_table_path))
+        with LLM(self.MODEL_PATH,
+                 attn_backend="TRTLLM",
+                 tensor_parallel_size=8,
+                 moe_expert_parallel_size=8,
+                 enable_attention_dp=True,
+                 moe_config=MoeConfig(backend=moe_backend),
+                 max_batch_size=DEEPSEEKV4_TEST_MAX_BATCH_SIZE,
+                 max_seq_len=4096,
+                 max_num_tokens=4096,
+                 kv_cache_config=kv_cache_config,
+                 cuda_graph_config=CudaGraphConfig(enable_padding=True),
+                 enable_chunked_prefill=False,
+                 disable_overlap_scheduler=False,
+                 custom_tokenizer="deepseek_v4",
+                 speculative_config=spec_config) as llm:
+            # A 0.5 trimmable budget fits the captured K3 token bucket exactly
+            # at a full batch. The host split may be uniform because it only
+            # chooses that shape; the device-window counter below proves fresh
+            # confidence re-ranked the same compact budget before replay.
+            [applied_frac
+             ] = llm._executor.collective_rpc("set_dspark_budget_frac",
+                                              args=(0.5, ))
+            assert applied_frac == pytest.approx(0.5, abs=1e-6)
+            score, acc_params = self._run_gsm8k(llm)
+            [ragged_stats
+             ] = llm._executor.collective_rpc("get_dspark_ragged_stats")
+            assert ragged_stats["device_window_steps"] > 0, ragged_stats
+            assert (ragged_stats["forced_device_window_trimmed_steps"]
+                    > 0), ragged_stats
+            assert (ragged_stats["planner"].get("forced_budget_steps", 0)
+                    > 0), ragged_stats
+            assert (ragged_stats["window_tokens"]
+                    < ragged_stats["ceiling_tokens"]), ragged_stats
+            assert score >= acc_params.ref_accuracy, (
+                f"GSM8K accuracy {score:.3f} with ragged verification is below "
+                f"the recorded reference {acc_params.ref_accuracy:.3f}")
+
 
 @pytest.mark.timeout(14400)
 @pytest.mark.skip_less_device_memory(140000)

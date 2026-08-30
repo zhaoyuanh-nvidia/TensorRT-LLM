@@ -104,7 +104,9 @@ class UtilsSamplingParams:
 
 
 def int_tensor(shape: tuple[int, ...], device: str = "cuda") -> torch.Tensor:
-    return torch.empty(shape, dtype=torch.int, device=device)
+    # Slot-indexed stores can be read by the overlap scheduler before every
+    # slot is written in the current step. Unwritten slots must be neutral.
+    return torch.zeros(shape, dtype=torch.int, device=device)
 
 
 def add_token(
