@@ -14,8 +14,8 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from enum import IntEnum
 from queue import Queue
-from typing import (TYPE_CHECKING, Dict, Iterable, Iterator, List, Optional,
-                    Tuple, Union)
+from typing import (TYPE_CHECKING, Callable, Dict, Iterable, Iterator, List,
+                    Optional, Tuple, Union)
 
 import torch
 from strenum import StrEnum
@@ -67,6 +67,7 @@ from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.speculation_gate import SpeculationGate
 from .adp_iter_stats import ADPIterStatsBuffer
 from .connectors.kv_cache_connector import KvCacheConnectorManager
+from .cuda_graph_runner import ADPShapeAgreement
 from .dwdp import DwdpManager
 from .error_classification import ErrorBudget
 from .executor_request_queue import ExecutorRequestQueue, RequestQueueItem
@@ -106,6 +107,204 @@ if TYPE_CHECKING:
     from ray.actor import ActorHandle
 
 _UNBOUNDED_STATS_MAX_LEN = -1
+_DSPARK_EXACT_WIRE_PREFIX_LEN = 19
+_DSPARK_ADP_WIRE_TRAILER_LEN = 4
+_DSPARK_EXACT_NATIVE_YIELD_INDEX = _DSPARK_EXACT_WIRE_PREFIX_LEN - 1
+
+
+def _encode_dspark_exact_expected_yields(
+    *, exact_local, num_cells: int, yield_scale: int
+) -> Tuple[int, Tuple[int, ...]]:
+    """Encode one rank's exact yields without risking a split collective.
+
+    Invalid or locally optimistic compact yields become the existing ``-1``
+    infeasible sentinel.  Every rank can therefore finish the allgather and
+    make the cell globally ineligible instead of one rank raising before its
+    peers enter the collective.  The decoder still treats a positive gathered
+    compact value above native as wire corruption.
+    """
+    if yield_scale <= 0:
+        raise ValueError("DSpark exact-policy yield scale must be positive")
+    num_cells = int(num_cells)
+    if num_cells < 0:
+        raise ValueError("DSpark exact-policy cell count must be nonnegative")
+    if exact_local is None:
+        return 0, tuple(-1 for _ in range(num_cells))
+
+    native = float(exact_local.native_expected_yield)
+    native_valid = math.isfinite(native) and native >= 0.0
+    native_wire = int(math.ceil(native * yield_scale)) if native_valid else 0
+    local_values = tuple(exact_local.compact_expected_yields)
+    compact_wires = []
+    for cell_index in range(num_cells):
+        value = (
+            float(local_values[cell_index])
+            if cell_index < len(local_values)
+            else math.nan
+        )
+        if (
+            not native_valid
+            or not math.isfinite(value)
+            or value < 0.0
+            or value > native
+        ):
+            compact_wires.append(-1)
+        else:
+            compact_wires.append(int(math.floor(value * yield_scale)))
+    return native_wire, tuple(compact_wires)
+
+
+def _decode_dspark_exact_expected_yields(
+    *,
+    payloads: List[List[int]],
+    exact_cells: Iterable[Tuple[int, int]],
+    graph_batch_size: int,
+    yield_scale: int,
+) -> Tuple[float, Dict[int, float], Dict[int, float]]:
+    """Decode aggregate yields and worst-rank losses from the ADP wire.
+
+    Aggregate yields retain the existing immediate-goodput semantics.  The
+    loss curve is normalized per real request on each active rank before
+    taking the maximum, so one synchronized step saving is not charged for
+    the sum of every attention-DP rank's drain risk.
+    """
+    if yield_scale <= 0:
+        raise ValueError("DSpark exact-policy yield scale must be positive")
+    native_expected_yield = sum(
+        float(payload[_DSPARK_EXACT_NATIVE_YIELD_INDEX])
+        for payload in payloads) / yield_scale
+    compact_expected_yields = {}
+    compact_max_yield_losses_per_request = {}
+    for cell_index, (cell_graph_batch_size,
+                     verifier_budget) in enumerate(exact_cells):
+        if cell_graph_batch_size != graph_batch_size:
+            continue
+        rank_yields = [
+            float(payload[_DSPARK_EXACT_WIRE_PREFIX_LEN + cell_index])
+            for payload in payloads
+        ]
+        # A negative local value marks a cell that cannot fit that rank's
+        # mandatory real-row floor. Zero aggregate yield makes it ineligible.
+        infeasible = any(value < 0.0 for value in rank_yields)
+        compact_expected_yields[verifier_budget] = (0.0 if infeasible else
+                                                    sum(rank_yields) /
+                                                    yield_scale)
+        active_rank_losses = []
+        if not infeasible:
+            for payload, compact_yield_wire in zip(payloads, rank_yields):
+                num_real_requests = int(payload[1])
+                if num_real_requests <= 0:
+                    continue
+                native_yield_wire = float(
+                    payload[_DSPARK_EXACT_NATIVE_YIELD_INDEX])
+                if compact_yield_wire > native_yield_wire:
+                    raise RuntimeError(
+                        "DSpark exact-policy compact yield exceeds native "
+                        "yield on an active rank")
+                active_rank_losses.append(
+                    (native_yield_wire - compact_yield_wire) / yield_scale /
+                    num_real_requests)
+        compact_max_yield_losses_per_request[verifier_budget] = (max(
+            active_rank_losses, default=0.0))
+    return (
+        native_expected_yield,
+        compact_expected_yields,
+        compact_max_yield_losses_per_request,
+    )
+
+
+def _validate_dspark_exact_bucket(*, exact_shape, bucket,
+                                  trims_submitted_tokens: bool) -> None:
+    """Validate the graph-key meaning of one exact DSpark decision."""
+    if exact_shape is None:
+        return
+    expected_bucket = int(exact_shape[1])
+    if trims_submitted_tokens:
+        if bucket is None or int(bucket) != expected_bucket:
+            raise RuntimeError(
+                "DSpark exact compact policy did not publish its selected "
+                f"captured verifier bucket V={expected_bucket}; got {bucket}")
+    elif bucket is not None:
+        raise RuntimeError(
+            "DSpark cap-accept policy must keep the uniform CUDA-graph key; "
+            f"got ragged verifier bucket {bucket}")
+
+
+def _validate_dspark_adp_debug_flags(payloads, debug_index: int) -> bool:
+    """Require the debug-only collective protocol to match on every rank."""
+    flags = tuple(int(payload[debug_index]) for payload in payloads)
+    if any(flag not in (0, 1) for flag in flags):
+        raise RuntimeError(
+            "DSpark ADP agreement debug flags must be encoded as 0 or 1")
+    if len(set(flags)) != 1:
+        raise RuntimeError(
+            "DSpark ranks disagree on TLLM_DSPARK_ADP_SHAPE_DEBUG; this "
+            "option changes collective ordering and must match on every rank")
+    return bool(flags[0])
+
+
+def _validate_dspark_adp_acceptance_gate(
+        *, confidence_enabled: bool, attention_dp_enabled: bool,
+        speculation_gate_enabled: bool) -> None:
+    """Reject a rank-local gate that can split the ADP collective protocol."""
+    if (confidence_enabled and attention_dp_enabled
+            and speculation_gate_enabled):
+        raise ValueError(
+            "DSpark confidence scheduling with attention DP does not support "
+            "acceptance_rate_window_size/acceptance_rate_threshold: the "
+            "per-rank SpeculationGate can disable speculation at different "
+            "iterations and break collective ordering. Disable the acceptance "
+            "gate for this configuration.")
+
+
+def _classify_dspark_exact_generation_rows(
+    generation_requests: List[LlmRequest],
+) -> Tuple[Optional[List[LlmRequest]], bool]:
+    """Return logical exact rows and whether one idle ADP dummy is scheduled."""
+    # No generation row is not a priced exact-policy geometry. In particular,
+    # an attention-DP peer carrying context-only work must decline locally and
+    # ride the existing all-or-nothing agreement back to native K5; advertising
+    # a supported zero-real decision would let it fail rank-locally after the
+    # collective while generation peers continue.
+    if not generation_requests:
+        return None, False
+    real_requests = [request for request in generation_requests
+                     if not request.is_dummy]
+    if len(real_requests) == len(generation_requests):
+        return real_requests, False
+    one_adp_dummy = bool(
+        not real_requests
+        and len(generation_requests) == 1
+        and generation_requests[0].is_attention_dp_dummy)
+    if one_adp_dummy:
+        return real_requests, True
+    return None, False
+
+
+def _dspark_exact_common_graph_batch_size(
+    payloads: List[List[int]],
+    round_up: Callable[[int], int],
+) -> int:
+    """Resolve a common exact G, preserving zero as all-rank termination."""
+    widest_rows = max((int(payload[1]) for payload in payloads), default=0)
+    if widest_rows <= 0:
+        return 0
+    return int(round_up(widest_rows))
+
+
+def _dspark_exact_secondary_padding_ready(
+    payloads: List[List[int]],
+    *,
+    graph_batch_size: int,
+    verifier_budget: int,
+    secondary_ready_index: int,
+) -> bool:
+    """Whether every zero-real peer can represent the selected remainder."""
+    if verifier_budget % graph_batch_size <= 1:
+        return True
+    return all(
+        int(payload[1]) != 0 or bool(int(payload[secondary_ready_index]))
+        for payload in payloads)
 
 
 class _ADPForwardIntent(IntEnum):
@@ -557,6 +756,12 @@ class PyExecutor:
             threshold = getattr(spec_config, 'acceptance_rate_threshold', None)
             if window and threshold is not None:
                 self.speculation_gate = SpeculationGate(window, threshold)
+        _validate_dspark_adp_acceptance_gate(
+            confidence_enabled=getattr(self.model_engine,
+                                       "_dspark_confidence_enabled", False),
+            attention_dp_enabled=self.enable_attention_dp,
+            speculation_gate_enabled=self.speculation_gate is not None,
+        )
 
         # response used data
         self.response_lock = threading.Lock()
@@ -2292,7 +2497,8 @@ class PyExecutor:
                            attention_dp_rank: Optional[int] = None,
                            host_step_time_ms: Optional[float] = None,
                            prev_device_step_time_ms: Optional[float] = None,
-                           gpu_forward_time_ms: Optional[float] = None):
+                           gpu_forward_time_ms: Optional[float] = None,
+                           num_generation_tokens: Optional[int] = None):
         """Append one iteration's finalized stats to the export buffer.
 
         The normal Attention-DP path fans out rank-local rows before calling
@@ -2361,6 +2567,16 @@ class PyExecutor:
                 local_dict["prevDeviceStepTimeMS"] = prev_device_step_time_ms
             if gpu_forward_time_ms is not None:
                 local_dict["gpuForwardTimeMS"] = gpu_forward_time_ms
+            # The executed (padded) generation-token total -- the M axis of
+            # the SPS cost table. Same value the iteration log prints in
+            # `states`; carried per rank so ragged sweeps can align steps on
+            # the group's agreed shape.
+            num_gen_tokens = (num_generation_tokens
+                              if num_generation_tokens is not None else
+                              (self.model_engine.iter_states
+                               or {}).get('num_generation_tokens'))
+            if num_gen_tokens is not None:
+                local_dict["numGenerationTokens"] = int(num_gen_tokens)
             local_dict["schedulerMode"] = scheduler_mode
             local_dict["rank"] = self.dist.tp_rank
             # Buffer for _flush_iter_stats_synced; in-place tp_allgather would
@@ -2379,6 +2595,8 @@ class PyExecutor:
         #   [5] prev_device_step_time_ms: Optional[float]
         #   [6] scheduler_mode: "overlap" | "non_overlap"
         #   [7] gpu_forward_time_ms: Optional[float]
+        #   [8] num_generation_tokens: Optional[int] -- executed (padded)
+        #       generation-token total, rank0's value broadcast per row
         with self.stats_lock:
             if (not _stats_buffer_is_unbounded(self.max_stats_len)
                     and len(self.stats) > self.max_stats_len):
@@ -2386,7 +2604,7 @@ class PyExecutor:
             self.stats.append(
                 (stats, req_stats, kv_iter_stats, attention_dp_rank,
                  host_step_time_ms, prev_device_step_time_ms, scheduler_mode,
-                 gpu_forward_time_ms))
+                 gpu_forward_time_ms, num_generation_tokens))
 
     def _process_iter_stats(
         self,
@@ -2451,7 +2669,9 @@ class PyExecutor:
                 is_rank0=self.dist.rank == 0,
                 host_step_time_ms=host_step_time_ms,
                 prev_device_step_time_ms=prev_device_step_time_ms,
-                gpu_forward_time_ms=gpu_forward_time_ms)
+                gpu_forward_time_ms=gpu_forward_time_ms,
+                num_generation_tokens=(self.model_engine.iter_states
+                                       or {}).get('num_generation_tokens'))
         else:
             self._append_iter_stats(
                 stats,
@@ -2460,7 +2680,33 @@ class PyExecutor:
                 prev_device_step_time_ms=prev_device_step_time_ms,
                 gpu_forward_time_ms=gpu_forward_time_ms)
 
+    def _report_dspark_ragged_stats(self) -> None:
+        """Final DSpark scheduling summary at shutdown.
+
+        The counters live in the worker process and are unreachable from the
+        driver under multi-rank TP, so the log is the shared channel.
+        """
+        worker = getattr(self.model_engine, "_get_spec_worker", None)
+        stats = getattr(worker(), "ragged_stats", None) if worker else None
+        # Flush BEFORE the ragged early-return: STS collection also runs in
+        # static mode.
+        recorder = getattr(self.sampler, "sts_recorder", None)
+        if recorder is not None:
+            recorder.flush()
+        if stats is None or not stats.steps_total:
+            planner = getattr(worker(), "verify_planner", None) if worker else None
+            planner_stats = getattr(planner, "stats", None)
+            if planner_stats and planner_stats.get("decisions", 0):
+                logger.info(
+                    f"DSpark confidence planner [final]: {planner_stats}")
+            return
+        stats.log_summary(prefix="DSpark ragged verify [final]")
+
     def _executor_loop_cleanup(self):
+        try:
+            self._report_dspark_ragged_stats()
+        except Exception as exc:  # noqa: BLE001 - never block shutdown on stats
+            logger.warning(f"DSpark ragged stats reporting failed: {exc}")
         # Wake any waiters in await_responses BEFORE potentially-blocking
         # work below. If wait_on_pp_send_handles hangs (e.g. after a
         # crash leaves PP send handles in a bad state), the await loop
@@ -3307,6 +3553,734 @@ class PyExecutor:
             send_handles[microbatch_id].wait()
             send_handles[microbatch_id] = None
 
+    def get_dspark_ragged_stats(self) -> dict[str, object]:
+        """Return this rank's live DSpark ragged-verification counters.
+
+        The counters deliberately stay rank-local: attention-DP ranks own
+        different requests, so summing them would erase the per-rank graph and
+        fallback evidence needed to diagnose an uneven drain. Multi-rank MPI
+        callers reach rank 0 through ``collective_rpc``; the final shutdown log
+        remains the all-rank evidence channel for production runs.
+
+        Raises:
+            RuntimeError: if this executor has no initialized DSpark ragged
+                statistics object.
+        """
+        worker_fn = getattr(self.model_engine, "_get_spec_worker", None)
+        worker = worker_fn() if worker_fn else None
+        stats = getattr(worker, "ragged_stats", None) if worker else None
+        if stats is None:
+            raise RuntimeError(
+                "no initialized DSpark ragged statistics on this executor")
+        return stats.summary()
+
+    def set_dspark_verify_len_pin(self,
+                                  verify_len: Optional[int]) -> Optional[int]:
+        """Queue a DSpark verify-length pin, or ``None`` to clear it.
+
+        The pin bypasses the confidence planner so every request verifies the
+        same number of positions (for cost-table sweeps against a running
+        server). Validated here, applied on the next decode step, when the
+        step's cross-rank allgather hands the same value to every rank.
+
+        Returns:
+            The validated pin, or None when cleared.
+
+        Raises:
+            RuntimeError: if this executor has no DSpark confidence planner.
+            ValueError: if the length is outside the ladder (see
+                :meth:`DSparkVerifyPlanner.validate_verify_len_pin`).
+        """
+        worker_fn = getattr(self.model_engine, "_get_spec_worker", None)
+        worker = worker_fn() if worker_fn else None
+        planner = getattr(worker, "verify_planner", None) if worker else None
+        if planner is None:
+            raise RuntimeError(
+                "no DSpark confidence planner on this executor; the verify-len "
+                "pin only applies to a DSpark engine with confidence "
+                "scheduling enabled")
+        mode = worker.ragged_verify_mode
+        computes = (mode.computes_windows if mode is not None else
+                    self.model_engine.spec_config.enable_ragged_verify)
+        if not computes:
+            # Static mode never calls decide_verify_lens, so an accepted pin
+            # would be adopted and silently never applied.
+            raise RuntimeError(
+                "this engine runs static (uniform) verification; the "
+                "verify-length pin only affects window-computing modes, so "
+                "pinning here would be accepted and silently never applied")
+        if (worker.sts_recorder is not None and verify_len is not None
+                and int(verify_len) < int(self.model_engine.max_draft_len)):
+            # A sub-block pin censors the acceptance label of every STS sample
+            # collected after it; the collector's start-time guard cannot see
+            # a runtime pin.
+            raise RuntimeError(
+                "STS calibration collection is active on this engine; a pin "
+                "below the full block censors the acceptance label for every "
+                "sample collected after it. Pin the full block, clear the "
+                "pin, or restart without the collector.")
+        if verify_len is not None and (planner.forced_budget_frac is not None
+                                       or planner.pending_budget_frac() >= 0):
+            raise RuntimeError(
+                "a budget fraction is in force (or queued) on this engine; a "
+                "pin would silently shadow it. Clear the fraction first.")
+        return planner.request_verify_len_pin(verify_len)
+
+    def set_dspark_budget_frac(self, frac: Optional[float]) -> Optional[float]:
+        """Queue a DSpark verify-budget fraction, or ``None`` to clear it.
+
+        Replaces the cost-table argmax with ``frac`` of the maximum trimmable
+        budget while the confidence top-k keeps assigning the windows -- the
+        production ragged path at a controlled load point, for SPS cost-table
+        sweeps. Validated here, applied on the next decode step through the
+        step's cross-rank allgather.
+
+        Raises:
+            RuntimeError: if this executor has no DSpark confidence planner,
+                runs static verification, or is collecting STS calibration
+                data (a trimmed budget censors the acceptance labels).
+            ValueError: if ``frac`` is outside ``(0.0, 1.0]``.
+        """
+        worker_fn = getattr(self.model_engine, "_get_spec_worker", None)
+        worker = worker_fn() if worker_fn else None
+        planner = getattr(worker, "verify_planner", None) if worker else None
+        if planner is None:
+            raise RuntimeError(
+                "no DSpark confidence planner on this executor; the budget "
+                "fraction only applies to a DSpark engine with confidence "
+                "scheduling enabled")
+        mode = worker.ragged_verify_mode
+        trims = (mode.trims_submitted_tokens if mode is not None else
+                 self.model_engine.spec_config.enable_ragged_verify)
+        if not trims:
+            # Static never computes windows; cap-accept computes them but
+            # submits the full block, so a frac there cannot move the load
+            # point -- it would only cap live acceptance, which is not what a
+            # cost sweep asks for.
+            raise RuntimeError(
+                "this engine does not trim submitted tokens (static or "
+                "cap-accept mode); the budget fraction only moves the load "
+                "point in compact mode, so setting it here would change "
+                "nothing or change acceptance instead")
+        if frac is not None and (planner.forced_verify_len is not None
+                                 or planner.pending_verify_len_pin() >= 0):
+            raise RuntimeError(
+                "a verify-length pin is in force (or queued) on this engine; "
+                "the pin takes precedence and the fraction would be adopted, "
+                "logged, and never applied. Clear the pin first.")
+        if (worker.sts_recorder is not None and frac is not None
+                and float(frac) < 1.0):
+            raise RuntimeError(
+                "STS calibration collection is active on this engine; a "
+                "trimmed budget censors the acceptance label for every sample "
+                "collected after it. Use 1.0, clear the fraction, or restart "
+                "without the collector.")
+        return planner.request_budget_frac(frac)
+
+    def _dspark_confidence_draft_len(self,
+                                     scheduled_batch: ScheduledRequests) -> int:
+        """Draft length for this iteration, from the DSpark confidence planner.
+
+        Runs outside CUDA-graph capture: it reads the confidence snapshot
+        staged on the previous iteration, then stages a fresh one -- a
+        one-iteration lag with no synchronization. Falls back to the full
+        block on any missing piece.
+        """
+        max_draft_len = self.model_engine.max_draft_len
+        worker = self.model_engine._get_spec_worker()
+        planner = getattr(worker, "verify_planner", None)
+        if planner is None:
+            return max_draft_len
+        runtime_cost_table = getattr(self.model_engine,
+                                     "_dspark_sps_cost_table", None)
+        if (runtime_cost_table is not None
+                and planner.cost_table is not runtime_cost_table):
+            planner.install_runtime_cost_table(runtime_cost_table)
+
+        gen_requests = scheduled_batch.generation_requests
+        num_gen_requests = len(gen_requests)
+        # Read back by SLOT, not batch position: the snapshot is one iteration
+        # old and the batch reshuffles in between. Slotless requests map to
+        # the neutral row ("verify the whole block").
+        confidence_rows = [
+            worker.confidence_row_for(request.py_request_id)
+            for request in gen_requests
+        ]
+
+        # The mode, not the config flag, decides whether windows are computed;
+        # every counter below is keyed off the same decision.
+        stats = worker.ragged_stats
+        # Wire the worker's counters into the sampler here, where both are
+        # reachable: acceptance is only observable host-side in the sampler.
+        if (stats is not None and self.sampler is not None
+                and self.sampler.acceptance_stats is None):
+            self.sampler.acceptance_stats = stats
+        # Same wiring for STS. The sampler gets the worker's OWN row resolver
+        # and pass counter: the recorder joins by (draft pass, buffer row),
+        # and both keys must come from the allocator that wrote the buffer.
+        if (self.sampler is not None and self.sampler.sts_recorder is None):
+            recorder = worker.sts_recorder
+            if recorder is not None:
+                self.sampler.sts_recorder = recorder
+                self.sampler.sts_row_for = worker.sts_row_for
+                self.sampler.sts_seq_provider = worker.verified_draft_seq
+        mode = worker.ragged_verify_mode
+        compute_windows = mode.computes_windows
+
+        is_distributed = (self.dist is not None and self.dist.tp_size > 1)
+
+        # --- Phase 1: decide locally, issue nothing ---------------------------
+        #
+        # Every decline reason is rank-local, so a collective placed after
+        # them deadlocks: nothing below may branch on rank-local state before
+        # the single collective, and nothing after it may issue another one.
+        ragged_lens = None
+        fallback_reason = None
+        device_budget = None
+        exact_local = None
+        exact_table = planner.exact_cost_table
+        exact_cells = ()
+        if exact_table is not None:
+            exact_cells = getattr(self.model_engine,
+                                  "_dspark_exact_candidate_cells", None)
+            if exact_cells is None:
+                exact_cells = exact_table.candidate_cells()
+        exact_policy = bool(exact_table is not None
+                            and planner.forced_verify_len is None
+                            and planner.forced_budget_frac is None)
+        exact_requests: Optional[List[LlmRequest]] = gen_requests
+        exact_zero_real_adp_dummy = False
+        if exact_policy:
+            (exact_requests, exact_zero_real_adp_dummy) = (
+                _classify_dspark_exact_generation_rows(gen_requests))
+        # Cleared unconditionally: a budget left over from a previous step
+        # would re-rank a batch it was never computed for.
+        self.model_engine._dspark_device_budget = None
+        if compute_windows:
+            if (scheduled_batch.context_requests
+                    and (exact_policy or planner.skip_mixed_trim)):
+                # Exact (G,V) tables price pure generation rows, while the CUDA
+                # graph agreement G counts all scheduled rows. Until the cost
+                # schema represents mixed geometry, every exact-policy mixed
+                # step must decline. The local decision rides the normal
+                # all-or-nothing attention-DP agreement below.
+                fallback_reason = "mixed_step_declined"
+            elif exact_policy:
+                # Produce the whole measured yield grid locally. The common G
+                # and winning V are resolved from the existing attention-DP
+                # allgather below, so exact scheduling adds no synchronization.
+                if exact_requests is None:
+                    fallback_reason = "unsupported_dummy_shape"
+                elif (exact_zero_real_adp_dummy
+                      and not mode.trims_submitted_tokens):
+                    # Pad-only exact execution removes physical target work.
+                    # Cap-accept deliberately keeps the whole target block, so
+                    # admitting an empty rank there adds protocol state without
+                    # any compute saving and remains native.
+                    fallback_reason = "planner_declined"
+                else:
+                    exact_confidence_rows = [
+                        worker.confidence_row_for(request.py_request_id)
+                        for request in exact_requests
+                    ]
+                    exact_local = planner.prepare_exact_sps_decision(
+                        num_gen_requests=len(exact_requests),
+                        rows=exact_confidence_rows)
+                if exact_requests is not None and exact_local is None:
+                    fallback_reason = "planner_declined"
+            elif planner.device_windows and mode.trims_submitted_tokens:
+                # Device-window mode: the host decides only the CAPACITY, from
+                # the lag-2 snapshot; the returned lens are a shape split used
+                # for the cross-rank agreement and the fit. The true windows
+                # are re-ranked on device just before the replay.
+                pair = planner.decide_verify_budget(
+                    num_gen_requests=num_gen_requests, rows=confidence_rows)
+                if pair is None:
+                    fallback_reason = "planner_declined"
+                else:
+                    device_budget, ragged_lens = pair
+            elif planner.device_windows:
+                # cap-accept + device mode: a pure measurement configuration.
+                # The lag-2 argmax picks the budget, the normal top-k spends
+                # it, and the block still executes IN FULL -- the windows ride
+                # py_verify_cap as accounting caps, so cap_trim_tokens reports
+                # exactly how many target-accepted tokens this budget would
+                # have discarded. Differencing against plain cap-accept
+                # (lag-1 budget) isolates the budget's true acceptance cost
+                # at identical compute.
+                pair = planner.decide_verify_budget(
+                    num_gen_requests=num_gen_requests, rows=confidence_rows)
+                ragged_lens = (planner.decide_verify_lens(
+                    num_gen_requests=num_gen_requests,
+                    rows=confidence_rows,
+                    reduce_across_ranks=False,
+                    budget_override=pair[0]) if pair is not None else None)
+                if ragged_lens is None:
+                    fallback_reason = "planner_declined"
+            else:
+                ragged_lens = planner.decide_verify_lens(
+                    num_gen_requests=num_gen_requests,
+                    rows=confidence_rows,
+                    reduce_across_ranks=False)
+                if ragged_lens is None:
+                    fallback_reason = "planner_declined"
+        else:
+            fallback_reason = "mode_static"
+            # Nothing to compute: the fallback verifies the full drafted block.
+
+        # --- Phase 2: one collective, same shape on every rank, every step ----
+        #
+        # Payload prefix: [wants_ragged, num_rows, total_verify_tokens,
+        # max_window, can_graph, pending_pin, pending_frac]. Every rank then
+        # appends [has_exact_table, exact_ready, exact_cell_count,
+        # table_sha256_as_8_u32, native_yield,
+        # yield_for_each_stable_(G,V)_cell, scheduled_batch_size,
+        # low_padding_dummy_cached, high_padding_dummy_cached,
+        # adp_shape_debug]. Carrying the authenticated table
+        # identity is mandatory: equal vector lengths do not prove that ranks
+        # assign the same (G,V) or T(G,V) to each position.
+        # `can_graph` rides along because the ragged
+        # fit runs before the graph runner's own allgather and must know
+        # whether row padding will happen: _get_padded_batch only takes the
+        # cross-rank row maximum when EVERY rank can graph this step.
+        local_rows = (exact_local.num_requests if exact_local is not None else
+                      len(ragged_lens) if ragged_lens is not None else 0)
+        local_tokens = (sum(1 + int(v)
+                            for v in ragged_lens) if ragged_lens else 0)
+        local_max_window = (planner.max_tier if exact_local is not None else
+                            max(ragged_lens) if ragged_lens else 0)
+        peer_stats = None
+        # Single-rank runs have no peer that could be holding a context
+        # request, so the local batch's own answer is the group's.
+        all_can_graph = bool(scheduled_batch.can_run_cuda_graph)
+        local_payload = [
+            1 if (ragged_lens is not None or exact_local is not None) else 0,
+            local_rows,
+            local_tokens,
+            local_max_window,
+            1 if scheduled_batch.can_run_cuda_graph else 0,
+            planner.pending_verify_len_pin(),
+            planner.pending_budget_frac(),
+        ]
+        exact_yield_scale = 1_000_000
+        exact_identity_words = (0, ) * 8
+        if exact_table is not None:
+            exact_identity_words = getattr(self.model_engine,
+                                           "_dspark_exact_identity_words", None)
+            if exact_identity_words is None:
+                exact_identity_words = exact_table.collective_identity_words
+        native_yield_wire, compact_yields_wire = (
+            _encode_dspark_exact_expected_yields(
+                exact_local=exact_local,
+                num_cells=len(exact_cells),
+                yield_scale=exact_yield_scale,
+            )
+        )
+        local_payload.extend([
+            1 if exact_table is not None else 0,
+            1 if exact_local is not None else 0,
+            len(exact_cells),
+            *exact_identity_words,
+            native_yield_wire,
+            *compact_yields_wire,
+        ])
+        runner = self.model_engine.cuda_graph_runner
+        local_payload.extend([
+            int(scheduled_batch.batch_size),
+            1 if planner.max_tier in getattr(runner, "padding_dummy_requests",
+                                             {}) else 0,
+            1 if planner.max_tier in getattr(
+                runner, "secondary_padding_dummy_requests", {}) else 0,
+            1 if runner.adp_shape_debug else 0,
+        ])
+        if is_distributed:
+            payloads = self.dist.tp_allgather(local_payload)
+            # The pin and the budget fraction ride the allgather so every rank
+            # adopts the same value on the same step (the endpoint lands on
+            # one rank). -1 means nobody queued anything.
+            agreed_pin = next((int(payload[5]) for payload in payloads
+                               if len(payload) > 5 and int(payload[5]) >= 0),
+                              -1)
+            planner.adopt_verify_len_pin(agreed_pin)
+            agreed_frac = next((int(payload[6]) for payload in payloads
+                                if len(payload) > 6 and int(payload[6]) >= 0),
+                               -1)
+            planner.adopt_budget_frac(agreed_frac)
+            exact_table_flags = [int(payload[7]) for payload in payloads]
+            if len(set(exact_table_flags)) != 1:
+                raise RuntimeError(
+                    "DSpark ranks disagree on whether an exact SPS table is "
+                    "installed")
+            if exact_table_flags[0]:
+                exact_cell_counts = [int(payload[9]) for payload in payloads]
+                exact_identities = [
+                    tuple(int(value) for value in payload[10:18])
+                    for payload in payloads
+                ]
+                payload_shapes_valid = all(
+                    len(payload) == (_DSPARK_EXACT_WIRE_PREFIX_LEN +
+                                     _DSPARK_ADP_WIRE_TRAILER_LEN +
+                                     int(payload[9])) for payload in payloads)
+                if (not payload_shapes_valid or len(set(exact_cell_counts)) != 1
+                        or len(set(exact_identities)) != 1):
+                    raise RuntimeError(
+                        "DSpark exact SPS ranks disagree on the authenticated "
+                        "(G,V), T(G,V), or minimum-gain table identity")
+            if not all(int(payload[0]) for payload in payloads):
+                # All-or-nothing across ranks: `all_rank_num_tokens` is frozen
+                # into the captured graph, so a mixed step's mismatch would
+                # not even be observable at replay time.
+                if ragged_lens is not None or exact_local is not None:
+                    fallback_reason = "peer_declined"
+                ragged_lens = None
+                exact_local = None
+            else:
+                # payload[3] is unread; it stays so the collective keeps a
+                # stable shape. peer_stats' third element is the GROUP's
+                # can-graph answer, identical on every rank, not each rank's
+                # own flag.
+                all_can_graph = all(int(payload[4]) for payload in payloads)
+                peer_stats = [[
+                    int(payload[1]),
+                    int(payload[2]), 1 if all_can_graph else 0
+                ] for payload in payloads]
+        else:
+            payloads = [local_payload]
+            # Single-rank world: the local queue IS the group's agreement.
+            planner.adopt_verify_len_pin(planner.pending_verify_len_pin())
+            planner.adopt_budget_frac(planner.pending_budget_frac())
+
+        exact_payload_end = _DSPARK_EXACT_WIRE_PREFIX_LEN + len(exact_cells)
+        batch_size_index = exact_payload_end
+        padding_dummy_index = exact_payload_end + 1
+        secondary_padding_dummy_index = exact_payload_end + 2
+        debug_index = exact_payload_end + 3
+        if any(
+                len(payload) != exact_payload_end + _DSPARK_ADP_WIRE_TRAILER_LEN
+                for payload in payloads):
+            raise RuntimeError(
+                "DSpark ADP agreement payload has an inconsistent shape")
+        _validate_dspark_adp_debug_flags(payloads, debug_index)
+        peer_batch_sizes = tuple(
+            int(payload[batch_size_index]) for payload in payloads)
+        widest_batch_size = max(peer_batch_sizes, default=0)
+        common_padded_batch_size = runner._round_up_batch_size_with_draft_len(
+            widest_batch_size, planner.max_tier)
+        all_can_graph = all(int(payload[4]) for payload in payloads)
+        padding_needed = any(
+            int(payload[batch_size_index]) != common_padded_batch_size
+            for payload in payloads)
+        padding_supported = bool(
+            not padding_needed
+            or (runner.padding_enabled
+                and common_padded_batch_size <= runner.config.batch_size))
+        padding_ready = bool(
+            common_padded_batch_size > 0 and padding_supported and all(
+                int(payload[batch_size_index]) == common_padded_batch_size
+                or int(payload[padding_dummy_index]) for payload in payloads))
+        exact_policy_agreed = bool(
+            exact_table is not None
+            and all(int(payload[8]) for payload in payloads))
+        agreement = ADPShapeAgreement(
+            iteration=int(self.iter_counter),
+            batch_identity=id(scheduled_batch),
+            local_batch_size=int(scheduled_batch.batch_size),
+            peer_batch_sizes=peer_batch_sizes,
+            all_can_graph=all_can_graph,
+            widest_batch_size=widest_batch_size,
+            graph_batch_size=common_padded_batch_size,
+            draft_len=int(planner.max_tier),
+            padding_ready=padding_ready,
+        )
+        runner.adp_shape_agreement = agreement
+        if not agreement.can_queue:
+            # Queue admission failed globally, so this is not a decode step:
+            # do not advance step-level stats/staging or leave a
+            # half-published window. Planner decision-attempt counters may
+            # still describe this attempted agreement.
+            self.model_engine._dspark_device_budget = None
+            runner.agreed_ragged_bucket = None
+            runner.ragged_pad_verify_len = 0
+            runner.ragged_zero_real_high_rows = 0
+            for request in gen_requests:
+                request.py_verify_len = None
+                request.py_verify_cap = None
+            return int(planner.max_tier)
+
+        # Resolve the exact cell after the same allgather has exposed common G
+        # and every rank's expected yield. All ranks traverse payloads in the
+        # same order, so this produces one deterministic V without another
+        # collective. V=0 keeps the ordinary native-static graph key.
+        exact_shape = None
+        if exact_local is not None:
+            if not all_can_graph:
+                fallback_reason = "peer_not_graphable"
+                exact_local = None
+            else:
+                expected_payload_len = (_DSPARK_EXACT_WIRE_PREFIX_LEN +
+                                        _DSPARK_ADP_WIRE_TRAILER_LEN +
+                                        len(exact_cells))
+                if any(
+                        len(payload) != expected_payload_len
+                        or not int(payload[8]) for payload in payloads):
+                    raise RuntimeError(
+                        "DSpark exact SPS collective payloads disagree on the "
+                        "measured (G,V) grid")
+                common_graph_batch_size = _dspark_exact_common_graph_batch_size(
+                    payloads, runner._round_up_batch_size)
+                if common_graph_batch_size == 0:
+                    fallback_reason = "no_captured_shape"
+                    exact_local = None
+                else:
+                    from ..speculative.dspark_planner import \
+                        select_exact_sps_candidate
+
+                    # Goodput uses aggregate yields, while drain pricing uses
+                    # the worst active rank's loss per real request. Decode
+                    # both from the existing fixed-point agreement payload.
+                    (
+                        native_expected_yield,
+                        compact_expected_yields,
+                        compact_max_yield_losses_per_request,
+                    ) = _decode_dspark_exact_expected_yields(
+                        payloads=payloads,
+                        exact_cells=exact_cells,
+                        graph_batch_size=common_graph_batch_size,
+                        yield_scale=exact_yield_scale,
+                    )
+                    selected_verifier_budget = select_exact_sps_candidate(
+                        graph_batch_size=common_graph_batch_size,
+                        native_expected_yield=native_expected_yield,
+                        compact_expected_yields=compact_expected_yields,
+                        compact_max_yield_losses_per_request=(
+                            compact_max_yield_losses_per_request),
+                        cost_table=exact_table,
+                    )
+                    if selected_verifier_budget == 0:
+                        if planner.detailed_stats:
+                            planner.stats["fallback_full_k"] += 1
+                        fallback_reason = "exact_native_k"
+                        exact_local = None
+                    elif not _dspark_exact_secondary_padding_ready(
+                            payloads,
+                            graph_batch_size=common_graph_batch_size,
+                            verifier_budget=selected_verifier_budget,
+                            secondary_ready_index=(
+                                secondary_padding_dummy_index)):
+                        # Only a zero-real quotient/remainder layout with more
+                        # than row zero high needs the second cached dummy.
+                        if planner.detailed_stats:
+                            planner.stats["fallback_full_k"] += 1
+                        fallback_reason = "secondary_padding_not_ready"
+                        exact_local = None
+                    else:
+                        (ragged_lens, local_exact_budget, exact_pad_tokens) = (
+                            planner.allocate_exact_sps_candidate(
+                                exact_local,
+                                graph_batch_size=common_graph_batch_size,
+                                verifier_budget=selected_verifier_budget))
+                        if exact_local.num_requests == 0:
+                            if not exact_zero_real_adp_dummy:
+                                raise RuntimeError(
+                                    "zero-real exact SPS allocation has no "
+                                    "authenticated attention-DP dummy row")
+                            _, remainder = divmod(selected_verifier_budget,
+                                                  common_graph_batch_size)
+                            scheduled_tokens = (int(exact_pad_tokens)
+                                                + int(remainder > 0))
+                            ragged_lens = [scheduled_tokens - 1]
+                        exact_shape = (common_graph_batch_size,
+                                       selected_verifier_budget,
+                                       exact_pad_tokens)
+                        if (planner.device_windows
+                                and mode.trims_submitted_tokens
+                                and local_exact_budget > 0):
+                            device_budget = int(local_exact_budget)
+                        from ..speculative.dspark_verify import \
+                            _exact_cell_geometry
+                        peer_stats = []
+                        for payload in payloads:
+                            peer_rows = int(payload[1])
+                            peer_geometry = _exact_cell_geometry(
+                                num_real=peer_rows,
+                                graph_batch_size=common_graph_batch_size,
+                                verifier_budget=selected_verifier_budget,
+                                min_verify_len=planner.cfg.min_verify_len,
+                                max_verify_len=planner.max_tier,
+                            )
+                            if peer_geometry is None:
+                                raise RuntimeError(
+                                    "Selected exact SPS cell is infeasible for "
+                                    f"peer rows={peer_rows}, "
+                                    f"G={common_graph_batch_size}, "
+                                    f"V={selected_verifier_budget}")
+                            _, peer_real_tokens, _ = peer_geometry
+                            peer_stats.append([
+                                peer_rows, peer_real_tokens,
+                                1 if all_can_graph else 0
+                            ])
+
+        # --- Phase 3: no more collectives -------------------------------------
+        #
+        # Land the token total on a captured bucket BEFORE the graph key is
+        # built; no captured shape means fall through to uniform, which always
+        # has a graph. The fit can still differ across ranks, which is why the
+        # attention-DP graph gate compares the token bucket, not just the
+        # batch size.
+        #
+        # `cap-accept` submits the full block: its windows go on
+        # `py_verify_cap`, not `py_verify_len`, so the whole token-layout path
+        # downstream keeps seeing an untrimmed batch.
+        bucket = None
+        ragged_active = False
+        cap_accept = (mode is not None and mode.computes_windows
+                      and not mode.trims_submitted_tokens)
+        if cap_accept:
+            # Clear every request first, set second: a stale cap silently
+            # commits against last step's schedule, with no assert to trip.
+            for request in gen_requests:
+                request.py_verify_cap = None
+        if ragged_lens is not None:
+            if cap_accept:
+                for request, window in zip(gen_requests, ragged_lens):
+                    request.py_verify_cap = int(window)
+                ragged_active = True
+            elif all_can_graph:
+                bucket = self.model_engine.fit_ragged_verify_lens(
+                    gen_requests,
+                    ragged_lens,
+                    peer_stats=peer_stats,
+                    exact_shape=exact_shape,
+                    exact_zero_real=exact_zero_real_adp_dummy)
+                ragged_active = bucket is not None
+                if bucket is None:
+                    fallback_reason = "no_captured_shape"
+                elif device_budget is not None:
+                    # The fit landed on a captured shape; hand the engine the
+                    # capacity so the pre-replay prologue re-ranks it with
+                    # fresh confidence. Published only here: every fallback
+                    # leaves it None and the step runs the host windows.
+                    self.model_engine._dspark_device_budget = int(device_budget)
+            else:
+                # No rank can graph this step, so run the windows eagerly. Do
+                # not fit a bucket: the fit sizes pad rows _get_padded_batch
+                # will not append on an ungraphable step.
+                runner = self.model_engine.cuda_graph_runner
+                runner.agreed_ragged_bucket = None
+                runner.ragged_pad_verify_len = 0
+                runner.ragged_zero_real_high_rows = 0
+                for request, window in zip(gen_requests, ragged_lens):
+                    request.py_verify_len = int(window)
+                ragged_active = True
+
+        reuse_graph_shape = bool(exact_policy_agreed and runner.enabled
+                                 and all_can_graph and padding_ready
+                                 and not runner.config.use_mrope)
+        _validate_dspark_exact_bucket(
+            exact_shape=exact_shape,
+            bucket=bucket,
+            trims_submitted_tokens=mode.trims_submitted_tokens,
+        )
+        if reuse_graph_shape:
+            if (exact_shape is not None
+                    and exact_shape[0] != common_padded_batch_size):
+                raise RuntimeError(
+                    "DSpark exact policy selected a graph batch size that "
+                    "disagrees with the cached ADP padding shape")
+        runner.adp_shape_agreement = dataclasses.replace(
+            agreement,
+            ragged_bucket=None if bucket is None else int(bucket),
+            reuse_graph_shape=reuse_graph_shape,
+        )
+
+        # Record what the step actually decided.
+        if stats is not None:
+            # Periodic summary: under TP the counters sit across an MPI
+            # boundary, so the log is the only shared channel.
+            if stats.should_log_periodic_summary():
+                stats.log_summary(prefix="DSpark ragged verify [periodic]")
+            fitted = None
+            delivered = None
+            logical_num_gen_requests = (
+                0 if exact_zero_real_adp_dummy else num_gen_requests)
+            if cap_accept:
+                # Nothing was fitted: the scheduled windows ARE the decision,
+                # and `delivered` must say the block was submitted whole.
+                fitted = ([] if exact_zero_real_adp_dummy and ragged_lens
+                          is not None else [int(v) for v in ragged_lens]
+                          if ragged_lens else None)
+                delivered = logical_num_gen_requests * (1 + max_draft_len)
+            elif ragged_active:
+                # Read back off the requests, not `ragged_lens`: the fit spent
+                # the bucket's rounding slack on real verification.
+                if exact_zero_real_adp_dummy:
+                    fitted = []
+                else:
+                    fitted = [
+                        int(request.py_verify_len) for request in gen_requests
+                        if getattr(request, "py_verify_len", None) is not None
+                    ]
+                    if len(fitted) != num_gen_requests:
+                        fitted = None
+            stats.record_step(
+                num_gen_requests=logical_num_gen_requests,
+                verify_lens=fitted,
+                bucket=bucket,
+                # Only when the fit delivered: otherwise this
+                # books the LAST fit's row count on steps that
+                # never entered the fit.
+                padded_bs=(self.model_engine._dspark_last_padded_bs
+                           if bucket is not None else None),
+                fallback=fallback_reason,
+                delivered=delivered)
+
+        if ragged_active and not cap_accept:
+            # The block is always drafted in full, so the batch-wide draft
+            # length stays at the top tier (fixed-width buffers); per-request
+            # windows ride on py_verify_len.
+            runtime_draft_len = max(
+                int(t) for t in self.model_engine.spec_config.verify_len_tiers)
+        else:
+            # Clear stale windows on EVERY generation request: a batch where
+            # only some requests carry one gets a ragged input layout with
+            # uniform acceptance -- silent token misattribution.
+            for request in gen_requests:
+                request.py_verify_len = None
+            # Clear the published fit state too: a stale agreed bucket
+            # describes a batch that no longer exists.
+            if self.model_engine.cuda_graph_runner is not None:
+                self.model_engine.cuda_graph_runner.agreed_ragged_bucket = None
+                self.model_engine.cuda_graph_runner.ragged_pad_verify_len = 0
+                self.model_engine.cuda_graph_runner.ragged_zero_real_high_rows = 0
+            # The only fallback is the full drafted block; nothing to agree on
+            # across ranks, so no collective.
+            runtime_draft_len = planner.max_tier
+
+        # Stage this step's confidence for the *next* decision. Non-blocking; if
+        # it has not landed by then the planner just verifies the full block.
+        # The whole slot-indexed buffer is staged, so the next step can look up
+        # whichever requests it happens to be scheduling.
+        buffer = worker.staged_confidence_buffer()
+        if buffer is not None:
+            # The stamp buffer says which draft pass last wrote each slot; the
+            # sequence bump marks "everything drafted so far" so the planner
+            # can histogram how stale each gathered row was at decision time.
+            staged_seq = worker.bump_draft_seq()
+            stamps = worker.confidence_stamp_buffer()
+            planner.stage_confidence(buffer,
+                                     stamps=stamps,
+                                     staged_seq=staged_seq)
+            # The STS recorder rings its own copy: labels arrive steps later
+            # and must pair with the pass that DRAFTED the block, not whatever
+            # the live buffer holds by then.
+            recorder = worker.sts_recorder
+            if recorder is not None:
+                recorder.stage_snapshot(device_logits=buffer,
+                                        device_stamps=stamps,
+                                        staged_seq=staged_seq)
+
+        return int(runtime_draft_len)
+
     def _handle_dynamic_draft_len(self,
                                   scheduled_batch: ScheduledRequests) -> None:
         """Handle dynamic draft length for the current batch.
@@ -3325,6 +4299,17 @@ class PyExecutor:
         When dynamic draft length is not enabled, runtime_draft_len is simply
         set to max_draft_len (the static maximum).
         """
+        signature = (
+            int(self.iter_counter),
+            id(scheduled_batch),
+            int(scheduled_batch.batch_size),
+            int(scheduled_batch.num_context_requests),
+            int(scheduled_batch.num_generation_requests),
+        )
+        if getattr(self, "_dspark_dynamic_handled_signature",
+                   None) == signature:
+            return
+
         if not hasattr(self.model_engine, 'max_draft_len'):
             return
 
@@ -3334,19 +4319,39 @@ class PyExecutor:
             self.model_engine.runtime_draft_len = 0
             return
 
-        if (self.model_engine.spec_config is not None
-                and self.model_engine.spec_config.draft_len_schedule is not None
-                and self.model_engine.spec_config.spec_dec_mode.
-                support_dynamic_draft_len()):
+        spec_config = self.model_engine.spec_config
+        schedule_driven = (
+            spec_config is not None
+            and spec_config.draft_len_schedule is not None
+            and spec_config.spec_dec_mode.support_dynamic_draft_len())
+        # DSpark drives the draft length from the batch's confidence rather than
+        # from a static batch-size schedule, but consumes the exact same
+        # pad/truncate machinery below.
+        confidence_driven = (spec_config is not None and getattr(
+            spec_config, "enable_confidence_scheduling", False))
+
+        if schedule_driven or confidence_driven:
             from tensorrt_llm._torch.speculative.utils import \
                 get_draft_len_for_batch_size
 
-            spec_dec_mode = self.model_engine.spec_config.spec_dec_mode
+            spec_dec_mode = spec_config.spec_dec_mode
 
-            # 1. Resolve runtime draft length from schedule
-            runtime_draft_len = get_draft_len_for_batch_size(
-                self.model_engine.spec_config.draft_len_schedule,
-                scheduled_batch.batch_size, self.model_engine.max_draft_len)
+            # 1. Resolve runtime draft length
+            if confidence_driven:
+                runtime_draft_len = self._dspark_confidence_draft_len(
+                    scheduled_batch)
+            else:
+                runtime_draft_len = get_draft_len_for_batch_size(
+                    spec_config.draft_len_schedule, scheduled_batch.batch_size,
+                    self.model_engine.max_draft_len)
+            runner = self.model_engine.cuda_graph_runner
+            agreement = getattr(runner, "adp_shape_agreement", None)
+            if (agreement is not None and agreement.matches(
+                    scheduled_batch, self.iter_counter, padded=False)
+                    and not agreement.can_queue):
+                self.model_engine.runtime_draft_len = runtime_draft_len
+                self._dspark_dynamic_handled_signature = signature
+                return
             # 2. Pad or truncate draft tokens to the resolved length
             DRAFT_BUFFER_PAD = 0  # Buffer sentinel, not PARD mask_token_id.
             rejection_on = getattr(self.model_engine.spec_config,
@@ -3397,6 +4402,18 @@ class PyExecutor:
                 self.model_engine.max_draft_len
                 if spec_config is not None and spec_config.is_linear_tree else
                 self.model_engine.max_total_draft_tokens)
+        self._dspark_dynamic_handled_signature = signature
+
+    def _dspark_adp_shape_cache_enabled(self) -> bool:
+        runner = getattr(self.model_engine, "cuda_graph_runner", None)
+        return bool(
+            self.enable_attention_dp and self.dist is not None
+            and self.dist.tp_size > 1 and runner is not None
+            and getattr(self.model_engine, "_dspark_confidence_enabled", False)
+            and getattr(self, "kv_connector_manager", None) is None
+            and getattr(self, "kv_cache_transceiver", None) is None
+            and getattr(self, "drafter", None) is None
+            and getattr(self, "_pp_rebalance_drain_iters", None) is None)
 
     @nvtx_range("_can_queue")
     def _can_queue(self, scheduled_batch):
@@ -3404,6 +4421,40 @@ class PyExecutor:
         # can_queue_this_rank is for case that the batch is not empty on this rank, but empty on other ranks
         # For bs == 1, we cannot pad dummy request to make the batch non-empty since it will cause the batch size to be 2.
         # 1 for dummy request, 1 for the yet-to-complete but not-yet-updated request.
+        runner = getattr(self.model_engine, "cuda_graph_runner", None)
+        if self._dspark_adp_shape_cache_enabled():
+            signature = (
+                int(self.iter_counter),
+                id(scheduled_batch),
+                int(scheduled_batch.batch_size),
+                int(scheduled_batch.num_context_requests),
+                int(scheduled_batch.num_generation_requests),
+            )
+            if getattr(self, "_dspark_dynamic_handled_signature",
+                       None) != signature:
+                runner.adp_shape_agreement = None
+            self._handle_dynamic_draft_len(scheduled_batch)
+            agreement = runner.adp_shape_agreement
+            if (agreement is not None and agreement.matches(
+                    scheduled_batch, self.iter_counter, padded=False)):
+                can_queue = agreement.can_queue
+                can_queue_this_rank = agreement.can_queue_this_rank
+                if runner.adp_shape_debug:
+                    tp_batch_sizes = self.dist.tp_allgather(
+                        scheduled_batch.batch_size)
+                    if (can_queue != (0 not in tp_batch_sizes)
+                            or can_queue_this_rank
+                            != (scheduled_batch.batch_size > 0)):
+                        raise RuntimeError(
+                            "DSpark cached ADP queue agreement disagrees "
+                            "with the debug collective")
+                return can_queue, can_queue_this_rank
+        elif runner is not None:
+            # An optional surface (for example a KV connector) can invalidate
+            # the request set after policy selection. Never let an agreement
+            # from a prior eligible step leak into its graph lookup.
+            runner.adp_shape_agreement = None
+
         if self.enable_attention_dp:
             tp_batch_sizes = self.dist.tp_allgather(scheduled_batch.batch_size)
             can_queue = 0 not in tp_batch_sizes
@@ -4910,7 +5961,8 @@ class PyExecutor:
         self._pp_rebalance_drain_iters = None
 
     def _suspend_padding_dummies_for_rebalance(
-            self, mgr: KVCacheManagerV2) -> List[Tuple[int, LlmRequest]]:
+            self, mgr: KVCacheManagerV2
+    ) -> List[Tuple[int, int, LlmRequest]]:
         """Suspend the CUDA-graph padding dummies before ``adjust()``.
 
         ``CUDAGraphRunner`` retains one padding dummy per captured draft
@@ -4927,21 +5979,27 @@ class PyExecutor:
         and silently drop padded batches to eager mode for the rest of the
         process lifetime.
 
-        Returns the ``(draft_len, dummy)`` pairs that were suspended.
+        Returns ``(draft_len, variant, dummy)`` triples. Variant zero is the
+        low-row dummy and variant one is the high-row dummy.
         """
         runner = getattr(self.model_engine, "cuda_graph_runner", None)
         if runner is None:
             return []
-        suspended: List[Tuple[int, LlmRequest]] = []
-        for draft_len, dummy in runner.padding_dummy_requests.items():
-            if mgr.is_request_active(dummy.py_request_id):
-                mgr.suspend_request(dummy)
-                suspended.append((draft_len, dummy))
+        suspended: List[Tuple[int, int, LlmRequest]] = []
+        caches = (
+            getattr(runner, "padding_dummy_requests", {}),
+            getattr(runner, "secondary_padding_dummy_requests", {}),
+        )
+        for variant, cache in enumerate(caches):
+            for draft_len, dummy in cache.items():
+                if mgr.is_request_active(dummy.py_request_id):
+                    mgr.suspend_request(dummy)
+                    suspended.append((draft_len, variant, dummy))
         return suspended
 
     def _resume_padding_dummies_after_rebalance(
             self, mgr: KVCacheManagerV2,
-            suspended: List[Tuple[int, LlmRequest]]) -> None:
+            suspended: List[Tuple[int, int, LlmRequest]]) -> None:
         """Resume the padding dummies suspended for ``adjust()``.
 
         A real request that fails to resume is left suspended for the
@@ -4959,13 +6017,19 @@ class PyExecutor:
         runner = getattr(self.model_engine, "cuda_graph_runner", None)
         if runner is None:
             return
-        for draft_len, dummy in suspended:
+        failed_draft_lens = set()
+        for draft_len, variant, dummy in suspended:
             if mgr.resume_request(dummy):
                 continue
             logger.warning(
                 "Could not resume the CUDA graph padding dummy request "
-                f"(draft_len={draft_len}) after a KV pool rebalance; "
+                f"(draft_len={draft_len}, variant={variant}) after a KV pool "
+                "rebalance; "
                 "releasing it and falling back to lazy re-creation.")
+            failed_draft_lens.add(draft_len)
+        # Resume both siblings before releasing a low/high pair. Releasing
+        # inline could free a resumed sibling and later try to resume it.
+        for draft_len in sorted(failed_draft_lens):
             runner.release_padding_dummy(self.resource_manager, draft_len)
 
     @contextmanager
@@ -5806,7 +6870,8 @@ class PyExecutor:
                         host_step_time_ms=record.host_step_time_ms,
                         prev_device_step_time_ms=record.
                         prev_device_step_time_ms,
-                        gpu_forward_time_ms=record.gpu_forward_time_ms)
+                        gpu_forward_time_ms=record.gpu_forward_time_ms,
+                        num_generation_tokens=record.num_generation_tokens)
             all_ranks_num_active_requests = [
                 s.num_active_requests for s in all_rank_states
             ]
