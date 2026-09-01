@@ -4442,3 +4442,117 @@ class TestDeepseekRuntimePreferences:
         cfg = self._pretrained_config(["DeepseekV3ForCausalLM"], "deepseek_v3")
         _resolve_transceiver_runtime_auto(args, DeepseekV3ForCausalLM, cfg)
         assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
+
+
+class TestDSparkConfidenceScheduling:
+    """Config surface for DSpark confidence-scheduled verification."""
+
+    def _cfg(self, **kw):
+        from tensorrt_llm.llmapi.llm_args import DSparkDecodingConfig
+        kw.setdefault("max_draft_len", 5)
+        return DSparkDecodingConfig(**kw)
+
+    def _scheduled(self, **kw):
+        """Scheduling on with the required profiled cost table."""
+        kw["enable_confidence_scheduling"] = True
+        kw.setdefault("confidence_sps_table_path", "/tmp/sps.json")
+        return self._cfg(**kw)
+
+    def test_defaults_are_off(self):
+        c = self._cfg()
+        assert c.enable_confidence_scheduling is False
+        assert c.enable_fused_confidence_scheduler is False
+        assert c.confidence_verify_len_tiers is None
+        # With scheduling off the ladder is just the static length.
+        assert c.verify_len_tiers == [5]
+
+    def test_knobs_require_the_master_switch(self):
+        for kw in ({
+                "confidence_sts_path": "/tmp/sts.json"
+        }, {
+                "confidence_sps_table_path": "/tmp/sps.json"
+        }, {
+                "confidence_sps_live_fingerprint_path": "/tmp/runtime.json"
+        }, {
+                "confidence_verify_len_tiers": [1, 5]
+        }):
+            with pytest.raises(ValueError,
+                               match="enable_confidence_scheduling"):
+                self._cfg(**kw)
+
+    def test_default_ladder_is_derived_and_includes_the_full_block(self):
+        c = self._scheduled()
+        assert c.verify_len_tiers == [1, 3, 5]
+
+    def test_full_block_is_always_reachable(self):
+        """The full block is the fallback when confidence is stale; keep it."""
+        c = self._scheduled(confidence_verify_len_tiers=[1, 2])
+        assert c.verify_len_tiers[-1] == 5
+
+    def test_ladder_cannot_exceed_max_draft_len(self):
+        with pytest.raises(ValueError, match="exceeds max_draft_len"):
+            self._scheduled(confidence_verify_len_tiers=[1, 9])
+
+    def test_ladder_is_deduped_and_sorted(self):
+        c = self._scheduled(confidence_verify_len_tiers=[5, 1, 3, 3])
+        assert c.verify_len_tiers == [1, 3, 5]
+
+    def test_fused_scheduler_is_independently_gated(self):
+        with pytest.raises(ValueError,
+                           match="enable_fused_confidence_scheduler"):
+            self._cfg(enable_fused_confidence_scheduler=True)
+        c = self._scheduled(enable_fused_confidence_scheduler=True)
+        assert c.enable_fused_confidence_scheduler is True
+
+    @staticmethod
+    def _environment(**overrides):
+        values = dict(
+            cuda_graph_config=SimpleNamespace(enable_padding=True),
+            guided_decoding_backend=None,
+            enable_lora=False,
+            lora_config=None,
+            sparse_attention_config=None,
+        )
+        values.update(overrides)
+        return SimpleNamespace(**values)
+
+    @pytest.mark.parametrize(
+        ("overrides", "message"),
+        [
+            ({
+                "cuda_graph_config": None
+            }, "requires cuda_graph_config"),
+            (
+                {
+                    "cuda_graph_config": SimpleNamespace(enable_padding=False)
+                },
+                "enable_padding=True",
+            ),
+            ({
+                "guided_decoding_backend": "xgrammar"
+            }, "guided decoding"),
+            ({
+                "enable_lora": True
+            }, "does not yet support LoRA"),
+            (
+                {
+                    "sparse_attention_config":
+                    SimpleNamespace(
+                        enable_heuristic_topk=True,
+                        use_cute_dsl_topk=False,
+                        use_cute_dsl_paged_mqa_logits=False,
+                    )
+                },
+                "enable_heuristic_topk",
+            ),
+        ],
+    )
+    def test_confidence_environment_rejects_unsupported_runtime_combinations(
+            self, overrides, message):
+        environment = self._environment(**overrides)
+        with pytest.raises(ValueError, match=message):
+            TorchLlmArgs._validate_dspark_confidence_environment(environment)
+
+    def test_confidence_environment_accepts_padded_cuda_graphs(self):
+        TorchLlmArgs._validate_dspark_confidence_environment(
+            self._environment())
