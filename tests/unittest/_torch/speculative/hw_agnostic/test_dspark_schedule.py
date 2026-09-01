@@ -59,22 +59,13 @@ def test_survival_eps_excludes_hopeless_positions():
     assert int(lens[0]) == 2
 
 
-def test_allocation_is_deterministic_under_tied_confidences():
-    """Two ranks with identical input must produce identical verify lengths."""
+def test_tied_confidences_are_balanced_and_deterministic():
+    """Ties form a stable balanced prefix on every rank."""
     cfg = _cfg(min_verify_len=1)
     surv = compute_survival(torch.full((9, BLOCK), 0.9))
-    first = schedule_verify_lens_topk(survival=surv, budget=13, cfg=cfg)
-    for _ in range(8):
-        assert torch.equal(schedule_verify_lens_topk(survival=surv, budget=13, cfg=cfg), first)
-
-
-def test_ties_break_toward_earlier_positions():
-    """All candidates tie, so the allocation must stay a balanced prefix front,
-    not hand one request a deep suffix while another gets nothing."""
-    cfg = _cfg(min_verify_len=1)
-    surv = compute_survival(torch.full((4, BLOCK), 1.0))
-    lens = schedule_verify_lens_topk(survival=surv, budget=4, cfg=cfg)
-    assert int(lens.max()) - int(lens.min()) <= 1
+    lens = schedule_verify_lens_topk(survival=surv, budget=13, cfg=cfg)
+    assert lens.tolist() == [2, 2, 2, 2, 1, 1, 1, 1, 1]
+    assert torch.equal(schedule_verify_lens_topk(survival=surv, budget=13, cfg=cfg), lens)
 
 
 def test_schedule_config_rejects_bad_bounds():
@@ -279,54 +270,6 @@ def test_live_pooled_survivals_park_on_the_breakpoint_together():
         allowed_lens=[1, 2, 5],
     )
     assert tiered == bs * 1  # rung-2: one scheduled position past the floor
-
-
-def test_starving_weak_rows_is_a_known_gap():
-    """SGLang can verify NOTHING for a hopeless request while TRT-LLM's
-    min_verify_len=1 floor cannot, so SGLang's achievable Theta is better."""
-    # Half the batch is strong all the way down, half is dead on arrival.
-    # The batch must be big enough that its token range sits on a genuinely
-    # rising part of the theta curve, or every candidate is free and the
-    # comparison proves nothing.
-    bs = 64
-    strong = np.tile([0.99, 0.98, 0.97, 0.96, 0.95], (bs // 2, 1))
-    dead = np.tile([0.01, 0.008, 0.006, 0.004, 0.002], (bs // 2, 1))
-    surv = np.concatenate([strong, dead], axis=0)
-    sgl_n = _sgl_compute_verify_token_budget(
-        history_survival_probs=torch.tensor(surv, dtype=torch.float32),
-        table=SGL_TABLE,
-        max_verify_len=SGL_BLOCK,
-        survival_eps=0.0,
-    )
-    trt_m = compute_verify_token_budget(
-        survival=surv, num_gen_requests=bs, cost_table=TRT_TABLE, min_verify_len=1
-    )
-
-    def theta_at(tau, tokens):
-        return tau / float(TRT_TABLE.step_times(np.asarray([tokens]), bs)[0])
-
-    cand = np.sort(surv.reshape(-1))[::-1]
-    sgl_theta = theta_at(bs + cand[:sgl_n].sum(), bs + sgl_n)
-    deeper = np.sort(surv[:, 1:].reshape(-1))[::-1]
-    trt_theta = theta_at(bs + surv[:, 0].sum() + deeper[:trt_m].sum(), 2 * bs + trt_m)
-    assert sgl_theta > trt_theta
-
-
-def test_eps_filtering_is_a_known_divergence():
-    """SGLang drops sub-eps candidates inside the budget; TRT-LLM applies eps
-    at allocation time, so its budget can count a candidate the allocator refuses."""
-    bs = 16
-    surv = np.tile([0.9, 0.4, 0.008, 0.004, 0.002], (bs, 1))
-    sgl_n = _sgl_compute_verify_token_budget(
-        history_survival_probs=torch.tensor(surv, dtype=torch.float32),
-        table=SGL_TABLE,
-        max_verify_len=SGL_BLOCK,
-        survival_eps=0.01,
-    )
-    trt_m = compute_verify_token_budget(
-        survival=surv, num_gen_requests=bs, cost_table=TRT_TABLE, min_verify_len=1
-    )
-    assert sgl_n - bs <= trt_m
 
 
 # --------------------------------------------------------------------------

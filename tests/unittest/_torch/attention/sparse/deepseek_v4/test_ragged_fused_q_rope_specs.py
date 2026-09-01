@@ -188,13 +188,14 @@ class TestRaggedFusedQRoPESpecs(unittest.TestCase):
                 position = (token - seq_begin) + (cached_after_step - query_len)
                 self.assertEqual(position, cached_after_step - query_len + local_token)
 
-    def test_heterogeneous_divisible_g128_v512_and_v640(self):
-        for verify_lens in ([3] * 64 + [5] * 64, [4] * 64 + [6] * 64):
+    def test_heterogeneous_g128_generation_contract(self):
+        for verify_lens in (
+            [3] * 64 + [5] * 64,
+            [4] * 64 + [6] * 64,
+            [5] * 64 + [6] * 64,
+        ):
             with self.subTest(global_budget=sum(verify_lens)):
                 self._assert_generation_contract(verify_lens)
-
-    def test_heterogeneous_nondivisible_g128_v704(self):
-        self._assert_generation_contract([5] * 64 + [6] * 64)
 
     def test_uniform_k5_keeps_scalar_generation_spec(self):
         num_generations = 128

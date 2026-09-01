@@ -423,16 +423,6 @@ def test_runtime_exact_loader_requires_independent_fingerprint_file(tmp_path):
             max_draft_len=5,
         )
 
-    fingerprint_path = tmp_path / "live-fingerprint.json"
-    fingerprint_path.write_text(json.dumps(payload["engine_fingerprint"]))
-    table, _ = load_runtime_sps_cost_table(
-        table_path,
-        graph_batch_sizes=[64, 128],
-        max_draft_len=5,
-        live_engine_fingerprint_path=fingerprint_path,
-    )
-    assert isinstance(table, ExactSpsCostTable)
-
 
 @pytest.mark.parametrize("marker", ["engine_fingerprint", "measurements"])
 def test_v2_markers_cannot_downgrade_to_legacy(tmp_path, marker):

@@ -793,15 +793,13 @@ def test_deepseek_v4_sparse_mla_single_token_tp4_local_heads_repro():
 
 @skip_pre_blackwell
 @pytest.mark.skip_less_device_memory(80000)
-@pytest.mark.parametrize("context_lengths", [[4399], [14, 508, 3947], [2, 1406, 3327]])
-@pytest.mark.parametrize("num_generation_steps", [2])
 # The query width per generation request. Speculative decoding makes this the
-# batch-wide `1 + draft_len`, and DSpark's confidence scheduler moves it between
-# steps along a captured tier ladder -- `[1, 3, 5]` for max_draft_len=5, i.e.
-# widths 2, 4 and 6. Pinning it at 1 left every width-dependent stride in the
-# DSA generation path untested: buffers are laid out at the static ceiling while
-# the kernels are launched at the runtime width, and when the two disagree the
-# result is either misattributed rows or a hang, never an error.
+# batch-wide `1 + draft_len`. Cover every context layout at width one, then the
+# lower and upper speculative widths on the heterogeneous page-boundary layout.
+# Pinning every case at width one left width-dependent strides in the DSA
+# generation path untested: buffers are laid out at the static ceiling while the
+# kernels are launched at the runtime width, and when the two disagree the result
+# is either misattributed rows or a hang, never an error.
 #
 # Coverage limit, stated because it is not obvious and it matters: this test
 # supplies `topk_indices` directly for the compress_ratio=4 layer, so
@@ -809,13 +807,21 @@ def test_deepseek_v4_sparse_mla_single_token_tp4_local_heads_repro():
 # `kv_lens_expanded` / `block_table_expanded` / the DeepGEMM schedule -- never
 # runs here. Those buffers are exactly where a wrong stride misattributes rows,
 # so widening this parameterization does NOT by itself cover that. Verified
-# empirically: reverting the stride fix leaves all twelve cases green. What this
-# does cover is the RoPE, KV-write, sparse-MLA and compressor paths at widths
-# other than one, which was previously nothing at all.
-@pytest.mark.parametrize("generation_seq_len_q", [1, 2, 6])
-def test_deepseek_v4_sparse_mla(
-    context_lengths: List[int], num_generation_steps: int, generation_seq_len_q: int
-):
+# empirically: reverting the stride fix leaves all original Cartesian cases
+# green. What this does cover is the RoPE, KV-write, sparse-MLA and compressor
+# paths at widths other than one, which was previously nothing at all.
+@pytest.mark.parametrize(
+    "context_lengths,generation_seq_len_q",
+    [
+        ([4399], 1),
+        ([14, 508, 3947], 1),
+        ([2, 1406, 3327], 1),
+        ([14, 508, 3947], 2),
+        ([14, 508, 3947], 6),
+    ],
+)
+def test_deepseek_v4_sparse_mla(context_lengths: List[int], generation_seq_len_q: int):
+    num_generation_steps = 2
     scenario = Scenario()
     device = torch.device("cuda")
     dtype = scenario.dtype

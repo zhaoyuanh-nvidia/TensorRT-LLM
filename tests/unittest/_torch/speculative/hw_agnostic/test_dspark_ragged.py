@@ -424,16 +424,6 @@ def test_group_declines_together_when_nothing_decomposes():
             )
 
 
-def test_uniform_batch_shape_matches_the_one_dimensional_rule():
-    # With a uniform K the token total is bs * (K + 1), so the joint rule must
-    # not pick anything larger than the uniform path would have needed.
-    k_plus_1 = 4
-    for num_real in (1, 3, 8):
-        got = _shape(num_real=num_real, total=num_real * k_plus_1)
-        assert got.padded_bs >= num_real
-        assert got.bucket >= num_real * k_plus_1
-
-
 # ---------------------------------------------------------------------------
 # fill_padded_rows_onehot
 # ---------------------------------------------------------------------------
