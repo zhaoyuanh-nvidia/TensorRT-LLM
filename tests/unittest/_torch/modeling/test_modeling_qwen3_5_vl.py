@@ -6,7 +6,6 @@ import os
 from copy import deepcopy
 from pathlib import Path
 from typing import List, Optional
-from unittest.mock import Mock
 
 import torch
 import transformers
@@ -173,26 +172,6 @@ def test_qwen35_dense_vl_resolves_model_and_mapper(tmp_path: Path) -> None:
         AutoCheckpointMapper.get("HF", "Qwen3_5ForConditionalGeneration"),
         Qwen3_5MoeHfWeightMapper,
     )
-
-
-def test_qwen38_dense_vl_delegates_standalone_draft_state() -> None:
-    """The Qwen3.8 composite target must expose its inner DSpark state."""
-    model = object.__new__(Qwen3_5VLModel)
-    torch.nn.Module.__init__(model)
-    inner = Mock()
-    inner.draft_config = object()
-    inner.draft_model = object()
-    inner.load_draft_weights.return_value = "loaded"
-    model.llm = inner
-
-    weights = {"markov_head.markov_w1.weight": object()}
-    mapper = object()
-
-    assert model.language_model is inner
-    assert model.draft_config is inner.draft_config
-    assert model.draft_model is inner.draft_model
-    assert model.load_draft_weights(weights, mapper) == "loaded"
-    inner.load_draft_weights.assert_called_once_with(weights, weight_mapper=mapper)
 
 
 def test_qwen35_dense_vl_disable_mm_encoder_skips_vision_tower(

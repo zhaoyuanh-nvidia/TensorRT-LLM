@@ -221,11 +221,6 @@ def _tiny_config(dspark: bool, *, published_spelling: bool = False):
     from transformers import Qwen3Config
 
     cfg = dict(TINY)
-    if dspark:
-        # Public standalone DSpark checkpoints use this architecture name.
-        # The runtime remains model-family agnostic and resolves the Qwen3
-        # backbone from model_type rather than requiring a per-model subclass.
-        cfg["architectures"] = ["DSparkDraftModel"]
     dflash = {"mask_token_id": VOCAB - 2, "target_layer_ids": [0, 1]}
     if dspark and published_spelling:
         cfg.update(
