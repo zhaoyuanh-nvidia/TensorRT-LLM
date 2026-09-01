@@ -13,12 +13,8 @@ from tensorrt_llm._torch.speculative.dspark_planner import (
     ExactSpsCostTable,
     ExactSpsDrainGuard,
     SpsCostTable,
-    budget_argmax_over_uniform_lens,
-    check_table_fingerprint,
     compute_verify_token_budget,
     load_runtime_sps_cost_table,
-    load_sps_cost_table,
-    load_validated_sps_cost_table,
     select_exact_sps_candidate,
     validate_sps_cost_table_payload,
 )
@@ -162,15 +158,6 @@ def test_minimum_gain_guard_falls_back_to_full_budget():
         min_verify_len=1,
         max_verify_len=block,
     ) == bs * (block - 1)
-    assert (
-        budget_argmax_over_uniform_lens(
-            survival=survival,
-            num_gen_requests=bs,
-            cost_table=table,
-            allowed_lens=[1, block],
-        )
-        == block
-    )
 
 
 def test_minimum_gain_threshold_edge_keeps_compact_candidate():
@@ -204,15 +191,6 @@ def test_minimum_gain_threshold_edge_keeps_compact_candidate():
         == 0
     )
     assert (
-        budget_argmax_over_uniform_lens(
-            survival=survival,
-            num_gen_requests=1,
-            cost_table=at_threshold,
-            allowed_lens=[1, 2],
-        )
-        == 1
-    )
-    assert (
         compute_verify_token_budget(
             survival=survival,
             num_gen_requests=1,
@@ -220,15 +198,6 @@ def test_minimum_gain_threshold_edge_keeps_compact_candidate():
             allowed_lens=[1, 2],
         )
         == 1
-    )
-    assert (
-        budget_argmax_over_uniform_lens(
-            survival=survival,
-            num_gen_requests=1,
-            cost_table=above_threshold,
-            allowed_lens=[1, 2],
-        )
-        == 2
     )
 
 
@@ -278,11 +247,13 @@ def _multi_g_sps_payload():
 
 
 def _load_test_exact(path, payload):
-    return load_validated_sps_cost_table(
+    fingerprint_path = path.with_name(f"{path.stem}-live-fingerprint.json")
+    fingerprint_path.write_text(json.dumps(payload["engine_fingerprint"]))
+    return load_runtime_sps_cost_table(
         path,
         graph_batch_sizes=[64, 128],
         max_draft_len=5,
-        live_engine_fingerprint=dict(payload["engine_fingerprint"]),
+        live_engine_fingerprint_path=fingerprint_path,
     )
 
 
@@ -291,14 +262,7 @@ def test_exact_cost_table_never_interpolates(tmp_path):
     path = tmp_path / "multi-g-sps.json"
     path.write_text(json.dumps(payload))
 
-    with pytest.raises(ValueError, match="require load_validated_sps_cost_table"):
-        load_sps_cost_table(path)
-    table, _ = load_validated_sps_cost_table(
-        path,
-        graph_batch_sizes=[64, 128],
-        max_draft_len=5,
-        live_engine_fingerprint=dict(payload["engine_fingerprint"]),
-    )
+    table, _ = _load_test_exact(path, payload)
 
     assert isinstance(table, ExactSpsCostTable)
     assert table.minimum_predicted_gain == pytest.approx(0.02)
@@ -392,7 +356,7 @@ def test_exact_cost_table_direct_construction_bounds_positive_cells(invalid_budg
         )
 
 
-def test_legacy_cost_table_loader_remains_interpolating(tmp_path):
+def test_runtime_loader_keeps_legacy_cost_table_interpolation(tmp_path):
     direct = SpsCostTable(token_counts=(0, 100), step_time_ms=(1.0, 5.0))
     assert direct.minimum_predicted_gain == 0.0
 
@@ -407,7 +371,7 @@ def test_legacy_cost_table_loader_remains_interpolating(tmp_path):
         )
     )
 
-    table, _ = load_sps_cost_table(path)
+    table, _ = load_runtime_sps_cost_table(path, graph_batch_sizes=[64, 128], max_draft_len=5)
 
     assert isinstance(table, SpsCostTable)
     assert table.step_time(50) == pytest.approx(3.0)
@@ -422,7 +386,7 @@ def test_legacy_cost_table_loader_remains_interpolating(tmp_path):
             }
         )
     )
-    table, _ = load_sps_cost_table(path)
+    table, _ = load_runtime_sps_cost_table(path, graph_batch_sizes=[64, 128], max_draft_len=5)
     assert table.minimum_predicted_gain == pytest.approx(0.03)
 
 
@@ -432,35 +396,20 @@ def test_exact_cost_table_loader_requires_schema_v2(tmp_path):
     path = tmp_path / "wrong-version.json"
     path.write_text(json.dumps(payload))
     with pytest.raises(ValueError, match="schema_version=2"):
-        load_validated_sps_cost_table(
-            path,
-            graph_batch_sizes=[64, 128],
-            max_draft_len=5,
-            live_engine_fingerprint=dict(payload["engine_fingerprint"]),
-        )
+        _load_test_exact(path, payload)
 
     payload = _multi_g_sps_payload()
     del payload["cost_tables"]
     path = tmp_path / "missing-tables.json"
     path.write_text(json.dumps(payload))
     with pytest.raises(ValueError, match="missing required fields: cost_tables"):
-        load_validated_sps_cost_table(
-            path,
-            graph_batch_sizes=[64, 128],
-            max_draft_len=5,
-            live_engine_fingerprint=dict(payload["engine_fingerprint"]),
-        )
+        _load_test_exact(path, payload)
     payload = _multi_g_sps_payload()
     del payload["schema_version"]
     path = tmp_path / "missing-version.json"
     path.write_text(json.dumps(payload))
     with pytest.raises(ValueError, match="schema_version=2"):
-        load_validated_sps_cost_table(
-            path,
-            graph_batch_sizes=[64, 128],
-            max_draft_len=5,
-            live_engine_fingerprint=dict(payload["engine_fingerprint"]),
-        )
+        _load_test_exact(path, payload)
 
 
 def test_runtime_exact_loader_requires_independent_fingerprint_file(tmp_path):
@@ -495,15 +444,15 @@ def test_v2_markers_cannot_downgrade_to_legacy(tmp_path, marker):
     }
     path = tmp_path / f"mixed-{marker}.json"
     path.write_text(json.dumps(mixed_payload))
+    fingerprint_path = tmp_path / f"mixed-{marker}-live-fingerprint.json"
+    fingerprint_path.write_text(json.dumps(exact_payload["engine_fingerprint"]))
 
-    with pytest.raises(ValueError, match="require load_validated_sps_cost_table"):
-        load_sps_cost_table(path)
     with pytest.raises(ValueError, match="schema_version=2"):
-        load_validated_sps_cost_table(
+        load_runtime_sps_cost_table(
             path,
             graph_batch_sizes=[64, 128],
             max_draft_len=5,
-            live_engine_fingerprint=dict(exact_payload["engine_fingerprint"]),
+            live_engine_fingerprint_path=fingerprint_path,
         )
 
 
@@ -948,35 +897,3 @@ def test_exact_table_limits_compact_graph_cells_per_g():
             },
             max_draft_len=5,
         )
-
-
-LIVE = {"tp": 8, "ep": 8, "attention_dp": True, "block": 5, "max_batch_size": 256}
-
-
-def _payload(engine):
-    return {
-        "token_counts": [512, 1536],
-        "step_time_ms": [60.0, 150.0],
-        "_meta": {"engine": engine} if engine is not None else {},
-    }
-
-
-def test_mismatched_engine_is_refused():
-    """Same cell, different max_batch_size: the wrong table must not load."""
-    wrong = dict(LIVE, max_batch_size=64)
-    with pytest.raises(ValueError, match="different engine configuration"):
-        check_table_fingerprint(payload=_payload(wrong), live=dict(LIVE))
-
-
-def test_fingerprints_that_must_load():
-    """Every non-contradicted fingerprint loads; only a contradicted fact
-    refuses (case-insensitive strings, unverifiable keys logged, no-meta warns)."""
-    check_table_fingerprint(payload=_payload(dict(LIVE)), live=dict(LIVE))
-    check_table_fingerprint(
-        payload=_payload(dict(LIVE, moe_backend="megamoe_cutedsl")),
-        live=dict(LIVE, moe_backend="MEGAMOE_CUTEDSL"),
-    )
-    check_table_fingerprint(
-        payload=_payload(dict(LIVE, image="faf2c60935", geometry="constant_block")), live=dict(LIVE)
-    )
-    check_table_fingerprint(payload=_payload(None), live=dict(LIVE))

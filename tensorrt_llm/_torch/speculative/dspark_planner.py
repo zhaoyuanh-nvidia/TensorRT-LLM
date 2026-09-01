@@ -35,11 +35,9 @@ import json
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Sequence
+from typing import Optional, Sequence
 
 import numpy as np
-
-from ...logger import logger
 
 _MAX_EXACT_COMPACT_CELLS_PER_G = 4
 _MAX_EXACT_COMPACT_CELLS_TOTAL = 32
@@ -48,15 +46,10 @@ __all__ = [
     "ExactSpsDrainGuard",
     "ExactSpsCostTable",
     "SpsCostTable",
-    "check_table_fingerprint",
-    "load_sps_cost_table",
     "load_runtime_sps_cost_table",
-    "load_validated_sps_cost_table",
     "select_exact_sps_candidate",
     "validate_sps_cost_table_payload",
     "compute_verify_token_budget",
-    "budget_argmax_over_uniform_lens",
-    "derive_verify_len_tiers",
     "total_verify_tokens",
 ]
 
@@ -452,21 +445,6 @@ def _is_exact_sps_payload(payload: dict[str, object]) -> bool:
     return bool(_V2_MARKER_FIELDS.intersection(payload))
 
 
-def load_sps_cost_table(
-    path: str | Path,
-) -> tuple[SpsCostTable, dict[str, object]]:
-    """Load a legacy one-dimensional SPS artifact.
-
-    Schema-v2 markers fail closed. Exact tables are usable only through
-    :func:`load_validated_sps_cost_table`, which authenticates the artifact
-    against the independently supplied live engine before returning it.
-    """
-    payload = _read_sps_cost_payload(path)
-    if _is_exact_sps_payload(payload):
-        raise ValueError("Schema-v2 exact SPS artifacts require load_validated_sps_cost_table")
-    return _build_legacy_sps_cost_table(payload), payload
-
-
 def _build_legacy_sps_cost_table(
     payload: dict[str, object],
 ) -> SpsCostTable:
@@ -503,26 +481,6 @@ def load_runtime_sps_cost_table(
             "live engine fingerprint path"
         )
     live_engine_fingerprint = _read_sps_cost_payload(live_engine_fingerprint_path)
-    validate_sps_cost_table_payload(
-        payload,
-        graph_batch_sizes=graph_batch_sizes,
-        max_draft_len=max_draft_len,
-        live_engine_fingerprint=live_engine_fingerprint,
-    )
-    return _build_exact_sps_cost_table(payload, max_draft_len=max_draft_len), payload
-
-
-def load_validated_sps_cost_table(
-    path: str | Path,
-    *,
-    graph_batch_sizes: Sequence[int],
-    max_draft_len: int,
-    live_engine_fingerprint: dict[str, object],
-) -> tuple[ExactSpsCostTable, dict[str, object]]:
-    """Atomically validate and load one exact schema-v2 SPS artifact."""
-    payload = _read_sps_cost_payload(path)
-    if not _is_exact_sps_payload(payload):
-        raise ValueError("Validated exact SPS loading requires a schema-v2 artifact")
     validate_sps_cost_table_payload(
         payload,
         graph_batch_sizes=graph_batch_sizes,
@@ -832,54 +790,6 @@ def _require_sha256(value: object, *, field: str) -> str:
     ):
         raise ValueError(f"{field} must be a lowercase SHA256 digest")
     return value
-
-
-def check_table_fingerprint(*, payload: dict, live: dict) -> None:
-    """Refuse a cost table profiled on a different engine than this one.
-
-    A mismatched table produces no error downstream -- the planner just trims
-    to the wrong economics. Only the keys PRESENT in both dicts are compared,
-    so a table may carry facts the consumer cannot see (for humans to check),
-    and a table with no fingerprint loads with a warning rather than breaking
-    existing deployments.
-    """
-    fp = (payload.get("_meta") or {}).get("engine") or payload.get("engine")
-    if not fp:
-        logger.warning(
-            "DSpark cost table carries no engine fingerprint; cannot verify it "
-            "was profiled on this configuration. Tables are engine-specific "
-            "(same cell measured 23%% apart across two configs) -- regenerate "
-            "with a current profiler to get load-time checking."
-        )
-        return
-
-    def _facts_differ(a, b) -> bool:
-        try:
-            return float(a) != float(b)
-        except (TypeError, ValueError):
-            return str(a).upper() != str(b).upper()
-
-    mismatched = {
-        key: (fp[key], live[key])
-        for key in sorted(set(fp) & set(live))
-        if _facts_differ(fp[key], live[key])
-    }
-    if mismatched:
-        detail = ", ".join(f"{k}: table={a!r} engine={b!r}" for k, (a, b) in mismatched.items())
-        raise ValueError(
-            f"DSpark cost table was profiled on a different engine "
-            f"configuration ({detail}). Its step times do not describe this "
-            f"engine, so the planner would trim to the wrong economics. "
-            f"Re-profile on this configuration, or remove "
-            f"confidence_sps_table_path to run without trimming."
-        )
-    unchecked = sorted(set(fp) - set(live))
-    if unchecked:
-        logger.info(
-            f"DSpark cost table fingerprint: verified "
-            f"{sorted(set(fp) & set(live))}; not verifiable at this site "
-            f"(check manually): " + ", ".join(f"{k}={fp[k]!r}" for k in unchecked)
-        )
 
 
 def validate_sps_cost_table_payload(
@@ -1292,103 +1202,3 @@ def compute_verify_token_budget(
     ):
         return full
     return best
-
-
-def derive_verify_len_tiers(
-    *,
-    cost_table: SpsCostTable,
-    num_requests: int,
-    block_size: int,
-    min_verify_len: int = 1,
-    max_tiers: int = 3,
-) -> List[int]:
-    """Derive the verify lengths worth capturing a CUDA graph for.
-
-    Within a measured flat cost shelf (adjacent breakpoints with equal values)
-    ``Theta = tau / cost`` strictly increases, so at a fixed batch size the
-    optimum sits on a shelf's *right edge*, never in its interior; this
-    returns those edges, always including ``min_verify_len`` and the full
-    block. On segments that genuinely rise the right-edge set is a
-    slope-change heuristic, and the property does not survive across batch
-    sizes (shelves live in token space) -- derive at the modal batch size and
-    measure the residual loss at the others.
-
-    Args:
-        num_requests: batch size the tiers are derived for; tiers are a
-            function of it, so a deployment that captures several batch sizes
-            derives a set per batch size.
-        max_tiers: cap on how many lengths to return. Each extra tier is
-            another captured graph, which consumes memory that would otherwise
-            be KV cache. The full block and ``min_verify_len`` are kept first.
-    """
-    lo, hi = int(min_verify_len), int(block_size)
-    if num_requests <= 0 or hi < lo:
-        return [lo]
-
-    edges = set()
-    for breakpoint_tokens in cost_table.token_counts[1:]:
-        # Largest length whose total (num_requests * (L + 1), see
-        # total_verify_tokens) still sits below this breakpoint; inverting
-        # num_requests * L instead puts the edge one shelf too far right.
-        length = (int(breakpoint_tokens) - 1) // int(num_requests) - 1
-        if lo <= length <= hi:
-            edges.add(length)
-    # The last shelf extends past the final breakpoint, so the whole block is
-    # always a right edge; the floor is always runnable.
-    edges.update({lo, hi})
-
-    tiers = sorted(edges)
-    if len(tiers) <= max_tiers:
-        return tiers
-    # Keep the endpoints; spread the remaining slots over the interior edges.
-    interior = tiers[1:-1]
-    step = len(interior) / float(max_tiers - 2) if max_tiers > 2 else 0
-    keep = [interior[int(i * step)] for i in range(max_tiers - 2)] if max_tiers > 2 else []
-    return sorted({tiers[0], *keep, tiers[-1]})
-
-
-def budget_argmax_over_uniform_lens(
-    *,
-    survival: np.ndarray,
-    num_gen_requests: int,
-    cost_table: SpsCostTable,
-    allowed_lens: Sequence[int],
-    min_verify_len: int = 1,
-) -> int:
-    """Pick the best verify length from a discrete set (e.g. captured graph tiers).
-
-    Evaluates ``Theta`` directly at each runnable length: optimizing the
-    continuous budget and rounding is not equivalent, since the rounded point
-    can land on the far side of a cost riser.
-
-    Args:
-        allowed_lens: verify lengths with a captured graph. Values below
-            ``min_verify_len`` are ignored.
-    Returns:
-        The chosen per-request verify length. Falls back to ``min_verify_len``
-        when no candidate is admissible.
-    """
-    if survival.ndim != 2:
-        raise ValueError(f"survival must be [bs, K], got shape {survival.shape}")
-    bs, block_size = survival.shape
-    lens: List[int] = sorted(
-        {int(v) for v in allowed_lens if min_verify_len <= int(v) <= block_size}
-    )
-    if bs == 0 or num_gen_requests <= 0 or not lens:
-        return int(min_verify_len)
-
-    surv = np.asarray(survival, dtype=np.float64)
-    best_len, best_theta = lens[0], -np.inf
-    scores = {}
-    for length in lens:
-        # Expected yield: the bonus token plus survival of every verified
-        # position, floor included.
-        tau = float(num_gen_requests) + float(surv[:, :length].sum())
-        theta = tau / cost_table.step_time(total_verify_tokens(bs, length), num_gen_requests)
-        scores[length] = theta
-        if theta > best_theta:
-            best_len, best_theta = length, theta
-    full = max(lens)
-    if best_len != full and best_theta < scores[full] * (1.0 + cost_table.minimum_predicted_gain):
-        return int(full)
-    return int(best_len)

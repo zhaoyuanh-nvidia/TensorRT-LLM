@@ -8,12 +8,7 @@ import numpy as np
 import pytest
 import torch
 
-from tensorrt_llm._torch.speculative.dspark_planner import (
-    SpsCostTable,
-    budget_argmax_over_uniform_lens,
-    compute_verify_token_budget,
-    derive_verify_len_tiers,
-)
+from tensorrt_llm._torch.speculative.dspark_planner import SpsCostTable, compute_verify_token_budget
 from tensorrt_llm._torch.speculative.dspark_schedule import (
     DSparkScheduleConfig,
     compute_survival,
@@ -114,89 +109,6 @@ def test_planner_and_allocator_agree_on_the_budget(bs, min_len):
     )
     assert int((lens - min_len).sum()) <= budget
     assert torch.all(lens >= min_len)
-
-
-# --------------------------------------------------------------------------
-# uniform-K projection (what TRT-LLM's graph key can actually express today)
-# --------------------------------------------------------------------------
-
-
-def test_discrete_argmax_beats_round_then_snap_across_a_riser():
-    """Optimizing over runnable lengths is not the same as rounding the budget:
-    snapping down past a cost riser lands on a worse Theta than the search."""
-    table = SpsCostTable(token_counts=(0, 8, 24, 40), step_time_ms=(2.0, 2.05, 2.1, 20.0))
-    surv = np.cumprod(np.full((8, BLOCK), 0.97), axis=1)
-    chosen = budget_argmax_over_uniform_lens(
-        survival=surv,
-        num_gen_requests=8,
-        cost_table=table,
-        allowed_lens=[1, 3, 5, 7],
-    )
-    # 8*(7+1)=64 tokens lands on the 20ms riser; the search must avoid it.
-    assert chosen < 7
-
-    def theta(length):
-        # Mirrors the implementation exactly, including the bonus token every
-        # request submits alongside its drafts.
-        tau = 8 + float(surv[:, :length].sum())
-        return tau / table.step_time(8 * (length + 1), 8)
-
-    assert theta(chosen) == max(theta(v) for v in (1, 3, 5, 7))
-    # With nothing runnable, fall back to the floor.
-    assert (
-        budget_argmax_over_uniform_lens(
-            survival=surv, num_gen_requests=8, cost_table=table, allowed_lens=[]
-        )
-        == 1
-    )
-
-
-def test_derived_tiers_lose_nothing_versus_continuous_k():
-    """The shelf-right-edge property: within a shelf Theta rises monotonically,
-    so tiers built from right edges must match an exhaustive length search."""
-    rng = np.random.default_rng(11)
-    # Shelves are encoded as breakpoint pairs with equal values: under the
-    # interpolating consumer, flatness between points is only real when the
-    # table measured it.
-    table = SpsCostTable(
-        token_counts=(0, 11, 12, 29, 30, 47, 48, 89, 90, 159, 160),
-        step_time_ms=(2.0, 2.0, 2.4, 2.4, 3.9, 3.9, 4.0, 4.0, 7.5, 7.5, 12.0),
-    )
-    for bs in (3, 8, 16, 31):
-        surv = np.cumprod(rng.uniform(0.5, 0.995, size=(bs, BLOCK)), axis=1)
-        tiers = derive_verify_len_tiers(
-            cost_table=table, num_requests=bs, block_size=BLOCK, max_tiers=99
-        )
-
-        def theta(length):
-            return (bs + float(surv[:, :length].sum())) / table.step_time(bs * (length + 1), bs)
-
-        best_any = max(theta(v) for v in range(1, BLOCK + 1))
-        best_tier = max(theta(v) for v in tiers)
-        assert best_tier == pytest.approx(best_any), f"bs={bs} tiers={tiers}"
-
-
-def test_derived_tiers_respect_the_capture_budget():
-    table = SpsCostTable(
-        token_counts=(0, 5, 9, 14, 20, 27, 35), step_time_ms=(1.0, 2, 3, 4, 5, 6, 7)
-    )
-    tiers = derive_verify_len_tiers(cost_table=table, num_requests=2, block_size=BLOCK, max_tiers=3)
-    assert len(tiers) <= 3
-    # Endpoints are always kept: the floor is always runnable and the full block
-    # is always a right edge (the last shelf is unbounded).
-    assert tiers[0] == 1 and tiers[-1] == BLOCK
-
-
-def test_derived_tiers_are_a_function_of_batch_size():
-    """Tiers move with bs because total tokens = bs * (length + 1); a tier set
-    derived once and reused across batch sizes would be wrong for one of them."""
-    table = SpsCostTable(token_counts=(0, 40), step_time_ms=(1.0, 5.0))
-    assert derive_verify_len_tiers(
-        cost_table=table, num_requests=8, block_size=BLOCK, max_tiers=99
-    ) == [1, 3, BLOCK]
-    assert derive_verify_len_tiers(
-        cost_table=table, num_requests=32, block_size=BLOCK, max_tiers=99
-    ) == [1, BLOCK]
 
 
 # --------------------------------------------------------------------------
@@ -498,49 +410,6 @@ def test_restricted_answer_is_always_realisable(tiers):
         )
         assert n % bs == 0, f"budget {n} for {bs} requests is not n*(t-min) for any tier"
         assert (n // bs) + 1 in tiers, f"budget {n} implies tier {(n // bs) + 1}, not in {tiers}"
-
-
-def test_restricted_never_scores_worse_than_the_uniform_choice():
-    """Same grid, better numerator: the chosen rung's realised theta wins;
-    at bs=1 the two scorers must pick the same rung outright."""
-    rng = np.random.default_rng(31337)
-    table = _table()
-    tiers = [1, 2, 5]
-    for _ in range(300):
-        bs = int(rng.integers(1, 17))
-        survival = np.sort(rng.random((bs, 5)), axis=1)[:, ::-1]
-
-        def realised_theta(tier: int) -> float:
-            budget = bs * (tier - 1)
-            cand = np.sort(survival[:, 1:].reshape(-1))[::-1]
-            tau = float(bs) + float(survival[:, :1].sum()) + float(cand[:budget].sum())
-            tokens = np.array([bs * (tier + 1)])
-            return tau / float(table.step_times(tokens, bs)[0])
-
-        n = compute_verify_token_budget(
-            survival=survival,
-            num_gen_requests=bs,
-            cost_table=table,
-            min_verify_len=1,
-            allowed_lens=tiers,
-        )
-        chosen = (n // bs) + 1
-        uniform = budget_argmax_over_uniform_lens(
-            survival=survival,
-            num_gen_requests=bs,
-            cost_table=table,
-            allowed_lens=tiers,
-            min_verify_len=1,
-        )
-        assert realised_theta(chosen) >= realised_theta(uniform) - 1e-12, (
-            f"restricted picked tier {chosen} whose realised theta is below "
-            f"the uniform scorer's tier {uniform}"
-        )
-        if bs == 1:
-            assert chosen == uniform, (
-                "at bs=1 the uniform and top-k allocations are the same set; "
-                "the two scorers must pick the same rung"
-            )
 
 
 # --------------------------------------------------------------------------
