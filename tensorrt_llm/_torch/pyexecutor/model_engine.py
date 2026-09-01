@@ -5522,7 +5522,8 @@ class PyTorchModelEngine(ModelEngine):
         max_verify_len = 1 + tiers[-1]
         token_lens = [1 + int(v) for v in verify_lens]
 
-        from ..speculative.dspark_ragged import choose_ragged_capture_shape
+        from ..speculative.dspark_ragged import (choose_ragged_capture_shape,
+                                                 resolve_ragged_pad_split)
 
         bs_buckets = sorted({int(b) for b in runner.supported_batch_sizes})
         if not bs_buckets:
@@ -5647,50 +5648,30 @@ class PyTorchModelEngine(ModelEngine):
         # rows cannot absorb the bucket.
         n_real = len(token_lens)
         n_pad = padded_bs - n_real
-        real_capacity = n_real * max_verify_len
         floor_tokens = sum(token_lens)
-        if n_pad == 0:
-            pad_len = 1
-        elif exact_shape is not None:
-            pad_len = int(exact_shape[2])
-            if not 1 <= pad_len <= max_verify_len:
-                logger.warning(f"DSpark exact pad window {pad_len} is outside "
-                               f"[1, {max_verify_len}]")
-                return None
-        else:
-            # pad_len has to leave the real rows a target they can actually
-            # hit: at least what they already need, at most their capacity.
-            #   bucket - n_pad*pad_len >= floor_tokens   -> upper bound
-            #   bucket - n_pad*pad_len <= real_capacity  -> lower bound
-            lo = max(1, -(-(bucket - real_capacity) // n_pad))  # ceil division
-            hi = min(max_verify_len, (bucket - floor_tokens) // n_pad)
-            if lo > hi:
-                # Unreachable when the chooser ran with max_verify_len (it
-                # verified this rank's decomposition from the payload); a hit
-                # here means the two arithmetic paths diverged -- worth a warning,
-                # not a silent debug line.
-                logger.warning(
-                    f"DSpark ragged: bucket {bucket} admits no pad-row window "
-                    f"for {n_real} real ({floor_tokens}..{real_capacity} "
-                    f"tokens) + {n_pad} pad rows; falling back to uniform "
-                    f"scheduling")
-                return None
-            pad_len = lo
-        real_target = bucket - n_pad * pad_len
+        fixed_pad_len = int(exact_shape[2]) if exact_shape is not None else None
+        split = resolve_ragged_pad_split(
+            bucket=int(bucket),
+            num_real_requests=n_real,
+            total_real_tokens=floor_tokens,
+            padded_bs=int(padded_bs),
+            max_verify_len=max_verify_len,
+            fixed_pad_len=fixed_pad_len,
+        )
+        if split is None:
+            logger.warning(
+                f"DSpark ragged: bucket {bucket} admits no pad-row window "
+                f"for {n_real} real requests and {n_pad} pad rows; falling "
+                f"back to uniform scheduling")
+            return None
+        pad_len = split.pad_len
+        real_target = split.real_target
         if (exact_shape is not None and real_target != sum(token_lens)):
             logger.warning(
                 "DSpark exact layout changed between policy and fit: "
                 f"real tokens={sum(token_lens)}, target={real_target}, "
                 f"G={padded_bs}, V={bucket}, pad={pad_len}")
             return None
-        if real_target < floor_tokens or real_target > real_capacity:
-            logger.warning(
-                f"DSpark ragged: bucket {bucket} leaves {real_target} tokens "
-                f"for {n_real} real requests ({n_pad} pad rows at {pad_len}), "
-                f"outside [{floor_tokens}, {real_capacity}]; falling back "
-                f"to uniform scheduling")
-            return None
-
         if exact_shape is not None:
             # The exact selector already returned a bounded split whose real
             # rows sum to the measured cell. Repacking it through

@@ -25,6 +25,7 @@ from tensorrt_llm._torch.speculative.dspark_ragged import (
     count_accepted_ragged,
     fill_bucket_device,
     fill_padded_rows_onehot,
+    resolve_ragged_pad_split,
     round_up_to_bucket,
     row_ids_from_lens,
     scatter_ragged_to_padded,
@@ -488,25 +489,6 @@ def test_warmup_split_reaches_any_captured_bucket():
             assert int(got.verify_lens.sum()) == bucket
 
 
-def _pad_len(*, bucket, n_real, n_pad, max_verify_len, floor=None):
-    """Mirror of the pad-row window ModelEngine.fit_ragged_verify_lens derives.
-    Returns None when no integer window leaves the real rows a reachable target."""
-    real_capacity = n_real * max_verify_len
-    floor = n_real if floor is None else floor
-    if n_pad == 0:
-        pad_len = 1
-    else:
-        lo = max(1, -(-(bucket - real_capacity) // n_pad))  # ceil division
-        hi = min(max_verify_len, (bucket - floor) // n_pad)
-        if lo > hi:
-            return None
-        pad_len = lo
-    real_target = bucket - n_pad * pad_len
-    if real_target < floor or real_target > real_capacity:
-        return None
-    return pad_len
-
-
 @pytest.mark.parametrize(
     "bucket, expected_pad_len",
     [
@@ -523,14 +505,21 @@ def test_pad_rows_grow_when_the_real_rows_cannot_absorb_the_bucket(bucket, expec
     padded_bs, max_verify_len = 8, 6
     real = [2, 3, 2]
     n_pad = padded_bs - len(real)
-    pad_len = _pad_len(bucket=bucket, n_real=len(real), n_pad=n_pad, max_verify_len=max_verify_len)
-    assert pad_len == expected_pad_len
+    split = resolve_ragged_pad_split(
+        bucket=bucket,
+        num_real_requests=len(real),
+        total_real_tokens=sum(real),
+        padded_bs=padded_bs,
+        max_verify_len=max_verify_len,
+    )
+    assert split is not None
+    assert split.pad_len == expected_pad_len
 
-    real_target = bucket - n_pad * pad_len
+    real_target = split.real_target
     assert sum(real) <= real_target <= len(real) * max_verify_len
     got = _fit(real, bucket=real_target, padded_bs=len(real), max_verify_len=max_verify_len)
     # The total the forward sees must be exactly the captured bucket.
-    assert int(got.verify_lens.sum()) + n_pad * pad_len == bucket
+    assert int(got.verify_lens.sum()) + n_pad * split.pad_len == bucket
 
 
 def test_pad_length_never_yields_an_infeasible_real_target():
@@ -550,22 +539,22 @@ def test_pad_length_never_yields_an_infeasible_real_target():
                     continue
                 bucket = fits[0]
                 checked += 1
-                pad_len = _pad_len(
+                split = resolve_ragged_pad_split(
                     bucket=bucket,
-                    n_real=n_real,
-                    n_pad=n_pad,
+                    num_real_requests=n_real,
+                    total_real_tokens=floor,
+                    padded_bs=padded_bs,
                     max_verify_len=max_verify_len,
-                    floor=floor,
                 )
-                if pad_len is None:
+                if split is None:
                     declined += 1
                     continue
-                real_target = bucket - n_pad * pad_len
+                real_target = split.real_target
                 assert floor <= real_target <= n_real * max_verify_len, (
                     f"padded_bs={padded_bs} n_real={n_real} bucket={bucket} "
-                    f"floor={floor} pad_len={pad_len} -> {real_target}"
+                    f"floor={floor} pad_len={split.pad_len} -> {real_target}"
                 )
-                assert real_target + n_pad * pad_len == bucket
+                assert real_target + n_pad * split.pad_len == bucket
 
     assert checked > 10000, f"sweep too small to be meaningful: {checked}"
     # Declining is safe (the step stays uniform) but should stay rare, or the

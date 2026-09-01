@@ -40,7 +40,9 @@ __all__ = [
     "fill_padded_rows_onehot",
     "ragged_gather_index_lists",
     "RaggedCaptureShape",
+    "RaggedPadSplit",
     "choose_ragged_capture_shape",
+    "resolve_ragged_pad_split",
     "fill_bucket_device",
     "build_row_maps_device",
 ]
@@ -255,31 +257,57 @@ class RaggedCaptureShape:
     bucket: int
 
 
-def _bucket_decomposable(
-    bucket: int, rows: int, tokens: int, padded_bs: int, max_verify_len: int
-) -> bool:
-    """Can a rank with ``rows`` real requests (``tokens`` floor) realise ``bucket``?
+@dataclass(frozen=True)
+class RaggedPadSplit:
+    """A shared pad-row window and the token target left for real rows."""
 
-    Mirrors the pad-row arithmetic in ``fit_ragged_verify_lens`` exactly: the
-    ``padded_bs - rows`` pad rows all carry ONE shared window in
-    ``[1, max_verify_len]`` (they are a single shared dummy object), and the
-    real rows absorb the remainder within ``[tokens, rows * max_verify_len]``.
+    pad_len: int
+    real_target: int
 
-    This is computed here, from the allgathered ``(rows, tokens)``, so that
-    every rank evaluates every OTHER rank's feasibility too: a bucket that
-    rank 3 cannot decompose used to make rank 3 alone decline the fit while
-    its peers published the bucket -- a graph-key divergence the ADP shape
-    gate then turned into a whole-group eager step. Measured on job 2586075
-    (pinned full block, where floor == capacity and the divisibility trap is
-    sharpest): 70 of 962 steps went eager on exactly this.
+
+def resolve_ragged_pad_split(
+    *,
+    bucket: int,
+    num_real_requests: int,
+    total_real_tokens: int,
+    padded_bs: int,
+    max_verify_len: int,
+    fixed_pad_len: Optional[int] = None,
+) -> Optional[RaggedPadSplit]:
+    """Resolve one feasible decomposition of a captured ragged bucket.
+
+    All pad rows share one request object and therefore one verify length. The
+    returned split keeps that length in ``[1, max_verify_len]`` and leaves the
+    real rows a target between their current token floor and capacity.
     """
-    n_pad = padded_bs - rows
-    floor, cap = tokens, rows * max_verify_len
-    if n_pad == 0:
-        return floor <= bucket <= cap
-    lo = max(1, -(-(bucket - cap) // n_pad))
-    hi = min(max_verify_len, (bucket - floor) // n_pad)
-    return lo <= hi
+    num_pad_requests = int(padded_bs) - int(num_real_requests)
+    if num_pad_requests < 0:
+        raise ValueError("padded_bs cannot be smaller than num_real_requests")
+    if max_verify_len < 1:
+        raise ValueError("max_verify_len must be at least one")
+
+    real_capacity = int(num_real_requests) * int(max_verify_len)
+    real_floor = int(total_real_tokens)
+    if num_pad_requests == 0:
+        pad_len = 1
+    elif fixed_pad_len is not None:
+        pad_len = int(fixed_pad_len)
+    else:
+        lower = max(1, -(-(int(bucket) - real_capacity) // num_pad_requests))
+        upper = min(
+            int(max_verify_len),
+            (int(bucket) - real_floor) // num_pad_requests,
+        )
+        if lower > upper:
+            return None
+        pad_len = lower
+
+    if not 1 <= pad_len <= int(max_verify_len):
+        return None
+    real_target = int(bucket) - num_pad_requests * pad_len
+    if not real_floor <= real_target <= real_capacity:
+        return None
+    return RaggedPadSplit(pad_len=pad_len, real_target=real_target)
 
 
 def choose_ragged_capture_shape(
@@ -307,7 +335,7 @@ def choose_ragged_capture_shape(
     Raises when no captured bucket fits; the caller must shrink the batch.
 
     With ``max_verify_len`` given, the answer is additionally required to be
-    DECOMPOSABLE BY EVERY RANK (see ``_bucket_decomposable``): the smallest
+    DECOMPOSABLE BY EVERY RANK (see :func:`resolve_ragged_pad_split`): the smallest
     such bucket is chosen, walking past candidates any rank cannot realise,
     so accept/decline is a pure function of the allgathered payload -- all
     ranks pick the same bucket or all raise together.
@@ -345,7 +373,14 @@ def choose_ragged_capture_shape(
     # decomposability test, so no separate >= needed cut is applied.
     for cand in candidates:
         if all(
-            _bucket_decomposable(cand, int(peer[0]), int(peer[1]), padded_bs, int(max_verify_len))
+            resolve_ragged_pad_split(
+                bucket=cand,
+                num_real_requests=int(peer[0]),
+                total_real_tokens=int(peer[1]),
+                padded_bs=padded_bs,
+                max_verify_len=int(max_verify_len),
+            )
+            is not None
             for peer in stats
         ):
             return RaggedCaptureShape(padded_bs=padded_bs, bucket=cand)
