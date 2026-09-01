@@ -141,7 +141,7 @@ def test_zero_real_padding_uses_distinct_low_and_high_dummies():
     runner.adp_shape_agreement = None
     runner.ragged_pad_verify_len = 2
     runner.ragged_zero_real_high_rows = 2
-    runner.spec_config = SimpleNamespace(enable_ragged_verify=True, max_draft_len=5)
+    runner.spec_config = SimpleNamespace(enable_confidence_scheduling=True, max_draft_len=5)
     runner._can_run_cuda_graph_batch = lambda _batch: True
     runner._round_up_batch_size_with_draft_len = lambda *_args: 4
 

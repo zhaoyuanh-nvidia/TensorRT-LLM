@@ -1940,13 +1940,6 @@
     },
     {
       "allowed_values": [],
-      "annotation": "<class 'bool'>",
-      "converter": "",
-      "kind": "value",
-      "path": "speculative_config.enable_ragged_verify"
-    },
-    {
-      "allowed_values": [],
       "annotation": "<class 'int'>",
       "converter": "",
       "kind": "value",

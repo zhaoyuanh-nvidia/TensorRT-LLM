@@ -3037,25 +3037,10 @@ class DSparkDecodingConfig(DecodingBaseConfig):
     confidence_verify_len_tiers: Optional[List[PositiveInt]] = Field(
         default=None,
         description=
-        "Draft lengths to capture CUDA graphs for. The scheduler may only pick "
-        "from this ladder: a length with no captured graph does not raise, it "
-        "silently drops the step out of graph replay into eager execution, which "
-        "costs far more than the trimmed tokens save. Each extra tier is another "
-        "captured graph, and captured graphs consume memory that would otherwise "
-        "be KV cache, so keep the ladder short. If None, defaults to "
-        "[1, ceil(max_draft_len/2), max_draft_len].",
-        status="prototype")
-
-    enable_ragged_verify: bool = Field(
-        default=False,
-        description=
-        "Give each request its own verify length instead of one length for the "
-        "whole batch. The batch's verify budget is then allocated by global "
-        "survival rank, so a request whose draft is still likely alive at depth "
-        "5 can take positions from one whose draft already died at depth 1. "
-        "Requires enable_confidence_scheduling. The packed batch is padded to a "
-        "captured (batch size, token count) pair, so this captures a second "
-        "graph axis and costs more graph memory than uniform scheduling.",
+        "Legacy uniform-scheduling draft lengths. Exact schema-v2 SPS tables "
+        "derive production CUDA-graph verifier budgets directly from their "
+        "measured T(G,V) cells and ignore this ladder. If None, the legacy "
+        "path defaults to [1, ceil(max_draft_len/2), max_draft_len].",
         status="prototype")
 
     enable_fused_confidence_scheduler: bool = Field(
@@ -3065,7 +3050,7 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         "top-k allocation plus exact CUDA-graph bucket fill. This changes only "
         "the scheduler launch path: budgets, survival thresholds, selected "
         "windows, and fallback behavior remain identical. It is independently "
-        "default-off and requires confidence scheduling with ragged verify.",
+        "default-off and requires confidence scheduling.",
         status="prototype")
 
     decoding_type: Literal["DSpark"] = Field(default="DSpark")
@@ -3084,77 +3069,25 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         "a contiguous cache.")
 
     @model_validator(mode="after")
-    def validate_ragged_verify(self):
-        if self.enable_fused_confidence_scheduler and not (
-                self.enable_confidence_scheduling
-                and self.enable_ragged_verify):
-            raise ValueError("enable_fused_confidence_scheduler requires both "
-                             "enable_confidence_scheduling=True and "
-                             "enable_ragged_verify=True")
-        if self.enable_ragged_verify and not self.enable_confidence_scheduling:
-            raise ValueError(
-                "enable_ragged_verify requires enable_confidence_scheduling=True: "
-                "per-request verify lengths are chosen from confidence-head "
-                "survival, which is only computed when scheduling is on")
-        if self.enable_confidence_scheduling and not self.enable_ragged_verify:
-            # The two flags describe one feature. Scheduling without ragged used
-            # to mean a uniform tier ladder -- one window chosen for the whole
-            # batch -- which is a middle ground that does not earn its keep:
-            # it cannot give a confident request a longer window than a
-            # collapsing one, which is the entire point of scheduling against
-            # per-request confidence, and it degenerates to the full block
-            # whenever acceptance is high (every workload measured on
-            # DeepSeek-V4-Pro-DSpark). SGLang has no equivalent either: its
-            # scheduler always produces per-request windows via top-k, and
-            # uniform appears only as the verify-all degenerate case.
-            #
-            # So there are two states, not three: schedule per request, or
-            # verify the full block. Declining the feature is
-            # enable_confidence_scheduling=False.
-            raise ValueError(
-                "enable_confidence_scheduling requires enable_ragged_verify=True. "
-                "Scheduling a single window for the whole batch cannot act on "
-                "per-request confidence, and collapses to verifying the full "
-                "block whenever acceptance is high. To turn the feature off, "
-                "set enable_confidence_scheduling=False -- that verifies the "
-                "full drafted block, which is the only fallback.")
-        if self.enable_ragged_verify and not self.confidence_sps_table_path:
-            # Without a profiled cost table the planner's budget degenerates to
-            # verify-all -- correctly, since a flat model makes every extra
-            # token look free -- so the ragged path silently never runs.
-            raise ValueError(
-                "enable_ragged_verify=True requires a profiled cost table: pass "
-                "confidence_sps_table_path produced by a matched static-cost "
-                "sweep. "
-                "confidence_sts_path only calibrates confidence logits; it "
-                "does not describe verifier cost. Without an SPS table the "
-                "planner cannot compare "
-                "the cost of extra verify tokens against their expected "
-                "acceptance, so it declines to trim and every request receives "
-                "the full window -- the ragged path runs but changes nothing. "
-                "Collecting a table does NOT require this flag: the profiler "
-                "pins static mode and sweeps the verify length by rebuilding "
-                "the engine, so run it with ragged verification off.")
-        return self
-
-    @model_validator(mode="after")
     def validate_confidence_scheduling(self):
         if not self.enable_confidence_scheduling:
-            if (self.confidence_sts_path or self.confidence_sps_table_path
+            if (self.enable_fused_confidence_scheduler
+                    or self.confidence_sts_path
+                    or self.confidence_sps_table_path
                     or self.confidence_sps_live_fingerprint_path
                     or self.confidence_verify_len_tiers):
                 raise ValueError(
-                    "confidence_sts_path / confidence_sps_table_path / "
+                    "enable_fused_confidence_scheduler / confidence_sts_path / "
+                    "confidence_sps_table_path / "
                     "confidence_sps_live_fingerprint_path / "
                     "confidence_verify_len_tiers require "
                     "enable_confidence_scheduling=True")
             return self
 
-        if (self.confidence_sps_live_fingerprint_path
-                and not self.confidence_sps_table_path):
-            raise ValueError("confidence_sps_live_fingerprint_path requires "
-                             "confidence_sps_table_path")
-
+        if not self.confidence_sps_table_path:
+            raise ValueError(
+                "enable_confidence_scheduling=True requires "
+                "confidence_sps_table_path from a matched static-cost sweep")
         if self.max_draft_len is not None:
             tiers = self.confidence_verify_len_tiers or [
                 1, max(1, (self.max_draft_len + 1) // 2), self.max_draft_len
@@ -6002,8 +5935,8 @@ class TorchLlmArgs(BaseLlmArgs):
                 "graphs or disable enable_piecewise_cuda_graph.")
         return self
 
-    def _validate_dspark_ragged_verify_environment(self) -> None:
-        """Reject the configurations ragged verification cannot honour.
+    def _validate_dspark_confidence_environment(self) -> None:
+        """Reject configurations confidence scheduling cannot honour.
 
         Every check here guards a path that would otherwise degrade *silently*:
         the run comes up, produces plausible text, and either never takes the
@@ -6013,19 +5946,19 @@ class TorchLlmArgs(BaseLlmArgs):
         cuda_graph_config = self.cuda_graph_config
         if self.guided_decoding_backend is not None:
             raise ValueError(
-                "speculative_config.enable_ragged_verify=True does not yet "
+                "speculative_config.enable_confidence_scheduling=True does not yet "
                 "support guided decoding. Guided-decoder bitmasks are laid "
                 "out with one uniform speculative stride; applying them to "
                 "packed per-request verify windows would shift every request "
                 "after the first short window. Disable guided decoding or "
-                "disable ragged verification.")
+                "disable confidence scheduling.")
         if self.enable_lora or self.lora_config is not None:
             raise ValueError(
-                "speculative_config.enable_ragged_verify=True does not yet "
+                "speculative_config.enable_confidence_scheduling=True does not yet "
                 "support LoRA. LoRA metadata expands generation requests "
                 "with one uniform speculative stride, which cannot represent "
                 "packed per-request verify windows. Disable LoRA or disable "
-                "ragged verification.")
+                "confidence scheduling.")
         # `fit_ragged_verify_lens` plans against the padded row count and
         # reserves tokens for the CUDA-graph padding rows, so it presumes those
         # rows exist. With padding off, `_get_padded_batch` adds none: the batch
@@ -6035,14 +5968,14 @@ class TorchLlmArgs(BaseLlmArgs):
         # room for padding that never arrived.
         if cuda_graph_config is None:
             raise ValueError(
-                "speculative_config.enable_ragged_verify=True requires "
+                "speculative_config.enable_confidence_scheduling=True requires "
                 "cuda_graph_config to be set with enable_padding=True. Ragged "
                 "verification fits each step's token total onto a captured "
                 "CUDA-graph bucket; with no graphs there is no bucket to fit "
                 "and every step would silently run eager.")
         if not cuda_graph_config.enable_padding:
             raise ValueError(
-                "speculative_config.enable_ragged_verify=True requires "
+                "speculative_config.enable_confidence_scheduling=True requires "
                 "cuda_graph_config.enable_padding=True (it defaults to False). "
                 "The ragged token budget is planned against the padded batch "
                 "size and reserves tokens for the padding rows; without padding "
@@ -6064,12 +5997,12 @@ class TorchLlmArgs(BaseLlmArgs):
             ]
             if incompatible:
                 raise ValueError(
-                    "speculative_config.enable_ragged_verify=True is "
+                    "speculative_config.enable_confidence_scheduling=True is "
                     "incompatible with sparse_attention_config."
                     f"{' / '.join(incompatible)}=True: those top-k paths "
                     "reconstruct each row's request and window position from a "
                     "single batch-wide next_n, which a ragged batch does not "
-                    "have. Disable them, or disable ragged verification.")
+                    "have. Disable them, or disable confidence scheduling.")
             # Not an error: the DSL paged-MQA-logits path is structurally
             # uniform too, but the expanded (one row per query token) path it
             # falls back to is numerically equivalent, and it is the default on
@@ -6422,8 +6355,8 @@ class TorchLlmArgs(BaseLlmArgs):
                         "DSpark block_size must equal max_draft_len; got "
                         f"block_size={spec_cfg.block_size} and "
                         f"max_draft_len={spec_cfg.max_draft_len}")
-                if spec_cfg.enable_ragged_verify:
-                    self._validate_dspark_ragged_verify_environment()
+                if spec_cfg.enable_confidence_scheduling:
+                    self._validate_dspark_confidence_environment()
 
             if isinstance(self.speculative_config, SADecodingConfig):
                 pool_size = self.speculative_config.global_pool_size

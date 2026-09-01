@@ -510,8 +510,7 @@ class PyTorchModelEngine(ModelEngine):
             spec_config is not None and getattr(
                 spec_config, "enable_fused_confidence_scheduler", False))
         self._dspark_trims_submitted_tokens = bool(
-            self._dspark_confidence_enabled
-            and getattr(spec_config, "enable_ragged_verify", False))
+            self._dspark_confidence_enabled)
         self._dspark_device_windows = bool(
             self._dspark_trims_submitted_tokens
             and self._dspark_fused_scheduler_enabled)

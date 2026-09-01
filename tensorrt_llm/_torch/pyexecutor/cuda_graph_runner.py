@@ -212,8 +212,8 @@ class CUDAGraphRunner:
             self.spec_config is not None and getattr(
                 self.spec_config, "enable_confidence_scheduling", False))
         self._dspark_trims_submitted_tokens = bool(
-            self.spec_config is not None
-            and getattr(self.spec_config, "enable_ragged_verify", False))
+            self.spec_config is not None and getattr(
+                self.spec_config, "enable_confidence_scheduling", False))
         self.sparse_config = config.sparse_attention_config
         self.is_encoder_decoder = config.is_encoder_decoder
         self.enable_encoder_decoder_mixed_cuda_graph = (
@@ -997,7 +997,7 @@ class CUDAGraphRunner:
                         key=("dspark_secondary_padding_dummy_fallback_"
                              f"{runtime_draft_len}"))
                     return 0
-        if getattr(self.spec_config, "enable_ragged_verify", False):
+        if getattr(self.spec_config, "enable_confidence_scheduling", False):
             ragged = any(
                 getattr(request, "py_verify_len", None) is not None
                 for request in batch.generation_requests)

@@ -4453,17 +4453,8 @@ class TestDSparkConfidenceScheduling:
         return DSparkDecodingConfig(**kw)
 
     def _scheduled(self, **kw):
-        """Scheduling on, with the companions it now implies.
-
-        Turning scheduling on means ragged -- the uniform tier ladder that
-        used to sit between "schedule per request" and "verify everything" is
-        gone -- and ragged means a profiled cost table, without which the
-        planner's budget degenerates to verify-all. Both are enforced in
-        llm_args, so a ladder test that sets only the master switch is
-        testing a configuration that can no longer exist.
-        """
+        """Scheduling on with the required profiled cost table."""
         kw["enable_confidence_scheduling"] = True
-        kw.setdefault("enable_ragged_verify", True)
         kw.setdefault("confidence_sps_table_path", "/tmp/sps.json")
         return self._cfg(**kw)
 
@@ -4556,12 +4547,12 @@ class TestDSparkConfidenceScheduling:
             ),
         ],
     )
-    def test_ragged_environment_rejects_unsupported_runtime_combinations(
+    def test_confidence_environment_rejects_unsupported_runtime_combinations(
             self, overrides, message):
         environment = self._environment(**overrides)
         with pytest.raises(ValueError, match=message):
-            TorchLlmArgs._validate_dspark_ragged_verify_environment(environment)
+            TorchLlmArgs._validate_dspark_confidence_environment(environment)
 
-    def test_ragged_environment_accepts_padded_cuda_graphs(self):
-        TorchLlmArgs._validate_dspark_ragged_verify_environment(
+    def test_confidence_environment_accepts_padded_cuda_graphs(self):
+        TorchLlmArgs._validate_dspark_confidence_environment(
             self._environment())
