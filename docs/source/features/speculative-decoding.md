@@ -166,6 +166,35 @@ speculative_config = DFlashDecodingConfig(
 llm = LLM("/path/to/target_model", speculative_config=speculative_config)
 ```
 
+### DSpark
+
+DSpark extends parallel DFlash drafting with a low-rank Markov head that models dependencies between draft positions. Standalone DSpark checkpoints reuse the model-family-agnostic DFlash backbone and add the DSpark heads, so no target-specific draft-model subclass is required.
+
+* `max_draft_len`: Maximum draft candidate length. It must match the checkpoint's `block_size`.
+* `speculative_model`: Path or HuggingFace model ID for the DSpark draft model.
+* `mask_token_id`, `target_layer_ids`, and `markov_rank`: Read from the draft model config when they are not set explicitly.
+* `attention_backend`: Cross-attention backend for the standalone drafter. `"VANILLA"` (the default) uses contiguous FlashAttention context K/V. `"TRTLLM"` requires FlashInfer and an NVIDIA Blackwell GPU with SM100 or SM103, and uses TRTLLM-Gen FMHA with a private paged context K/V cache.
+
+Qwen3.8-27B can use the public `RadixArk/Qwen3.8-27B-DSpark` checkpoint. The target checkpoint is a composite conditional-generation model, so set `disable_mm_encoder=True` for text-only serving:
+
+```python
+from tensorrt_llm import LLM
+from tensorrt_llm.llmapi import DSparkDecodingConfig
+
+speculative_config = DSparkDecodingConfig(
+    max_draft_len=7,
+    speculative_model="RadixArk/Qwen3.8-27B-DSpark",
+)
+
+llm = LLM(
+    "Qwen/Qwen3.8-27B-FP8",
+    speculative_config=speculative_config,
+    disable_mm_encoder=True,
+)
+```
+
+The public checkpoint includes confidence-head weights. TensorRT LLM loads those weights, but confidence-based dynamic draft-length scheduling is not implemented yet, so the runtime currently proposes the full configured block.
+
 ### User-provided drafting
 A completely user-defined drafting method can be supplied with a `UserProvidedDecodingConfig` that includes
 * `max_draft_len`: Maximum draft candidate length.
@@ -231,6 +260,7 @@ Speculative decoding options must be specified via `--config config.yaml` for bo
 * `DraftTarget`
 * `PARD`
 * `DFlash`
+* `DSpark`
 * `SA`
 
 > Note: The PyTorch backend supports only `Eagle3`. `decoding_type: Eagle` is accepted as a backward-compatible alias for `Eagle3`, but EAGLE (v1/v2) draft checkpoints are incompatible.

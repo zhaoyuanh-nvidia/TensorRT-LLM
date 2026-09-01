@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import json
 import math
 import tempfile
 from collections import defaultdict
@@ -350,6 +351,50 @@ def test_dspark_block_size_resolved_from_checkpoint(tmp_path):
     )
 
     assert args.speculative_config.block_size == 5
+
+
+@pytest.mark.cpu_only
+def test_qwen38_dspark_public_checkpoint_config_resolves(tmp_path):
+    """Keep TRT-LLM aligned with the public Qwen3.8 DSpark checkpoint."""
+    target_layer_ids = [5, 19, 33, 47, 61]
+    dspark_config = {
+        "attention_mode": "gqa",
+        "enable_confidence_head": True,
+        "markov_head_type": "vanilla",
+        "markov_rank": 256,
+        "mask_token_id": 248070,
+        "projector_type": "dspark",
+        "target_layer_ids": target_layer_ids,
+    }
+    (tmp_path / "config.json").write_text(
+        json.dumps({
+            "architectures": ["DSparkDraftModel"],
+            "block_size": 7,
+            "dflash_config": dspark_config,
+            "dspark_config": dspark_config,
+            "enable_confidence_head": True,
+            "markov_head_type": "vanilla",
+            "markov_rank": 256,
+            "mask_token_id": 248070,
+            "model_type": "qwen3",
+            "target_layer_ids": target_layer_ids,
+        }),
+        encoding="utf-8",
+    )
+    spec_cfg = DSparkDecodingConfig(max_draft_len=7,
+                                    speculative_model=str(tmp_path))
+
+    args = TorchLlmArgs(
+        model="/tmp/dummy_model",
+        skip_tokenizer_init=True,
+        speculative_config=spec_cfg,
+    )
+
+    assert args.speculative_config.block_size == 7
+    assert args.speculative_config.mask_token_id == 248070
+    assert args.speculative_config.target_layer_ids == target_layer_ids
+    assert args.speculative_config.markov_rank == 256
+    assert args.speculative_config.draft_is_embedded_in_target is False
 
 
 @pytest.mark.cpu_only

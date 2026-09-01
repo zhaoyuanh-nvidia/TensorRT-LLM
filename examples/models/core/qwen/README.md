@@ -286,6 +286,30 @@ kv_cache_config:
 
 For further details, please refer to [speculative-decoding.md](../../../../docs/source/legacy/advanced/speculative-decoding.md)
 
+#### DSpark (Qwen3.8-27B)
+
+Qwen3.8-27B supports standalone DSpark speculative decoding with the public `RadixArk/Qwen3.8-27B-DSpark` drafter. The example below uses the checkpoint's evaluated `Qwen/Qwen3.8-27B-FP8` target. Its seven-token block size and target-layer capture list are training-time properties of the checkpoint; keep `max_draft_len: 7` and let TensorRT LLM read the remaining values from the draft config.
+
+`Qwen/Qwen3.8-27B-FP8` is packaged as a conditional-generation model. For text-only serving, disable the multimodal encoder so it does not consume GPU memory:
+
+```yaml
+# qwen38-dspark.yaml
+disable_mm_encoder: true
+speculative_config:
+  decoding_type: DSpark
+  max_draft_len: 7
+  speculative_model: RadixArk/Qwen3.8-27B-DSpark
+  attention_backend: VANILLA
+```
+
+```bash
+trtllm-serve Qwen/Qwen3.8-27B-FP8 --config qwen38-dspark.yaml
+```
+
+`VANILLA` uses a contiguous FlashAttention context cache. On NVIDIA Blackwell GPUs, `attention_backend: TRTLLM` selects TRTLLM-Gen FMHA and a private paged context cache for the drafter. The checkpoint's confidence-head weights are loaded, but dynamic confidence-based truncation is not enabled yet; TensorRT LLM currently proposes the full seven-token block.
+
+For the Python API and backend requirements, see [Speculative Decoding](../../../../docs/source/features/speculative-decoding.md#dspark).
+
 ### Dynamo
 
 NVIDIA Dynamo is a high-throughput low-latency inference framework designed for serving generative AI and reasoning models in multi-node distributed environments.

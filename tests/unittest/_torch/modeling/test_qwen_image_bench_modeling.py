@@ -3,6 +3,7 @@
 
 import json
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -236,3 +237,29 @@ def test_qwen_image_bench_forwards_speculative_interface():
     assert model.model is text_model
     assert model.lm_head is lm_head
     assert model.load_draft_weights("weights") is sentinel
+
+
+def test_qwen_image_bench_load_weights_skips_disabled_encoder(monkeypatch):
+    model = QwenImageBenchModel.__new__(QwenImageBenchModel)
+    torch.nn.Module.__init__(model)
+    model.mm_encoder = None
+    model.model_config = object()
+    model.llm = SimpleNamespace(load_weights=Mock())
+
+    mapper = Mock()
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.models.modeling_qwen_image_bench.Qwen3_5MoeHfWeightMapper",
+        lambda: mapper,
+    )
+    text_weight = object()
+    model.load_weights(
+        {
+            "model.visual.patch_embed.proj.weight": object(),
+            "model.language_model.embed_tokens.weight": text_weight,
+        }
+    )
+
+    mapper.init_model_and_config.assert_called_once_with(model.llm, model.model_config)
+    model.llm.load_weights.assert_called_once_with(
+        {"model.language_model.embed_tokens.weight": text_weight}, mapper
+    )
