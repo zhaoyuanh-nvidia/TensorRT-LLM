@@ -1472,9 +1472,10 @@ __device__ inline ThrdRegRowMax mergeRowMax(
     return mergedRowMax;
 }
 
-__device__ inline void addAttentionSinks(
-    ThrdRegRowMax& globalRowSum, ThrdRegRowMax const globalRowMax, float const* attentionSinks)
+__device__ inline ThrdRegRowMax addAttentionSinks(
+    ThrdRegRowMax& globalRowSum, ThrdRegRowMax& globalRowMax, float const* attentionSinks)
 {
+    ThrdRegRowMax rowScales = ThrdRegRowMax::filled(1.F);
     for (uint32_t i = 0; i < globalRowSum.size; i++)
     {
         uint32_t const rowOffset = warp_size * i + laneId();
@@ -1484,14 +1485,23 @@ __device__ inline void addAttentionSinks(
             if (rowOffset < warpTile.y)
             {
                 uint32_t const srcOffset = rowOffset % headGrpSize;
-                globalRowSum[i] += expf(attentionSinks[srcOffset] - globalRowMax[i]);
+                float const sink = attentionSinks[srcOffset];
+                float const rowMaxNew = fmaxf(globalRowMax[i], sink);
+                rowScales[i] = expf(globalRowMax[i] - rowMaxNew);
+                globalRowSum[i] = globalRowSum[i] * rowScales[i] + expf(sink - rowMaxNew);
+                globalRowMax[i] = rowMaxNew;
             }
         }
         else if (rowOffset < headGrpSize)
         {
-            globalRowSum[i] += expf(attentionSinks[rowOffset] - globalRowMax[i]);
+            float const sink = attentionSinks[rowOffset];
+            float const rowMaxNew = fmaxf(globalRowMax[i], sink);
+            rowScales[i] = expf(globalRowMax[i] - rowMaxNew);
+            globalRowSum[i] = globalRowSum[i] * rowScales[i] + expf(sink - rowMaxNew);
+            globalRowMax[i] = rowMaxNew;
         }
     }
+    return rowScales;
 }
 
 #ifdef NDEBUG
@@ -2533,7 +2543,9 @@ CUBIN_EXPORT __global__
             if ((!isMultiBlock || idxSubSeqInSeq == 0) && attentionSinks != nullptr)
             {
                 // Attention sinks are per head.
-                addAttentionSinks(globalRowSum, globalRowMax, attentionSinks + headGrpSize * idxHeadGrp);
+                ThrdRegRowMax const sinkRowScales
+                    = addAttentionSinks(globalRowSum, globalRowMax, attentionSinks + headGrpSize * idxHeadGrp);
+                rescaleAcc(warp, acc, fullRescaleMask, sinkRowScales);
             }
             ThrdRegRowMax const rcpRowSum = __frcp_rn(globalRowSum);
 #if LOW_PREC_OUTPUT

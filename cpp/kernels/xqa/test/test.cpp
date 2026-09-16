@@ -1362,6 +1362,11 @@ TEST(RefCheck, llama_V2_70b_3)
 }
 
 #if SLIDING_WINDOW && !IS_SPEC_DEC_TREE
+TEST(RefCheck, gpt_oss_spec_swa_multiblock_attention_sink)
+{
+    runTest<8, HEAD_GROUP_SIZE, 4>(2, 1152, false, true, true, false, true, ~0U, 128);
+}
+
 TEST(RefCheck, gpt_oss_spec_swa_rows)
 {
     runTest<8, HEAD_GROUP_SIZE, 2>(1, 258, false, true, true, false, true, ~0U, 128);
