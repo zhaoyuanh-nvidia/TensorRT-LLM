@@ -427,9 +427,73 @@ void mergeChunkedAttentionForMLA(torch::Tensor& merged_attn, torch::Tensor const
             temp_softmax_stats, num_requests, cu_q_seq_lens, max_q_seq_len, merge_op, num_heads, head_size);
     }
 }
+
+std::vector<torch::Tensor> reorderHelixMlaKV(torch::Tensor const& gathered, torch::Tensor const& cu_global,
+    torch::Tensor const& global_offsets, torch::Tensor const& cu_local, torch::Tensor const& local_offsets,
+    torch::Tensor const& rank_offsets, int64_t tokens_per_block, int64_t lora_size, int64_t rope_size)
+{
+    auto const dtype = gathered.scalar_type();
+    TORCH_CHECK(dtype == torch::kFloat16 || dtype == torch::kBFloat16 || dtype == torch::kFloat32);
+    CHECK_INPUT(gathered, dtype);
+    TORCH_CHECK(gathered.dim() == 2 && gathered.size(1) == lora_size + rope_size);
+    TORCH_CHECK(tokens_per_block > 0 && lora_size > 0 && rope_size > 0);
+    TORCH_CHECK(lora_size * gathered.element_size() % 16 == 0);
+    TORCH_CHECK(rope_size * gathered.element_size() % 16 == 0);
+    for (auto const& tensor : {cu_global, global_offsets, cu_local, local_offsets, rank_offsets})
+    {
+        CHECK_INPUT(tensor, torch::kInt64);
+        TORCH_CHECK(tensor.get_device() == gathered.get_device());
+    }
+    TORCH_CHECK(cu_global.dim() == 1 && cu_global.numel() > 1);
+    int const num_contexts = cu_global.numel() - 1;
+    TORCH_CHECK(cu_local.dim() == 2 && cu_local.size(0) > 0 && cu_local.size(1) == num_contexts + 1);
+    int const cp_size = cu_local.size(0);
+    TORCH_CHECK(global_offsets.dim() == 1 && global_offsets.numel() == num_contexts);
+    TORCH_CHECK(local_offsets.dim() == 2 && local_offsets.size(0) == cp_size && local_offsets.size(1) == num_contexts);
+    TORCH_CHECK(rank_offsets.dim() == 1 && rank_offsets.numel() == cp_size + 1);
+    auto compressed_kv = torch::empty({gathered.size(0), lora_size}, gathered.options());
+    auto k_pe = torch::empty({gathered.size(0), rope_size}, gathered.options());
+    auto stream = at::cuda::getCurrentCUDAStream(gathered.get_device());
+    auto launch = [&](auto value)
+    {
+        using T = decltype(value);
+        tk::invokeReorderHelixMlaKV<T>(static_cast<T const*>(gathered.data_ptr()),
+            static_cast<T*>(compressed_kv.data_ptr()), static_cast<T*>(k_pe.data_ptr()), cu_global.data_ptr<int64_t>(),
+            global_offsets.data_ptr<int64_t>(), cu_local.data_ptr<int64_t>(), local_offsets.data_ptr<int64_t>(),
+            rank_offsets.data_ptr<int64_t>(), gathered.size(0), num_contexts, cp_size, tokens_per_block, lora_size,
+            rope_size, stream);
+    };
+    if (dtype == torch::kFloat16)
+    {
+        launch(half{});
+    }
+    else if (dtype == torch::kBFloat16)
+    {
+        launch(__nv_bfloat16{});
+    }
+    else
+    {
+        launch(float{});
+    }
+    return {compressed_kv, k_pe};
+}
+
 } // namespace torch_ext
 
 TRTLLM_NAMESPACE_END
+
+TORCH_LIBRARY_FRAGMENT(trtllm, m)
+{
+    m.def(
+        "reorder_helix_mla_kv(Tensor gathered, Tensor cu_global, Tensor global_offsets, "
+        "Tensor cu_local, Tensor local_offsets, Tensor rank_offsets, int tokens_per_block, "
+        "int lora_size, int rope_size) -> Tensor[]");
+}
+
+TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
+{
+    m.impl("reorder_helix_mla_kv", &tensorrt_llm::torch_ext::reorderHelixMlaKV);
+}
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {

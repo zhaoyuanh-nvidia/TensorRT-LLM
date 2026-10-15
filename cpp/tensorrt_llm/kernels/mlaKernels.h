@@ -193,6 +193,12 @@ void invokeMLARopeAppendPagedKVAssignQ(KVBlockArray& kv_cache, KVBlockArray& kv_
     int lora_size, KvCacheDataType cache_type, float const* kv_scale_orig_quant_ptr,
     int32_t const* kv_cache_local_slots, cudaStream_t stream);
 
+template <typename T>
+void invokeReorderHelixMlaKV(T const* gathered, T* compressed_kv, T* k_pe, int64_t const* cu_global,
+    int64_t const* global_offsets, int64_t const* cu_local, int64_t const* local_offsets, int64_t const* rank_offsets,
+    int num_tokens, int num_contexts, int cp_size, int tokens_per_block, int lora_size, int rope_size,
+    cudaStream_t stream);
+
 // Apply neox-style RoPE in-place to only the last rope_dim elements of each head,
 // leaving the first nope_dim elements untouched.
 // data shape: [num_tokens, num_heads, nope_dim + rope_dim]
