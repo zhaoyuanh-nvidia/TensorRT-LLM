@@ -902,6 +902,21 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
     def post_load_weights(self) -> None:
         self.transform_weights()
 
+    def forward_slice(self, x: torch.Tensor, start: int, end: int) -> torch.Tensor:
+        from ...quantization.utils.fp8_utils import slice_fp8_blockscale_weight
+
+        weight, scale, crop = slice_fp8_blockscale_weight(
+            self.weight, self.weight_scale, start, end
+        )
+        out = torch.ops.trtllm.fp8_swap_ab_gemm(
+            x.reshape(-1, x.shape[-1]),
+            weight,
+            scale,
+            output_dtype=x.dtype,
+            disable_ue8m0_cast=True,
+        )
+        return out[:, crop : crop + end - start].contiguous().reshape(*x.shape[:-1], end - start)
+
     def forward(
         self,
         x: torch.Tensor,

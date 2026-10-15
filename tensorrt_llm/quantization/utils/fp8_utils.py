@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from typing import Optional, Tuple
 
 import torch
@@ -197,6 +200,38 @@ def get_tma_aligned_size(x: int, element_size: int) -> int:
     assert tma_alignment_bytes % element_size == 0
     alignment = tma_alignment_bytes // element_size
     return align(x, alignment)
+
+
+def slice_fp8_blockscale_weight(
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    start: int,
+    end: int,
+) -> Tuple[torch.Tensor, torch.Tensor, int]:
+    """Select output rows while retaining the original 128-row scale grid.
+
+    Returns the weight slice, its scales and the leading output rows to crop.
+    Raw FP32 scales and DeepGEMM's packed int32 scales are supported.
+    """
+    if not 0 <= start < end <= weight.shape[0]:
+        raise ValueError(f"Invalid output feature range [{start}, {end})")
+    block_size = 128
+    first = start // block_size * block_size
+    last = min(ceil_div(end, block_size) * block_size, weight.shape[0])
+    if weight_scale.dtype == torch.float32:
+        scale = weight_scale[first // block_size:ceil_div(last, block_size)]
+    elif weight_scale.dtype == torch.int32:
+        # A row slice keeps the original leading dimension. Repack the small
+        # scale tensor to the column-major TMA layout for this GEMM's N.
+        rows = last - first
+        aligned_rows = get_tma_aligned_size(rows, weight_scale.element_size())
+        scale = weight_scale.new_empty(
+            (weight_scale.shape[1], aligned_rows)).t()[:rows]
+        scale.copy_(weight_scale[first:last])
+    else:
+        raise NotImplementedError(
+            "Sliced FP8 projections require raw FP32 or packed int32 scales")
+    return weight[first:last], scale, start - first
 
 
 def get_col_major_tma_aligned_packed_tensor(x: torch.Tensor) -> torch.Tensor:
