@@ -246,8 +246,8 @@ class DSparkSpecMetadata(SpecMetadata):
             # without this, all concurrent gen requests fall through to the shared
             # scratch row below and corrupt each other's draft window at batch
             # size > 1 (GitHub #16767). Context-prefix entries are left to
-            # ``_seed_context_windows``. CUDA-graph capture dummies and real
-            # generation requests acquire a persistent slot only once; prepare()
+            # ``_seed_context_windows``. Real generation requests acquire a
+            # persistent slot only once; prepare()
             # runs before every replay, so it must never reset a live slot.
             # ADP-idle (id 0) and high-ID CUDA-graph padding dummies use scratch.
             num_contexts = max(0, len(self.request_ids) - self.num_generations)
@@ -506,8 +506,9 @@ class DSv4DSparkWorker(SpecWorkerBase):
 
         Two bounds exist and neither dominates: ``attn_metadata`` carries the KV
         manager's ``max_seq_len`` while ``_freqs_cap`` carries the user's, and
-        ``_create_cuda_graph_warmup_request`` sizes its dummy request at whichever is
-        larger. Covering both is what keeps warmup off the end of the table.
+        ``DummyRequestFactory.create_cuda_graph_warmup_request`` sizes its dummy
+        request at whichever is larger. Covering both is what keeps warmup off
+        the end of the table.
         """
         inner_model = getattr(draft_model, "dspark_model", None) or draft_model
         config_cap = int(getattr(inner_model, "_freqs_cap", 0) or 0)
@@ -558,8 +559,9 @@ class DSv4DSparkWorker(SpecWorkerBase):
             self._scratch_slot = max_batch
             num_rows = max_batch + 1
 
-            # CUDA-graph padding requests carry ids in
-            # ``[CUDA_GRAPH_DUMMY_REQUEST_ID - runtime_draft_len, CUDA_GRAPH_DUMMY_REQUEST_ID]``,
+            # Both CUDA-graph padding variants, each with K+1 runtime widths,
+            # use ``[CUDA_GRAPH_DUMMY_REQUEST_ID - 2*(K+1) + 1,
+            # CUDA_GRAPH_DUMMY_REQUEST_ID]``, where K is the physical draft cap,
             # while real request ids start at ``max_batch_size`` and grow, so a simple
             # floor cleanly separates them. Together with ``ATTENTION_DP_DUMMY_REQUEST_ID``
             # (0) these dummies must route to the scratch row (see ``prepare()``) and
@@ -567,7 +569,9 @@ class DSv4DSparkWorker(SpecWorkerBase):
             # dspark -> cuda_graph_runner -> speculative.utils -> dspark import cycle.
             from ..pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
 
-            self._graph_dummy_id_floor = CUDA_GRAPH_DUMMY_REQUEST_ID - self.max_draft_len
+            self._graph_dummy_id_floor = (
+                CUDA_GRAPH_DUMMY_REQUEST_ID - 2 * (self.max_draft_len + 1) + 1
+            )
 
             self._kv_windows = torch.zeros(
                 (num_rows, num_stages, self._win, head_dim),
