@@ -24,7 +24,7 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import (
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs import DecoderCudaGraphs
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import DecoderInputPreparer
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.metadata import DecoderMetadata
-from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
+from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
 from tensorrt_llm._torch.speculative.ragged_helpers import ragged_gather_index_lists
 
 
@@ -374,7 +374,7 @@ def test_model_engine_delegates_ragged_state_to_decoder_owner() -> None:
     inputs.fit_ragged_verify_lens = lambda *args, **kwargs: (args, kwargs)
     worker = object()
     runner._model = SimpleNamespace(spec_worker=worker)
-    engine = object.__new__(PyTorchModelEngine)
+    engine = object.__new__(ModelEngine)
     engine._cleanup_done = True
     engine._runner = runner
 
@@ -394,7 +394,7 @@ def test_model_engine_delegates_ragged_state_to_decoder_owner() -> None:
 
 
 def test_model_engine_non_decoder_keeps_confidence_inactive() -> None:
-    engine = object.__new__(PyTorchModelEngine)
+    engine = object.__new__(ModelEngine)
     engine._cleanup_done = True
     engine._runner = SimpleNamespace()
 
